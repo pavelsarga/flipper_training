@@ -2,6 +2,7 @@ import csv
 import logging
 import threading
 import time
+import sys
 import hashlib
 from dataclasses import dataclass, field
 from itertools import groupby
@@ -57,7 +58,8 @@ class ColoredFormatter(logging.Formatter):
 def get_terminal_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
-    handler = logging.StreamHandler()
+    logger.handlers.clear()
+    handler = logging.StreamHandler(stream=sys.stdout)
     handler.setFormatter(ColoredFormatter())
     logger.addHandler(handler)
     return logger

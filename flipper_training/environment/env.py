@@ -255,6 +255,33 @@ class Env(EnvBase):
             obs_td[Env.PREV_STATE_DER_KEY] = prev_state_der.to_tensordict()
         return obs_td
 
+    def _to_realistic_env(self) -> "Env":
+        """
+        Convert this environment to a realistic world interface environment.
+        This is done by replacing the _step method to instead take in a tensordict with the necessary
+        observation data from the realistic world, and outputting a tensordict in the same format
+        as this environment such that it can be used with the trained policy.
+        Returns:
+            Env: A new environment instance that interfaces with a realistic world.
+        """
+
+        def realistic_step(self, tensordict: TensorDict) -> TensorDict:
+            obs_td = TensorDict(
+                {o.name: o.from_realistic_world(tensordict) for o in self.observations},
+                device=self.device,
+                batch_size=[1],
+            )
+            obs_td[Env.STATE_KEY] = PhysicsState.dummy(self.robot_cfg, device=self.device, batch_size=1).to_tensordict()
+            obs_td["succeeded"] = torch.zeros((1, 1), device=self.device, dtype=torch.bool)
+            obs_td["failed"] = torch.zeros((1, 1), device=self.device, dtype=torch.bool)
+            obs_td["terminated"] = torch.zeros((1, 1), device=self.device, dtype=torch.bool)
+            obs_td["truncated"] = torch.zeros((1, 1), device=self.device, dtype=torch.bool)
+            obs_td["reward"] = torch.zeros((1, 1), device=self.device, dtype=self.out_dtype)
+            return obs_td
+
+        self._step = realistic_step.__get__(self, Env)
+        return self
+
     def _step_engine(self, prev_state: PhysicsState, action: torch.Tensor) -> tuple[PhysicsStateDer, PhysicsState]:
         curr_state = prev_state
         first_prev_state_der = None

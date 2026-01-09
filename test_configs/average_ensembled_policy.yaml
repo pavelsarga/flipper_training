@@ -24,10 +24,15 @@ max_grad_norm: 0.5
 grid_res: 0.05
 max_coord: 3.2
 # start important
-heightmap_gen: ${ cls:flipper_training.heightmaps.from_file.FromFileHeightmap}
+heightmap_gen: ${ cls:flipper_training.heightmaps.trunks.TrunkHeightmapGenerator}
 heightmap_gen_opts:
-  file_path: heightmap_files/ridge.pt
-  top_height_percentile_cutoff: 0.9
+  min_trunk_height: 0.15
+  max_trunk_height: 0.3
+  max_dist_from_origin: 0.5
+  trunk_deadzone_width: 0.5
+  max_trunk_width: 1.2
+  min_trunk_width: 0.6
+  exp: 6
 objective: ${cls:flipper_training.rl_objectives.random_nav.RandomNavigationObjective}
 objective_opts:
   goal_reached_threshold: 0.35

@@ -142,5 +142,5 @@ frames_per_sub_batch: 4096
 time_steps_per_batch: 128
 engine_iters_per_env_step: 4
 eval_repeats_after_training: 1
-policy_weights_path: runs/ppo/final_trunk_thesis_training_42_2025-05-09_21-01-13/weights/policy_final.pth
-vecnorm_weights_path: runs/ppo/final_trunk_thesis_training_42_2025-05-09_21-01-13/weights/vecnorm_final.pth
+policy_weights_path: modified_networks/top_3_averaged/policy.pth
+vecnorm_weights_path: modified_networks/top_3_averaged/vecnorm.pth

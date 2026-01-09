@@ -11,6 +11,7 @@ from flipper_training.engine.engine_state import PhysicsState, PhysicsStateDer
 
 if TYPE_CHECKING:
     from flipper_training.environment.env import Env
+    from tensordict import TensorDictBase
 
 
 class ObservationEncoder(torch.nn.Module):
@@ -97,6 +98,16 @@ class Observation(ABC):
             return cls(env=env, **opts | kwargs)
 
         return factory
+
+    def from_realistic_world(self, tensordict: "TensorDictBase") -> torch.Tensor:
+        """
+        Convert observation from realistic world to local state vector format.
+        Args:
+            tensordict (TensorDictBase): TensorDict containing the observation from the realistic world.
+        Returns:
+            torch.Tensor: Converted observation tensor.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement from_realistic_world method.")
 
 
 ObservationFactory = Callable[["Env"], Observation]

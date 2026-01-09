@@ -57,7 +57,7 @@ def main():
     parser.add_argument("input_folder", help="Path to the folder containing image frames.")
     parser.add_argument("output_file", help="Path for the output MP4 video file.")
     parser.add_argument("--fps", type=int, default=30, help="Frames per second for the video (default: 30).")
-    parser.add_argument("--codec", type=str, default="libx265", help="Video codec (default: 'libx265' for HEVC). Use 'libx264' for H.264 if needed.")
+    parser.add_argument("--codec", type=str, default="libx264", help="Video codec (default: 'libx265' for HEVC). Use 'libx264' for H.264 if needed.")
 
     args = parser.parse_args()
 

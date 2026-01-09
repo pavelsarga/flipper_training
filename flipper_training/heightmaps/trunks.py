@@ -51,7 +51,7 @@ class TrunkHeightmapGenerator(BaseHeightmapGenerator):
             left_right_mask[i, left_mask] = TrunkSide.LEFT
             left_right_mask[i, right_mask] = TrunkSide.RIGHT
             z[i] = z_i
-        return z, {"trunk_sides": left_right_mask}
+        return z, {"trunk_sides": left_right_mask, "suitable_mask": left_right_mask != TrunkSide.TRUNK}
 
 
 @dataclass

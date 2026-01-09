@@ -148,3 +148,4 @@ policy_opts:
     weight_decay: 0.0001
 policy_weights_path: modified_networks/top_all_averaged/policy.pth
 vecnorm_weights_path: modified_networks/top_all_averaged/vecnorm.pth
+# lol

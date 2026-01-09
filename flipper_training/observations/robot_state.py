@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 from torchrl.data import Unbounded
+from tensordict import TensorDictBase
 from flipper_training.engine.engine_state import PhysicsState, PhysicsStateDer
 from flipper_training.utils.geometry import (
     inverse_quaternion,
@@ -73,6 +74,49 @@ class LocalStateVector(Observation):
         if self.apply_noise:
             noise = torch.randn_like(obs) * self.noise_scale.view(1, -1)
             obs.add_(noise)
+        return obs
+
+    def from_realistic_world(self, tensordict: TensorDictBase) -> torch.Tensor:
+        """
+        Convert observation from realistic world to local state vector format.
+        The input tensordict is expected to contain the following keys:
+        - "goal_vec_local": The goal vector in the robot's local frame (x forward, y left, z up).
+        - "xd_local": The linear velocity vector in the robot's local frame.
+        - "omega_local": The angular velocity vector in the robot's local frame.
+        - "thetas": The joint angles of the robot.
+        - "quaternion": The orientation of the robot as a quaternion.
+        Args:
+            tensordict (TensorDictBase): TensorDict containing the observation from the realistic world.
+        Returns:
+            torch.Tensor: Converted observation tensor.
+        """
+        goal_vec_local = tensordict["goal_vec_local"].view(1, 3) / self.max_dist
+        xd_local = tensordict["xd_local"].view(1, 3) / self.max_dist
+        omega_local = tensordict["omega_local"].view(1, 3) / torch.pi
+        thetas = (tensordict["thetas"].view(1, -1) - self.env.robot_cfg.joint_limits[0]) / self.theta_range
+        # ros sends [x, y, z, w]
+        q_ros = tensordict["quat"].view(-1, 4)
+        w = q_ros[:, 3]
+        x = q_ros[:, 0]
+        y = q_ros[:, 1]
+        z = q_ros[:, 2]
+        sin_p = 2 * (w * y - z * x)
+        sin_p = torch.clamp(sin_p, -1.0, 1.0)
+        pitch = torch.asin(sin_p)
+        roll = torch.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+        roll = roll.view(1, 1) / torch.pi
+        pitch = pitch.view(1, 1) / torch.pi
+        obs = torch.cat(
+            [
+                roll,
+                pitch,
+                xd_local,
+                omega_local,
+                thetas,
+                goal_vec_local,
+            ],
+            dim=1,
+        ).to(self.env.out_dtype)
         return obs
 
     @property

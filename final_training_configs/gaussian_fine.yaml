@@ -151,3 +151,5 @@ policy_opts:
   value_optimizer_opts:
     lr: 0.0020812972313916348
     weight_decay: 0.0001
+policy_weights_path: modified_networks/top_3_averaged/policy.pth
+vecnorm_weights_path: modified_networks/top_3_averaged/vecnorm.pth
