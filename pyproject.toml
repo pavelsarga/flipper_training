@@ -30,6 +30,7 @@ dependencies = [
     "pyyaml==6.0.3",
     "tqdm==4.67.1",
     "natsort==8.4.0",
+    "einops==0.8.1",
     
     # ML/DL utilities
     "numpy==2.3.5",
