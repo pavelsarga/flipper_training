@@ -15,7 +15,7 @@ torch._inductor.config.fallback_random = True
 torch._dynamo.config.cache_size_limit = 128
 
 
-PACKAGE_ROOT = Path(__file__).parent
+PACKAGE_ROOT = Path(__file__).resolve().parent
 ROOT = PACKAGE_ROOT.parent
 
 

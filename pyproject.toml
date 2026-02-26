@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=64.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -77,9 +77,12 @@ dependencies = [
 ]
 
 
-[tool.setuptools.package-dir]
-flipper_training = "flipper_training"
+[project.scripts]
+flipper_policy_node = "flipper_training.ros2.flipper_policy_node:main"
+send_goal = "flipper_training.ros2.send_goal:main"
 
+[tool.setuptools.packages.find]
+where = ["."]
 
 [tool.ty.environment]
 python = ".venv"
