@@ -4,7 +4,7 @@ seed: 42
 use_wandb: true
 eval_repeats_after_training: 1
 use_tensorboard: false
-device: cuda:0
+device: cuda
 training_dtype: ${dtype:float32}
 total_frames: ${mul:5242880,4}
 engine_iters_per_env_step: 4
@@ -24,37 +24,30 @@ max_grad_norm: 0.5
 grid_res: 0.05
 max_coord: 3.2
 # start important
-heightmap_gen: ${ cls:flipper_training.heightmaps.trunks.TrunkHeightmapGenerator}
+heightmap_gen: ${ cls:flipper_training.heightmaps.stairs.FixedStairsHeightmapGenerator}
 heightmap_gen_opts:
-  min_trunk_height: 0.15
-  max_trunk_height: 0.3
-  max_dist_from_origin: 0.5
-  trunk_deadzone_width: 0.5
-  max_trunk_width: 1.2
-  min_trunk_width: 0.6
-  exp: 6
-objective: ${cls:flipper_training.rl_objectives.random_nav.RandomNavigationObjective}
-objective_opts:
-  goal_reached_threshold: 0.35
-  start_z_offset: 0.3
-  goal_z_offset: 0.2
-  iteration_limit_factor: 8
-  min_dist_to_goal: 2.0
-  max_dist_to_goal: 4.0
-  max_feasible_pitch: 1.5
-  max_feasible_roll: 1.5
-  start_position_orientation: towards_goal
-  higher_allowed: 0.5
-  cache_size: 10
-  init_joint_angles: ${tensor:[0.0,0.0,0.0,0.0]}
-# end important
+  n_steps: 5
+  step_height: 0.27
+  normal_angle: 0.0
+  exponent: null
 world_opts:
-  k_stiffness: 30000
-  k_friction_lon: 1.0
-  k_friction_lat: 0.8
+  k_stiffness: 35000
+  k_friction_lon: 0.8
+  k_friction_lat: 0.5
 engine_opts:
   damping_alpha: 5.0
   dt: 0.007
+objective: ${cls:flipper_training.rl_objectives.fixed_goal.FixedStartGoalNavigation}
+objective_opts:
+  goal_x_y_z: ${tensor:[-2.3, 0.0, 0.2]}
+  start_x_y_z: ${tensor:[2.3, 0.0, 1.15]}
+  iteration_limit: 1000
+  max_feasible_pitch: 1.5
+  max_feasible_roll: 1.5
+  goal_reached_threshold: 0.2
+  init_joint_angles: random
+  resample_random_joint_angles_on_reset: true
+# end important
 engine_compile_opts:
   options:
     triton.cudagraphs: true

@@ -129,4 +129,4 @@ rosbag2_bagfile_information:
         nanoseconds: 75330756164
       message_count: 2872
   custom_data: ~
-  ros_distro: jazzy
+  ros_distro: kilted

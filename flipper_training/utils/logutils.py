@@ -80,7 +80,8 @@ class RunLogger:
 
     def __post_init__(self):
         self.terminal_logger = get_terminal_logger("RunLogger")
-        ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+        import os
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S") + f"_{os.getpid()}"
         self.logpath = ROOT / f"runs/{self.category}/{self.train_config['name']}_{ts}"
         self.terminal_logger.info(f"RunLogger initialized for run {self.logpath.name}")
         self.logpath.mkdir(parents=True, exist_ok=True)
@@ -172,11 +173,7 @@ class RunLogger:
         model_path = self.weights_path / f"{name}.pth"
         torch.save(state_dict, model_path)
         if self.use_wandb:
-            wandb.log_model(
-                path=model_path,
-                name=name,
-                aliases=[self.wandb_run_id],
-            )
+            wandb.save(str(model_path), base_path=str(self.weights_path))
 
     def __del__(self):
         self.close()

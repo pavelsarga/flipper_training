@@ -4,7 +4,7 @@ seed: 42
 use_wandb: true
 eval_repeats_after_training: 1
 use_tensorboard: false
-device: cuda:0
+device: cuda
 training_dtype: ${dtype:float32}
 total_frames: ${mul:5242880,4}
 engine_iters_per_env_step: 4
