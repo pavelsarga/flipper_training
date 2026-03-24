@@ -51,7 +51,7 @@ reward_opts:
   gamma: ${gae_opts.gamma}
   step_penalty: -0.24508094900269353
   failed_reward: -4.185834036649192
-  potential_coef: 42.65164641109597
+  shaping_coef: 42.65164641109597
   goal_reached_reward: 7.00220498001836
 observations:
   - cls: ${cls:flipper_training.observations.robot_state_with_action.LocalStateVectorWithAction}

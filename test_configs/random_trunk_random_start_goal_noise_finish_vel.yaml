@@ -113,7 +113,7 @@ reward: ${cls:flipper_training.rl_rewards.rewards.PotentialGoalWithFinishVelocit
 reward_opts:
   goal_reached_reward: 9.081257699979428
   failed_reward: -9.863716729867294
-  potential_coef: 30.66571570059192
+  shaping_coef: 30.66571570059192
   gamma: ${gae_opts.gamma}
   step_penalty: -0.16095654203363044
   finish_velocity_coef: 0.5

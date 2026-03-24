@@ -10,7 +10,7 @@ optuna_keys:
   - "policy_opts.value_optimizer_opts.lr"
   - "reward_opts.goal_reached_reward"
   - "reward_opts.failed_reward"
-  - "reward_opts.potential_coef"
+  - "reward_opts.shaping_coef"
   - "reward_opts.step_penalty"
   - "scheduler_opts.end_factor"
   - "reward_opts.joint_vel_variance_coef"

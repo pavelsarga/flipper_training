@@ -3,6 +3,7 @@
 # ============================================================
 import argparse
 from omni.isaac.lab.app import AppLauncher
+import optuna
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PPO policy inside FTR-Benchmark (Isaac Sim)")
@@ -87,7 +88,6 @@ class FtrPPOConfig:
     epochs_per_batch: int
     frames_per_sub_batch: int
     eval_and_save_every: int
-    max_eval_steps: int
     eval_repeats_after_training: int
     max_grad_norm: float
     clip_grad_norm_p: int | str
@@ -103,6 +103,8 @@ class FtrPPOConfig:
     vecnorm_opts: dict[str, Any]
     vecnorm_on_reward: bool
     ftr_obs_encoder_opts: dict[str, Any]
+    save_weights_every: int = 0  # 0 = same as eval_and_save_every
+    max_eval_steps: int = 0  # 0 = auto: 2 × max_episode_length derived from sim_dt
     use_wandb: bool = False
     use_tensorboard: bool = False
     policy_weights_path: str | None = None
@@ -110,9 +112,16 @@ class FtrPPOConfig:
     extra_env_transforms: list = field(default_factory=list)
     # Env config overrides applied via setattr before env creation
     env_cfg_overrides: dict = field(default_factory=dict)
-    # Physics safety limits (applied to env_cfg.robot / env_cfg.sim.physx)
-    robot_max_linear_velocity: float = 5.0
-    robot_max_angular_velocity: float = 10.0
+    # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
+    sim_dt: float = 1 / 400
+    solver_position_iterations: int = 16
+    solver_velocity_iterations: int = 4
+    max_depenetration_velocity: float = 0.15
+    bounce_threshold_velocity: float = 0.2
+    robot_linear_damping: float = 0.05
+    robot_angular_damping: float = 0.05
+    robot_max_linear_velocity: float = 10.0
+    robot_max_angular_velocity: float = 720.0
     physx_gpu_heap_capacity: int = 2**28
     physx_gpu_temp_buffer_capacity: int = 2**26
     physx_gpu_max_num_partitions: int = 8
@@ -125,7 +134,8 @@ class FtrPPOConfig:
 class FtrPPOTrainer:
     """PPO trainer that uses FTR-Benchmark as the physics backend instead of flipper_training's engine."""
 
-    def __init__(self, raw_config: "DictConfig", ftr_gym_env: gymnasium.Env):
+    def __init__(self, raw_config: "DictConfig", ftr_gym_env: gymnasium.Env, optuna_trial=None):
+        self.optuna_trial = optuna_trial
         self.config = FtrPPOConfig(**raw_config)
         self.device = set_device(self.config.device)
         self.rng = seed_all(self.config.seed)
@@ -137,6 +147,8 @@ class FtrPPOTrainer:
             use_tensorboard=self.config.use_tensorboard,
             step_metric_name="collected_frames",
         )
+        if self.optuna_trial is not None:
+            self.optuna_trial.set_user_attr("logpath", str(self.run_logger.logpath))
         self.term_logger = get_terminal_logger("ftr_ppo_train")
 
         # ---- environment ----
@@ -213,6 +225,13 @@ class FtrPPOTrainer:
         except Exception as e:
             self.term_logger.error(f"Training failed: {e}")
             traceback.print_exception(e)
+            if "CUDA error" in str(e) or "CUDA out of memory" in str(e):
+                # CUDA context is dead — saving weights and running atexit/Isaac Sim
+                # cleanup handlers will deadlock. Exit immediately so the SLURM slot
+                # is freed and the job can be requeued rather than hanging for hours.
+                self.term_logger.error("CUDA error detected — calling os._exit(75) to skip cleanup.")
+                import os as _os
+                _os._exit(75)
             try:
                 self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), "policy_crash")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_crash")
@@ -276,6 +295,9 @@ class FtrPPOTrainer:
             rollout_log_prob = tensordict_data["sample_log_prob"].mean().item()
             rollout_adv_mean = tensordict_data["advantage"].mean().item()
             rollout_adv_std = tensordict_data["advantage"].std().item()
+            rollout_mean_reward = tensordict_data["next", "reward"].mean().item()
+            rollout_mean_state_value = tensordict_data["state_value"].mean().item()
+            rollout_value_minus_reward = rollout_mean_state_value - rollout_mean_reward
             del tensordict_data
             if "cuda" in str(self.device):
                 torch.cuda.empty_cache()
@@ -306,6 +328,10 @@ class FtrPPOTrainer:
             log = {
                 **self.ftr_torchrl_env.pop_reward_info(),
                 **self.ftr_torchrl_env.pop_termination_info(),
+                "train/mean_reward": rollout_mean_reward,
+                "train/mean_state_value": rollout_mean_state_value,
+                "train/value_minus_reward": rollout_value_minus_reward,
+                "train/mean_advantage_GAE": rollout_adv_mean,
                 "train/mean_action_sample_log_prob": rollout_log_prob,
                 "train/mean_critic_loss": loss_vals["loss_critic"].mean().item(),
                 "train/mean_objective_loss": loss_vals["loss_objective"].mean().item(),
@@ -319,18 +345,34 @@ class FtrPPOTrainer:
                 **{f"train/{g['name']}_lr": g["lr"] for g in self.optim.param_groups},
             }
 
-            if i % self.config.eval_and_save_every == 0:
+            save_every = self.config.save_weights_every or self.config.eval_and_save_every
+            if i % save_every == 0:
                 self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), f"policy_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
-                if i > 0:  # skip eval at i=0: untrained policy produces no useful metrics and maximises GPU heap pressure
-                    try:
-                        eval_log = self._get_eval_rollout_results()
-                        log.update(eval_log)
-                    except RuntimeError as e:
-                        if "CUDA" in str(e):
-                            self.term_logger.warning(f"Eval CUDA error — GPU context corrupted. Stopping training cleanly (checkpoint already saved).")
-                            break
-                        self.term_logger.warning(f"Eval rollout failed (physics explosion): {e}. Skipping eval metrics this checkpoint.")
+            if i % self.config.eval_and_save_every == 0 and i > 0:
+                try:
+                    eval_log = self._get_eval_rollout_results()
+                    log.update(eval_log)
+
+                    if self.optuna_trial is not None:
+                        eval_step = i // self.config.eval_and_save_every
+                        success_rate = eval_log.get("eval/success_rate", 0.0)
+                        self.optuna_trial.report(success_rate, eval_step)
+
+                        if self.optuna_trial.should_prune():
+                            self.term_logger.info(
+                                f"Trial pruned at iteration {i} "
+                                f"(eval_step={eval_step}, success_rate={success_rate:.3f})"
+                            )
+                            raise optuna.TrialPruned()
+                except optuna.TrialPruned:
+                    raise  # must propagate — don't catch in RuntimeError handler
+                except RuntimeError as e:
+                    if "CUDA" in str(e):
+                        self.term_logger.warning(f"Eval CUDA error — GPU context corrupted. Exiting immediately to avoid cleanup hang.")
+                        import os as _os
+                        _os._exit(75)
+                    self.term_logger.warning(f"Eval rollout failed (physics explosion): {e}. Skipping eval metrics this checkpoint.")
 
             self.run_logger.log_data(log, total_collected_frames)
 
@@ -342,9 +384,10 @@ class FtrPPOTrainer:
     def _get_eval_rollout_results(self) -> dict[str, float]:
         self.env.eval()
         self.actor_operator.eval()
+        max_eval_steps = self.config.max_eval_steps or (self.ftr_torchrl_env.ftr_env.unwrapped.max_episode_length * 2)
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
             eval_rollout = self.env.rollout(
-                self.config.max_eval_steps,
+                max_eval_steps,
                 self.actor_operator,
                 break_when_all_done=True,
                 auto_reset=True,
@@ -457,19 +500,27 @@ if __name__ == "__main__":
     env_cfg = _EnvCfgClass()
     env_cfg.scene.num_envs = _cfg.num_robots
     env_cfg.terrain_name = _cfg.terrain
-    # Cap robot velocity so a contact-impulse explosion cannot carry the robot more than ~0.25 m
-    # before the out_of_range termination fires.  Normal speed is 0.2–0.3 m/s; 5 m/s is 17x
-    # above that and still well below the stock 100 m/s limit that lets robots reach 5+ m/step.
+
+    # --- Simulation timestep ---
+    env_cfg.sim.dt = _cfg.sim_dt
+
+    # --- Rigid body properties ---
     env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
     env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
+    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
+    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
+    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
 
-    # Increase PhysX GPU heap buffers to prevent PxgCudaMemoryAllocator exhaustion (CUDA error 700).
-    # Default gpu_heap_capacity=2^26 (64 MB) and gpu_temp_buffer_capacity=2^24 (16 MB) are too small
-    # for 256 envs with terrain contacts over long rollouts.
+    # --- Per-articulation solver iterations ---
+    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
+    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
+
+    # --- Scene-wide PhysX solver (matched to per-articulation values) ---
+    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
+    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
+    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
     env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
     env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
-    # Disable contact pair caching — CrossingEnv uses contact forces only for reward, not impulse
-    # caching, so this cuts GPU contact-buffer pressure significantly.
     env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
 
     # Apply arbitrary direct-attribute overrides (e.g. potential reward params)
@@ -505,4 +556,7 @@ if __name__ == "__main__":
         trainer = FtrPPOTrainer(raw_cfg, ftr_gym_env)
         trainer.train()
 
-    simulation_app.close()
+    # Skip simulation_app.close() — Isaac Sim's shutdown re-initialises GPU foundation
+    # and frequently deadlocks, keeping the SLURM slot busy for hours.
+    import os as _os
+    _os._exit(0)

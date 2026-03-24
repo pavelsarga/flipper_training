@@ -112,7 +112,7 @@ policy_opts:
 reward: ${cls:flipper_training.rl_rewards.rewards.PotentialGoalSimplified}
 reward_opts:
   termination_reward: 13.030719553626371
-  potential_coef: 26.639112085131806
+  shaping_coef: 26.639112085131806
   gamma: ${gae_opts.gamma}
   step_penalty: -0.33055922953006306
 observations:

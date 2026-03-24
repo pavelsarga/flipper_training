@@ -89,7 +89,7 @@ class PotentialGoal(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
 
     def __call__(
         self,
@@ -106,7 +106,7 @@ class PotentialGoal(Reward):
         prev_dist = (goal_state.x - prev_state.x).norm(dim=-1, keepdim=True)
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
-        reward = self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
+        reward = self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
         reward[success] += self.goal_reached_reward
         reward[fail] += self.failed_reward
         return reward.to(self.env.out_dtype)
@@ -118,7 +118,7 @@ class PotentialGoalWithVelocityBonus(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
     velocity_bonus_coef: float
 
     def __call__(
@@ -138,7 +138,7 @@ class PotentialGoalWithVelocityBonus(Reward):
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
         reward = (
-            self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev)
+            self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev)
             + self.step_penalty
             + self.velocity_bonus_coef * curr_state.xd.norm(dim=-1, keepdim=True)
         )
@@ -153,7 +153,7 @@ class PotentialGoalWithConditionalVelocityBonus(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
     velocity_bonus_coef: float
 
     def __call__(
@@ -173,7 +173,7 @@ class PotentialGoalWithConditionalVelocityBonus(Reward):
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
         reward = (
-            self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev)
+            self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev)
             + self.step_penalty
             + self.velocity_bonus_coef
             * curr_state.xd.norm(dim=-1, keepdim=True)
@@ -190,7 +190,7 @@ class PotentialGoalWithConditionalVelocityBonusAndJointCommandBonus(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
     velocity_bonus_coef: float
     joint_command_bonus_coef: float
 
@@ -211,7 +211,7 @@ class PotentialGoalWithConditionalVelocityBonusAndJointCommandBonus(Reward):
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
         reward = (
-            self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev)
+            self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev)
             + self.step_penalty
             + self.velocity_bonus_coef
             * curr_state.xd.norm(dim=-1, keepdim=True)
@@ -229,7 +229,7 @@ class PotentialGoalWithJointVelVariancePenalty(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
     joint_vel_variance_coef: float
 
     def __call__(
@@ -247,7 +247,7 @@ class PotentialGoalWithJointVelVariancePenalty(Reward):
         prev_dist = (goal_state.x - prev_state.x).norm(dim=-1, keepdim=True)
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
-        reward = self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
+        reward = self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
         joint_vel_variances = action[..., action.shape[1] // 2 :].abs().var(dim=-1, keepdim=True)
         reward -= self.joint_vel_variance_coef * joint_vel_variances
         reward[success] += self.goal_reached_reward
@@ -261,7 +261,7 @@ class PotentialGoalWithFinishVelocityPenalty(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
     finish_velocity_coef: float
 
     def __call__(
@@ -279,7 +279,7 @@ class PotentialGoalWithFinishVelocityPenalty(Reward):
         prev_dist = (goal_state.x - prev_state.x).norm(dim=-1, keepdim=True)
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
-        reward = self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
+        reward = self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
         reward[success] += self.goal_reached_reward - self.finish_velocity_coef * curr_state.xd[success].norm(dim=-1, keepdim=True)
         reward[fail] += self.failed_reward
         return reward.to(self.env.out_dtype)
@@ -291,7 +291,7 @@ class PotentialGoalWithStepAscentBonus(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
     step_bonus_coef: float
 
     def __post_init__(self):
@@ -315,7 +315,7 @@ class PotentialGoalWithStepAscentBonus(Reward):
         prev_dist = (goal_state.x - prev_state.x).norm(dim=-1, keepdim=True)
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
-        reward = self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
+        reward = self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
         prev_xy = prev_state.x[..., :2]  # (B,2)
         curr_xy = curr_state.x[..., :2]  # (B,2)
         prev_ij = self.terrain_cfg.xy2ij(prev_xy)  # (B,2)
@@ -338,7 +338,7 @@ class PotentialGoalWithPenaltiesConfigurable(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
     joint_vel_variance_coef: float | None = None
     joint_angle_variance_coef: float | None = None
     track_vel_variance_coef: float | None = None
@@ -362,7 +362,7 @@ class PotentialGoalWithPenaltiesConfigurable(Reward):
         prev_dist = (goal_state.x - prev_state.x).norm(dim=-1, keepdim=True)
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
-        reward = self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
+        reward = self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
         if self.joint_vel_variance_coef is not None:
             joint_vel_variances = action[..., action.shape[1] // 2 :].abs().var(dim=-1, keepdim=True)
             reward -= self.joint_vel_variance_coef * joint_vel_variances
@@ -392,7 +392,7 @@ class PotentialGoalWithSideLatentPreference(Reward):
     failed_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
     side_bonus_coef: float
 
     def __call__(
@@ -413,7 +413,7 @@ class PotentialGoalWithSideLatentPreference(Reward):
         prev_dist = (goal_state.x - prev_state.x).norm(dim=-1, keepdim=True)
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
-        reward = self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
+        reward = self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
         start_goal_vec = goal_state.x[:, :2] - start_state.x[:, :2]
         robot_pos_planar = curr_state.x[:, :2]
         # Compute signed distance from robot to the line from start to goal (positive on one side, negative on the other)
@@ -439,7 +439,7 @@ class PotentialGoalSimplified(Reward):
     termination_reward: float
     gamma: float
     step_penalty: float
-    potential_coef: float
+    shaping_coef: float
 
     def __call__(
         self,
@@ -456,7 +456,7 @@ class PotentialGoalSimplified(Reward):
         prev_dist = (goal_state.x - prev_state.x).norm(dim=-1, keepdim=True)
         neg_goal_dist_curr = -curr_dist  # phi(s')
         neg_goal_dist_prev = -prev_dist  # phi(s)
-        reward = self.potential_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
+        reward = self.shaping_coef * (self.gamma * neg_goal_dist_curr - neg_goal_dist_prev) + self.step_penalty
         reward[success] += self.termination_reward
         reward[fail] -= self.termination_reward
         return reward.to(self.env.out_dtype)

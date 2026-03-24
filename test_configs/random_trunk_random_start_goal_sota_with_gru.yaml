@@ -124,7 +124,7 @@ reward: ${cls:flipper_training.rl_rewards.rewards.PotentialGoal}
 reward_opts:
   goal_reached_reward: 7
   failed_reward: -7
-  potential_coef: 42.65164641109597
+  shaping_coef: 42.65164641109597
   gamma: ${gae_opts.gamma}
   step_penalty: -0.24508094900269353
 policy_config: ${cls:flipper_training.policies.gru_policy.GRUPolicyConfig}

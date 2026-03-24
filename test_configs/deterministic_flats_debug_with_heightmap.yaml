@@ -122,7 +122,7 @@ reward_opts:
   failed_reward: -200.0
   step_penalty: -1e-1
   gamma: ${gae_opts.gamma} # Should match GAE gamma
-  potential_coef: 20.0
+  shaping_coef: 20.0
   velocity_bonus_coef: 0.1
 
 # Policy and Value Network Architecture

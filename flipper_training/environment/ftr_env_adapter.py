@@ -48,6 +48,7 @@ class FtrTorchRLEnv(EnvBase):
         self._reward_info_accum: dict[str, list[float]] = {}
         self._term_success: int = 0
         self._term_failure: int = 0
+        self._term_explosion: int = 0
         self._term_total: int = 0
 
         # Instantiate the observation descriptor so make_transformed_env can build VecNorm keys.
@@ -121,6 +122,8 @@ class FtrTorchRLEnv(EnvBase):
                 self._term_total += episodes_done
                 self._term_success += _info["success"].long().sum().item()
                 self._term_failure += _info["failure"].long().sum().item()
+                if "explosion" in _info:
+                    self._term_explosion += _info["explosion"].long().sum().item()
 
         # Sanitize observation: NaN from invalid robot state (fallen off terrain) must not reach
         # the policy or VecNorm running statistics on the next step.
@@ -159,8 +162,9 @@ class FtrTorchRLEnv(EnvBase):
         result = {
             "env/success_rate": self._term_success / self._term_total,
             "env/failure_rate": self._term_failure / self._term_total,
+            "env/explosion_rate": self._term_explosion / self._term_total,
         }
-        self._term_success = self._term_failure = self._term_total = 0
+        self._term_success = self._term_failure = self._term_explosion = self._term_total = 0
         return result
 
     def _set_seed(self, seed: int | None) -> None:

@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 import threading
 import time
 import sys
@@ -17,7 +18,7 @@ from omegaconf import DictConfig, OmegaConf
 import wandb
 from flipper_training import ROOT
 
-PROJECT = "flipper_training"
+PROJECT = os.environ.get("WANDB_PROJECT", "flipper_training")
 
 
 def red(s):
@@ -82,18 +83,28 @@ class RunLogger:
         self.terminal_logger = get_terminal_logger("RunLogger")
         import os
         ts = time.strftime("%Y-%m-%d_%H-%M-%S") + f"_{os.getpid()}"
-        self.logpath = ROOT / f"runs/{self.category}/{self.train_config['name']}_{ts}"
-        self.terminal_logger.info(f"RunLogger initialized for run {self.logpath.name}")
+        run_name = f"{self.train_config['name']}_{ts}"
+
+        # Under SLURM jobs, store everything in the SLURM log directory.
+        # Otherwise fall back to runs/<category>/<run_name>.
+        slurm_logpath = self._slurm_log_dir()
+        if slurm_logpath is not None:
+            self.logpath = slurm_logpath
+        else:
+            self.logpath = ROOT / f"runs/{self.category}/{run_name}"
+
+        self.run_name = self.logpath.name  # use logdir name so W&B matches filesystem
+        self.terminal_logger.info(f"RunLogger initialized for run {self.run_name} at {self.logpath}")
         self.logpath.mkdir(parents=True, exist_ok=True)
         self.weights_path = self.logpath / "weights"
         self.weights_path.mkdir(exist_ok=True)
         if self.use_wandb:
-            self.wandb_run_id = hashlib.sha256(self.logpath.name.encode()).hexdigest()
+            self.wandb_run_id = hashlib.sha256(self.run_name.encode()).hexdigest()
             confdict = OmegaConf.to_container(self.train_config, resolve=False)
             wandb.init(
                 project=PROJECT,
                 id=self.wandb_run_id,
-                name=self.logpath.name,
+                name=self.run_name,
                 tags=[self.category],
                 notes=self.wandb_run_id,
                 config=confdict,
@@ -108,6 +119,28 @@ class RunLogger:
         self._save_config()
         self.write_thread = threading.Thread(target=self._write, daemon=True)
         self.write_thread.start()
+
+    @staticmethod
+    def _slurm_log_dir() -> Path | None:
+        """Return the SLURM log subdirectory for this job, or None if not in a SLURM job.
+
+        Array jobs:  logs/<name>_<array_job_id>/<name>_<array_job_id>_<task_id>/
+        Single jobs: logs/<name>_<job_id>/
+        """
+        job_name = os.environ.get("SLURM_JOB_NAME", "")
+        array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID")
+        task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+        job_id = os.environ.get("SLURM_JOB_ID")
+        if array_job_id and task_id:
+            # Array job: logs/optuna_ftr_123/optuna_ftr_123_45/
+            log_dir_name = f"{job_name}_{array_job_id}" if job_name else f"slurm_{array_job_id}"
+            task_dir_name = f"{log_dir_name}_{task_id}"
+            return ROOT / f"logs/{log_dir_name}/{task_dir_name}"
+        elif job_id:
+            # Single job: logs/train_ftr_456/
+            log_dir_name = f"{job_name}_{job_id}" if job_name else f"slurm_{job_id}"
+            return ROOT / f"logs/{log_dir_name}"
+        return None
 
     def _save_config(self):
         OmegaConf.save(self.train_config, self.logpath / "config.yaml")
@@ -132,6 +165,7 @@ class RunLogger:
             topic_row = dict(names)
             writer = self.writers.get(topic, None) or self._init_logfile(topic, topic_row)
             writer.writerow(topic_row | {self.step_metric_name: step})
+            self.logfiles[topic].flush()
 
     def _write(self):
         while True:

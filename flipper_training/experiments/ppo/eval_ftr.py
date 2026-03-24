@@ -112,6 +112,9 @@ def run_eval(raw_cfg: OmegaConf, ftr_gym_env: gymnasium.Env, max_steps: int, rep
     # Build TorchRL env + transforms + policy (mirrors FtrPPOTrainer.__init__)
     ftr_torchrl_env = FtrTorchRLEnv(ftr_gym_env, encoder_opts=cfg.ftr_obs_encoder_opts, device=device)
 
+    if max_steps == 0:
+        max_steps = ftr_gym_env.unwrapped.max_episode_length * 2
+
     policy_cfg = cfg.policy_config(**cfg.policy_opts)
     actor_value_wrapper, _, policy_transforms = policy_cfg.create(
         env=ftr_torchrl_env,
@@ -169,7 +172,7 @@ if __name__ == "__main__":
     if args.num_envs is not None:
         raw_cfg.num_robots = args.num_envs
 
-    max_steps = args.max_steps if args.max_steps is not None else raw_cfg.max_eval_steps
+    max_steps = args.max_steps if args.max_steps is not None else raw_cfg.get("max_eval_steps", 0)
 
     # Build FtrPPOConfig just to read task/terrain/env fields for gymnasium.make
     _cfg = FtrPPOConfig(**raw_cfg)
@@ -188,11 +191,37 @@ if __name__ == "__main__":
     env_cfg = _EnvCfgClass()
     env_cfg.scene.num_envs = _cfg.num_robots
     env_cfg.terrain_name = _cfg.terrain
+
+    # --- Simulation timestep ---
+    env_cfg.sim.dt = _cfg.sim_dt
+
+    # --- Rigid body properties ---
     env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
     env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
+    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
+    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
+    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
+
+    # --- Per-articulation solver iterations ---
+    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
+    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
+
+    # --- Scene-wide PhysX solver (matched to per-articulation values) ---
+    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
+    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
+    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
     env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
     env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
     env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
+
+    # Scale down GPU PhysX buffers for small env counts (e.g. local eval on laptop GPUs).
+    # The defaults in FTR_SIM_CFG are sized for 4096 envs on server GPUs.
+    if _cfg.num_robots <= 64:
+        env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
+        env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
+        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
+        env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
+        env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
     for k, v in (_cfg.env_cfg_overrides or {}).items():
         setattr(env_cfg, k, v)
 

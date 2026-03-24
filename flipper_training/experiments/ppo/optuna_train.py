@@ -13,6 +13,19 @@ from flipper_training.experiments.ppo.train import PPOTrainer
 
 
 DB_SECRET = OmegaConf.load(ROOT / "optuna_db.yaml")
+
+def _build_conn_str(db_secret) -> str:
+    if "url" in db_secret:
+        conn_str = db_secret["url"]
+        if conn_str.startswith("sqlite:///"):
+            import pathlib
+            pathlib.Path(conn_str[len("sqlite:///"):]).parent.mkdir(parents=True, exist_ok=True)
+        return conn_str
+    sslmode = db_secret.get("sslmode", "require")
+    return (
+        f"postgresql+psycopg2://{db_secret['db_user']}:{db_secret['db_password']}"
+        f"@{db_secret['db_host']}:{db_secret['db_port']}/{db_secret['db_name']}?sslmode={sslmode}"
+    )
 TERM_LOGGER = get_terminal_logger("optuna_train")
 
 
@@ -63,9 +76,7 @@ def objective(trial, base_config, keys, types, values, metrics_to_optimize):
 
 def perform_study(optuna_config: OptunaConfig, train_config):
     # Set up Optuna study
-    storage = RDBStorage(
-        f"postgresql+psycopg2://{DB_SECRET['db_user']}:{DB_SECRET['db_password']}@{DB_SECRET['db_host']}:{DB_SECRET['db_port']}/{DB_SECRET['db_name']}?sslmode=require"
-    )
+    storage = RDBStorage(_build_conn_str(DB_SECRET))
     study = optuna.create_study(
         study_name=optuna_config.study_name,
         storage=storage,

@@ -9,7 +9,7 @@ optuna_keys:
   - "policy_opts.actor_optimizer_opts.lr"
   - "policy_opts.value_optimizer_opts.lr"
   - "reward_opts.termination_reward"
-  - "reward_opts.potential_coef"
+  - "reward_opts.shaping_coef"
   - "reward_opts.step_penalty"
   - "scheduler_opts.end_factor"
   - "num_robots"

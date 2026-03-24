@@ -44,7 +44,7 @@ reward: ${cls:flipper_training.rl_rewards.rewards.PotentialGoal}
 reward_opts:
   goal_reached_reward: 100.0
   failed_reward: -100.0
-  potential_coef: 20
+  shaping_coef: 20
   gamma: 0.999
   step_penalty: -0.02
 max_eval_steps: 900
