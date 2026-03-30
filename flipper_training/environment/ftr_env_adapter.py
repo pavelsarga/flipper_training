@@ -46,6 +46,7 @@ class FtrTorchRLEnv(EnvBase):
         self.ftr_env = ftr_env
         self._last_obs: torch.Tensor | None = None
         self._reward_info_accum: dict[str, list[float]] = {}
+        self._state_stats_accum: dict[str, list[float]] = {}
         self._term_success: int = 0
         self._term_failure: int = 0
         self._term_explosion: int = 0
@@ -57,15 +58,17 @@ class FtrTorchRLEnv(EnvBase):
         self.observations = [FtrFlatObservation(env=self, encoder_opts=encoder_opts)]
 
         # ------------------------------------------------------------------ specs
+        num_actions: int = ftr_env.unwrapped.cfg.num_actions
+        obs_dim: int = self.observations[0].dim
         self.action_spec = Bounded(
             low=-1.0,
             high=1.0,
-            shape=(num_envs, 4),
+            shape=(num_envs, num_actions),
             device=device,
             dtype=torch.float32,
         )
         self.observation_spec = Composite(
-            {OBS_KEY: Unbounded(shape=(num_envs, 115), device=device, dtype=torch.float32)},
+            {OBS_KEY: Unbounded(shape=(num_envs, obs_dim), device=device, dtype=torch.float32)},
             shape=(num_envs,),
         )
         self.reward_spec = Unbounded(shape=(num_envs, 1), device=device, dtype=torch.float32)
@@ -74,6 +77,7 @@ class FtrTorchRLEnv(EnvBase):
                 "done": Binary(shape=(num_envs, 1), device=device, dtype=torch.bool),
                 "terminated": Binary(shape=(num_envs, 1), device=device, dtype=torch.bool),
                 "truncated": Binary(shape=(num_envs, 1), device=device, dtype=torch.bool),
+                "explosion": Binary(shape=(num_envs, 1), device=device, dtype=torch.bool),
             },
             shape=(num_envs,),
         )
@@ -117,6 +121,9 @@ class FtrTorchRLEnv(EnvBase):
             if "reward_components" in _info:
                 for k, v in _info["reward_components"].items():
                     self._reward_info_accum.setdefault(k, []).append(v)
+            if "state_stats" in _info:
+                for k, v in _info["state_stats"].items():
+                    self._state_stats_accum.setdefault(k, []).append(v)
             if "success" in _info and "failure" in _info:
                 episodes_done = (terminated | truncated).long().sum().item()
                 self._term_total += episodes_done
@@ -134,6 +141,11 @@ class FtrTorchRLEnv(EnvBase):
         terminated = terminated.to(self.device).unsqueeze(-1)
         truncated = truncated.to(self.device).unsqueeze(-1)
         done = terminated | truncated
+        explosion = _info.get("explosion", None) if isinstance(_info, dict) else None
+        if explosion is not None:
+            explosion = explosion.to(self.device).unsqueeze(-1)
+        else:
+            explosion = torch.zeros_like(done)
 
         return TensorDict(
             {
@@ -142,6 +154,7 @@ class FtrTorchRLEnv(EnvBase):
                 "done": done,
                 "terminated": terminated,
                 "truncated": truncated,
+                "explosion": explosion,
             },
             batch_size=self.batch_size,
             device=self.device,
@@ -153,6 +166,14 @@ class FtrTorchRLEnv(EnvBase):
             return {}
         result = {k: sum(v) / len(v) for k, v in self._reward_info_accum.items()}
         self._reward_info_accum.clear()
+        return result
+
+    def pop_state_stats(self) -> dict[str, float]:
+        """Return mean of state stats accumulated since the last call, then clear."""
+        if not self._state_stats_accum:
+            return {}
+        result = {k: sum(v) / len(v) for k, v in self._state_stats_accum.items()}
+        self._state_stats_accum.clear()
         return result
 
     def pop_termination_info(self) -> dict[str, float]:

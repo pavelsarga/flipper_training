@@ -62,6 +62,53 @@ class HeightmapEncoder(ObservationEncoder):
             # Output shape expected: (B, output_dim)
         return y_ter
 
+class FTR_HeightmapEncoder(ObservationEncoder):
+    def __init__(
+        self,
+        img_shape: tuple[int, int],
+        output_dim: int,
+        activate_output: bool = False,
+        **kwargs,
+    ):
+        super(FTR_HeightmapEncoder, self).__init__(output_dim)
+        self.img_shape = img_shape  # Keep for reference if needed, but not used in layer defs anymore
+        # Define the sequential convolutional layers
+        self.encoder = nn.Sequential(
+            # Layer 1: Similar to the original stem but using 3x3 kernel
+            # Input: (B, 1, 45, 21)
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=0, dilation=2),
+            nn.ReLU(inplace=True),
+            # Output: (B, 16, 21, 9)
+            # Layer 2: Downsample, increase channels
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=0, dilation=1),
+            nn.ReLU(inplace=True),
+            # Output: (B, 32, 10, 4)
+            # Layer 3: Downsample, increase channels
+            nn.Conv2d(32, 64, kernel_size=(4,2), stride=1, padding=0, dilation=1),
+            nn.ReLU(inplace=True),
+            # Output: (B, 64, 7, 3)
+            nn.AdaptiveAvgPool2d((2, 2)),  # Pool to 2x2 spatial dimensions
+            nn.Flatten(),  # Flatten features -> (B, 64 * 2 * 2)
+            nn.Linear(4 * 64, output_dim),  # Linear layer -> (B, output_dim)
+            nn.ReLU(inplace=True) if activate_output else nn.Identity(),
+        )
+
+    def forward(self, hm):
+        # Handle potential time dimension (same as before)
+        if hm.ndim > 4:
+            B, T = hm.shape[:2]
+            # Input shape expected: (B, T, C, H, W)
+            C, H, W = hm.shape[2:]
+            hm = hm.view(B * T, C, H, W)  # Use view for efficiency
+            y_ter = self.encoder(hm)
+            # Output shape expected: (B, T, output_dim)
+            y_ter = y_ter.view(B, T, -1)
+        else:
+            # Input shape expected: (B, C, H, W)
+            y_ter = self.encoder(hm)
+            # Output shape expected: (B, output_dim)
+        return y_ter
+
 
 @dataclass
 class Heightmap(Observation):

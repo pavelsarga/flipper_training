@@ -164,7 +164,16 @@ class RunLogger:
         for topic, names in groupby(row.items(), key=lambda x: x[0].rsplit("/", maxsplit=1)[0]):
             topic_row = dict(names)
             writer = self.writers.get(topic, None) or self._init_logfile(topic, topic_row)
-            writer.writerow(topic_row | {self.step_metric_name: step})
+            # Handle new fields not in original fieldnames by extending the writer
+            output_row = topic_row | {self.step_metric_name: step}
+            if set(output_row.keys()) - set(writer.fieldnames):
+                # New fields detected — extend fieldnames and rewrite header
+                writer.fieldnames = list(dict.fromkeys(writer.fieldnames + list(output_row.keys())))
+                self.logfiles[topic].seek(0)
+                self.logfiles[topic].truncate()
+                writer.writeheader()
+                self.logfiles[topic].flush()
+            writer.writerow(output_row)
             self.logfiles[topic].flush()
 
     def _write(self):

@@ -1,3 +1,4 @@
+import random
 import numpy as np
 import torch
 
@@ -17,10 +18,11 @@ def set_device(device: str) -> torch.device:
 
 def seed_all(seed: int) -> torch.Generator:
     """
-    Seed all the random number generators
+    Seed all random number generators (Python random, NumPy, PyTorch CPU/CUDA/MPS).
     """
-    rng = torch.manual_seed(seed)
+    random.seed(seed)
     np.random.seed(seed)
+    rng = torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.mps.manual_seed(seed)

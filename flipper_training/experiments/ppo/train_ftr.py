@@ -150,6 +150,10 @@ class FtrPPOTrainer:
         if self.optuna_trial is not None:
             self.optuna_trial.set_user_attr("logpath", str(self.run_logger.logpath))
         self.term_logger = get_terminal_logger("ftr_ppo_train")
+        self.term_logger.info(
+            f"Seed: {self.config.seed}  "
+            f"(random ✓  numpy ✓  torch ✓  cuda ✓)"
+        )
 
         # ---- environment ----
         self.ftr_torchrl_env = FtrTorchRLEnv(ftr_gym_env, encoder_opts=self.config.ftr_obs_encoder_opts, device=self.device)
@@ -271,39 +275,97 @@ class FtrPPOTrainer:
             self.value_operator.train()
             self.env.train()
 
-            # GAE computed once; extend CPU replay buffer; free the CUDA rollout tensor
-            # before PPO training so PhysX can reclaim GPU memory for the next collection.
-            self.advantage_module(tensordict_data)
+            # Before GAE: remove entire env trajectories that contain any explosion step.
+            # An explosion teleports the robot to a "safe" origin; the step immediately
+            # before the explosion uses V(safe_state) as the GAE bootstrap, which
+            # corrupts advantages for the whole preceding segment.  Filtering at the
+            # trajectory level (entire row in [num_envs, time]) removes both the
+            # explosion step AND the contaminated pre-explosion bootstrap in one shot.
+            explosion_flags = tensordict_data.get(("next", "explosion"), None)
+            if explosion_flags is not None:
+                has_explosion = explosion_flags.squeeze(-1).any(dim=1)  # [num_envs]
+                n_dirty = int(has_explosion.sum().item())
+                if n_dirty > 0:
+                    tensordict_data = tensordict_data[~has_explosion]
+                    self.term_logger.info(
+                        f"Excluded {n_dirty}/{self.config.num_robots} env trajectories with explosions from GAE"
+                        f" ({self.config.num_robots - n_dirty} clean)"
+                    )
 
-            # Sanitize all float tensors before extending the replay buffer.
-            # NaN/Inf in sample_log_prob, advantage, or value estimates (from physics
-            # explosions that slip through the env-side guards) would poison every
-            # sub-batch sampled from the buffer, causing all gradient updates to be
-            # skipped for the entire iteration.
+            if tensordict_data.batch_size[0] == 0:
+                # Every env exploded this iteration — nothing clean to train on.
+                self.term_logger.warning("All env trajectories had explosions — skipping update this iteration.")
+                self.scheduler.step()
+                log = {
+                    **self.ftr_torchrl_env.pop_reward_info(),
+                    **self.ftr_torchrl_env.pop_termination_info(),
+                    **self.ftr_torchrl_env.pop_state_stats(),
+                }
+                self.run_logger.log_data(log, total_collected_frames)
+                continue
+
+            # GAE computed in chunks to avoid CUDA OOM: the CNN encoder flattens to
+            # [N*T, 1, 45, 21] which exhausts memory at full batch (512*128=65536).
+            # Chunk across the env axis so each pass is ~frames_per_sub_batch frames.
+            # NOTE: TorchRL slice views propagate writes to existing keys but NOT new
+            # key insertions, so we cat the GAE-produced keys back into the parent.
+            _gae_chunk = max(1, self.config.frames_per_sub_batch // self.config.time_steps_per_batch)
+            _n_clean = tensordict_data.batch_size[0]
+            _chunks = []
+            for _c in range(0, _n_clean, _gae_chunk):
+                _chunk = tensordict_data[_c:_c + _gae_chunk]
+                self.advantage_module(_chunk)
+                _chunks.append(_chunk)
+            for _key in ("advantage", "value_target", "state_value"):
+                if _key in _chunks[0].keys():
+                    tensordict_data[_key] = torch.cat([_ch[_key] for _ch in _chunks], dim=0)
+
+            # Sanitize any remaining NaN/Inf (should be rare after trajectory filter).
             nan_count = 0
+            nan_keys = []
             for key in tensordict_data.keys(include_nested=True, leaves_only=True):
                 t = tensordict_data[key]
                 if t.is_floating_point():
                     bad = ~t.isfinite()
                     if bad.any():
                         nan_count += int(bad.sum().item())
+                        nan_keys.append(f"{key}({bad.sum().item()})")
                         tensordict_data[key] = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
             if nan_count > 0:
-                self.term_logger.warning(f"Sanitized {nan_count} non-finite values in rollout tensordict before replay buffer extension")
+                self.term_logger.warning(
+                    f"Sanitized {nan_count} non-finite values in rollout tensordict: {', '.join(nan_keys)}"
+                )
 
-            self.replay_buffer.extend(tensordict_data.reshape(-1))
-            rollout_log_prob = tensordict_data["sample_log_prob"].mean().item()
-            rollout_adv_mean = tensordict_data["advantage"].mean().item()
-            rollout_adv_std = tensordict_data["advantage"].std().item()
-            rollout_mean_reward = tensordict_data["next", "reward"].mean().item()
-            rollout_mean_state_value = tensordict_data["state_value"].mean().item()
+            flat = tensordict_data.reshape(-1)
+            n_valid = flat.shape[0]
+
+            rollout_log_prob = flat["sample_log_prob"].mean().item()
+            rollout_adv_mean = flat["advantage"].mean().item()
+            rollout_adv_std = flat["advantage"].std().item()
+            rollout_mean_reward = flat[("next", "reward")].mean().item()
+            rollout_mean_state_value = flat["state_value"].mean().item()
             rollout_value_minus_reward = rollout_mean_state_value - rollout_mean_reward
-            del tensordict_data
+
+            actions = flat["action"]  # [N, num_actions]
+            action_log = {
+                "action/v_mean":  actions[:, 0].mean().item(),
+                "action/v_std":   actions[:, 0].std().item(),
+                "action/w_mean":  actions[:, 1].mean().item(),
+                "action/w_std":   actions[:, 1].std().item(),
+            }
+            flipper_names = ["fl", "fr", "rl", "rr"]
+            for fi, fname in enumerate(flipper_names):
+                action_log[f"action/flipper_{fname}_mean"] = actions[:, 2 + fi].mean().item()
+                action_log[f"action/flipper_{fname}_std"]  = actions[:, 2 + fi].std().item()
+
+            self.replay_buffer.extend(flat)
+            del tensordict_data, flat
             if "cuda" in str(self.device):
                 torch.cuda.empty_cache()
 
+            n_subbatches = max(1, n_valid // self.config.frames_per_sub_batch)
             for _j in range(self.config.epochs_per_batch):
-                for _k in range(iteration_size // self.config.frames_per_sub_batch):
+                for _k in range(n_subbatches):
                     sub_batch = self.replay_buffer.sample().to(self.device)
                     loss_vals = self.loss_module(sub_batch)
                     loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"] + loss_vals["loss_entropy"]
@@ -326,8 +388,10 @@ class FtrPPOTrainer:
 
             self.scheduler.step()
             log = {
+                **action_log,
                 **self.ftr_torchrl_env.pop_reward_info(),
                 **self.ftr_torchrl_env.pop_termination_info(),
+                **self.ftr_torchrl_env.pop_state_stats(),
                 "train/mean_reward": rollout_mean_reward,
                 "train/mean_state_value": rollout_mean_state_value,
                 "train/value_minus_reward": rollout_value_minus_reward,

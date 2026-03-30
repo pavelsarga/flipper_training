@@ -32,6 +32,14 @@ parser.add_argument(
     "--max_steps", type=int, default=None,
     help="Override max_eval_steps from config.",
 )
+parser.add_argument(
+    "--plot_heightmap", action="store_true",
+    help="Save heightmap plots to /tmp/ftr_eval_<timestamp>/. Requires num_envs=1.",
+)
+parser.add_argument(
+    "--plot_interval", type=int, default=1,
+    help="Save a heightmap every N steps (default: 1 = every step).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args, unknown_args = parser.parse_known_args()
 app_launcher = AppLauncher(args)
@@ -65,11 +73,111 @@ import gymnasium
 logger = get_terminal_logger("eval_ftr")
 
 
-def _run_single_rollout(env, ftr_torchrl_env: FtrTorchRLEnv, actor, max_steps: int) -> dict[str, float]:
+def _save_heightmap(ftr_gym_env, step: int, out_dir: "Path") -> None:
+    import matplotlib.pyplot as plt
+
+    unwrapped = ftr_gym_env.unwrapped
+    hmap = unwrapped.current_frame_height_maps[0].cpu().numpy()  # (45, 21)
+    pos = unwrapped.positions[0].cpu()
+    lin_vel = unwrapped.robot_lin_velocities[0].cpu().norm().item()
+    ang_vel = unwrapped.robot_ang_velocities[0].cpu().norm().item()
+    dist = (unwrapped.target_positions[0, :2] - unwrapped.positions[0, :2]).cpu().norm().item()
+
+    fig, ax = plt.subplots(figsize=(5, 9))
+    # origin="upper": row 0 at top = front (+x); row N at bottom = rear (−x).
+    im = ax.imshow(hmap, origin="upper", cmap="terrain", aspect="auto")
+    plt.colorbar(im, ax=ax, label="height (m)")
+    # mark robot position (center of map)
+    cy, cx = hmap.shape[0] // 2, hmap.shape[1] // 2
+    ax.plot(cx, cy, "r^", markersize=10, label="robot")
+    ax.set_title(
+        f"step={step:04d}  pos=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})\n"
+        f"lin_vel={lin_vel:.2f}m/s  ang_vel={ang_vel:.2f}rad/s  dist_goal={dist:.2f}m"
+    )
+    ax.set_xlabel("← −y (left)   +y (right) →")
+    ax.set_ylabel("rear (bottom) ↑ front (top)")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"heightmap.png", dpi=80)
+    fig.savefig(out_dir / f"step_{step:04d}.png", dpi=80)
+    plt.close(fig)
+
+def _print_lin_vels(ftr_gym_env, label: str = "Linear velocities") -> None:
+    """Print a per-robot linear velocity table with vx, vy, vz, speed and aggregate stats."""
+    unwrapped = ftr_gym_env.unwrapped
+    vels = unwrapped.robot_lin_velocities.cpu()   # [N, 3]
+    speeds = vels.norm(dim=-1)                    # [N]
+
+    logger.info(f"{label}:")
+    logger.info(f"  {'Robot':>5}  {'vx (m/s)':>9}  {'vy (m/s)':>9}  {'vz (m/s)':>9}  {'speed':>7}")
+    for i in range(vels.shape[0]):
+        logger.info(
+            f"  {i:>5}  {vels[i, 0]:>9.4f}  {vels[i, 1]:>9.4f}  {vels[i, 2]:>9.4f}  {speeds[i]:>7.4f}"
+        )
+    logger.info(
+        f"  Summary — mean={speeds.mean():.4f}  max={speeds.max():.4f}  "
+        f"min={speeds.min():.4f}  std={speeds.std():.4f} m/s"
+    )
+
+
+
+def _run_single_rollout_with_heightmap(
+    env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor, max_steps: int,
+    out_dir: "Path", plot_interval: int,
+) -> dict[str, float]:
+    """Manual step loop that saves a heightmap image every plot_interval steps."""
+    import matplotlib.pyplot as plt
+
+    logger.info(f"Saving heightmap plots to {out_dir} every {plot_interval} step(s)")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    td = env.reset()
+    total_reward = 0.0
+    n_steps = 0
+
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
+        for step in range(max_steps):
+            if plot_interval > 0 and step % plot_interval == 0:
+                _save_heightmap(ftr_gym_env, step, out_dir)
+
+            td = actor(td)
+            td = env.step(td)
+            total_reward += td["next", "reward"].mean().item()
+            n_steps += 1
+
+            if td["next", "done"].all():
+                break
+            td = td["next"]
+
+    # save final frame
+    _save_heightmap(ftr_gym_env, n_steps, out_dir)
+
+    # try to stitch into a GIF
+    try:
+        import imageio.v2 as imageio
+        frames = sorted(out_dir.glob("step_*.png"))
+        gif_path = out_dir / "heightmap.gif"
+        imgs = [imageio.imread(str(f)) for f in frames]
+        imageio.mimsave(str(gif_path), imgs, fps=10)
+        logger.info(f"Saved GIF: {gif_path}")
+    except Exception as e:
+        logger.info(f"Could not create GIF (imageio not available or error: {e}). Individual PNGs are in {out_dir}")
+
+    results: dict[str, float] = {
+        "eval/mean_step_reward": total_reward / max(n_steps, 1),
+        "eval/rollout_steps": float(n_steps),
+    }
+    term_info = ftr_torchrl_env.pop_termination_info()
+    results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
+    results.update(ftr_torchrl_env.pop_reward_info())
+    return results
+
+
+def _run_single_rollout(env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor, max_steps: int) -> dict[str, float]:
     """Run one deterministic rollout and return a flat dict of metrics."""
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
         rollout = env.rollout(max_steps, actor, auto_reset=True, break_when_all_done=True)
-
+    _print_lin_vels(ftr_gym_env, label="Linear velocities at end of rollout")
     results: dict[str, float] = {
         "eval/mean_step_reward": rollout["next", "reward"].mean().item(),
         "eval/max_step_reward":  rollout["next", "reward"].max().item(),
@@ -104,10 +212,18 @@ def _print_results(results: dict[str, float], header: str) -> None:
             print(f"  {k:<45} {v:.6f}")
 
 
-def run_eval(raw_cfg: OmegaConf, ftr_gym_env: gymnasium.Env, max_steps: int, repeats: int) -> None:
+def run_eval(
+    raw_cfg: OmegaConf,
+    ftr_gym_env: gymnasium.Env,
+    max_steps: int,
+    repeats: int,
+    plot_heightmap: bool = False,
+    plot_interval: int = 1,
+) -> None:
     cfg = FtrPPOConfig(**raw_cfg)
     device = set_device(cfg.device)
     seed_all(cfg.seed)
+    logger.info(f"Seed: {cfg.seed}  (random ✓  numpy ✓  torch ✓  cuda ✓)")
 
     # Build TorchRL env + transforms + policy (mirrors FtrPPOTrainer.__init__)
     ftr_torchrl_env = FtrTorchRLEnv(ftr_gym_env, encoder_opts=cfg.ftr_obs_encoder_opts, device=device)
@@ -132,10 +248,21 @@ def run_eval(raw_cfg: OmegaConf, ftr_gym_env: gymnasium.Env, max_steps: int, rep
     actor.eval()
     env.eval()
 
+    if plot_heightmap and ftr_gym_env.unwrapped.num_envs != 1:
+        raise ValueError("--plot_heightmap requires num_envs=1 (pass --num_envs 1)")
+
     all_results: list[dict[str, float]] = []
     for r in range(repeats):
         logger.info(f"Running eval rollout {r + 1}/{repeats} (max_steps={max_steps}) ...")
-        results = _run_single_rollout(env, ftr_torchrl_env, actor, max_steps)
+        if plot_heightmap:
+            from datetime import datetime
+            out_dir = Path(f"/tmp/ftr_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}_r{r+1}")
+            results = _run_single_rollout_with_heightmap(
+                env, ftr_torchrl_env, ftr_gym_env, actor, max_steps,
+                out_dir=out_dir, plot_interval=plot_interval,
+            )
+        else:
+            results = _run_single_rollout(env, ftr_torchrl_env,ftr_gym_env, actor, max_steps)
         _print_results(results, f"Repeat {r + 1}/{repeats}")
         all_results.append(results)
 
@@ -227,6 +354,12 @@ if __name__ == "__main__":
 
     ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
 
-    run_eval(raw_cfg, ftr_gym_env, max_steps=max_steps, repeats=args.repeats)
+    run_eval(
+        raw_cfg, ftr_gym_env,
+        max_steps=max_steps,
+        repeats=args.repeats,
+        plot_heightmap=args.plot_heightmap,
+        plot_interval=args.plot_interval,
+    )
 
     simulation_app.close()
