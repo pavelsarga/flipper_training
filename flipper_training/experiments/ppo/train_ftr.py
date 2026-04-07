@@ -68,7 +68,91 @@ from flipper_training.utils.torch_utils import seed_all, set_device
 
 
 # ============================================================
-# BLOCK 3 — Config dataclass for FTR-specific PPO training
+# BLOCK 3 — Reward analysis helpers
+# ============================================================
+
+_REWARD_ANALYSIS_EXCLUDE = frozenset({
+    "rew/total_reward",
+    "rew/success_reward_value",
+    "rew/fail_reward_value",
+    "rew/success_rate_step",
+    "rew/fail_rate_step",
+    "rew/step_penalty",
+})
+
+
+def _compute_reward_grad_stats(
+    flat: "torch.Tensor",
+    reward_series: dict[str, list[float]],
+    time_steps_per_batch: int,
+) -> dict[str, float]:
+    """Compute per-component variance decomposition and gradient contribution.
+
+    **Variance decomposition** — ``Cov(R_i, R_total) / Var(R_total)``
+    Each component's share of total reward variance; values sum to ~1 across
+    all components (may be negative when a component is anti-correlated with
+    the total reward).
+
+    **Gradient contribution** — ``Cov(R_i, A) / Σ_j |Cov(R_j, A)|``
+    Each component's correlation with the GAE advantage that drives policy
+    updates; absolute values sum to 1.
+
+    Both statistics use per-step mean time-series (T values = time_steps_per_batch,
+    each value being the mean over the healthy env population for that step).
+
+    Args:
+        flat: Reshaped rollout tensordict of shape ``(N_clean * T,)``.
+        reward_series: Per-step scalar series from
+            ``FtrTorchRLEnv.peek_reward_series()`` — NOT yet cleared.
+        time_steps_per_batch: Number of steps T collected per iteration.
+
+    Returns:
+        Dict with keys ``var_decomp/{component}`` and ``grad_contrib/{component}``.
+        Empty dict if total reward has near-zero variance or no valid components.
+    """
+    T = time_steps_per_batch
+    N_clean = flat.shape[0] // T
+
+    # Per-step mean total reward and advantage over healthy envs: (T,)
+    r_total = flat[("next", "reward")].squeeze(-1).reshape(N_clean, T).mean(0)
+    adv = flat["advantage"].squeeze(-1).reshape(N_clean, T).mean(0)
+
+    r_total_c = r_total - r_total.mean()
+    adv_c = adv - adv.mean()
+    var_total = (r_total_c ** 2).mean()
+
+    if var_total < 1e-8:
+        return {}
+
+    var_decomp_log: dict[str, float] = {}
+    cov_with_adv: dict[str, float] = {}
+
+    for key, series in reward_series.items():
+        if key in _REWARD_ANALYSIS_EXCLUDE or not key.startswith("rew/"):
+            continue
+        r_i = torch.tensor(series, dtype=torch.float32, device=r_total.device)
+        # Skip zero-variance components (e.g. disabled penalties).
+        if r_i.std() < 1e-6:
+            continue
+        r_i_c = r_i - r_i.mean()
+        short_key = key[4:]  # strip "rew/" prefix
+
+        cov_total = (r_i_c * r_total_c).mean()
+        var_decomp_log[f"var_decomp/{short_key}"] = (cov_total / var_total).item()
+
+        cov_adv = (r_i_c * adv_c).mean()
+        cov_with_adv[f"grad_contrib/{short_key}"] = cov_adv.item()
+
+    # Normalise gradient contribution so absolute values sum to 1
+    total_abs = sum(abs(v) for v in cov_with_adv.values())
+    if total_abs > 1e-8:
+        cov_with_adv = {k: v / total_abs for k, v in cov_with_adv.items()}
+
+    return {**var_decomp_log, **cov_with_adv}
+
+
+# ============================================================
+# BLOCK 4 — Config dataclass for FTR-specific PPO training
 # ============================================================
 
 @dataclass
@@ -88,6 +172,7 @@ class FtrPPOConfig:
     epochs_per_batch: int
     frames_per_sub_batch: int
     eval_and_save_every: int
+    eval_repeats: int                   # rollouts averaged per mid-training eval checkpoint
     eval_repeats_after_training: int
     max_grad_norm: float
     clip_grad_norm_p: int | str
@@ -112,6 +197,10 @@ class FtrPPOConfig:
     extra_env_transforms: list = field(default_factory=list)
     # Env config overrides applied via setattr before env creation
     env_cfg_overrides: dict = field(default_factory=dict)
+    # Linear decay for action_bonus_coef (same semantics as LinearLR).
+    # Keys: start_factor (default 1.0), end_factor, total_iters.
+    # null = disabled (action_bonus_coef stays constant).
+    action_bonus_coef_scheduler: dict | None = None
     # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
     sim_dt: float = 1 / 400
     solver_position_iterations: int = 16
@@ -125,6 +214,86 @@ class FtrPPOConfig:
     physx_gpu_heap_capacity: int = 2**28
     physx_gpu_temp_buffer_capacity: int = 2**26
     physx_gpu_max_num_partitions: int = 8
+
+
+class _BaseCfgScheduler:
+    """Base class for config attribute schedulers."""
+
+    def __init__(self, cfg, attr: str, init_value: float, start_factor: float = 1.0, end_factor: float = 0.0, total_iters: int = 1):
+        self._cfg = cfg
+        self._attr = attr
+        self._init = init_value
+        self._start_f = start_factor
+        self._end_f = end_factor
+        self._total = total_iters
+        self._step = 0
+        setattr(self._cfg, self._attr, self._init * self._start_f)
+
+    def step(self):
+        raise NotImplementedError
+
+    @property
+    def current_value(self) -> float:
+        return getattr(self._cfg, self._attr)
+
+
+class _LinearCfgScheduler(_BaseCfgScheduler):
+    """Linearly anneals a float attribute on a config object, mirroring torch LinearLR semantics."""
+
+    def step(self):
+        self._step = min(self._step + 1, self._total)
+        factor = self._start_f + (self._end_f - self._start_f) * self._step / self._total
+        setattr(self._cfg, self._attr, self._init * factor)
+
+
+class _ExponentialCfgScheduler(_BaseCfgScheduler):
+    """Exponentially anneals a float attribute.
+
+    Factor decays as: start_factor * (end_factor / start_factor)^(step / total_iters)
+    Example: start_factor=1.0, end_factor=0.1, total_iters=1000
+    - step 0: factor = 1.0
+    - step 500: factor ≈ 0.316
+    - step 1000: factor = 0.1
+    """
+
+    def step(self):
+        self._step = min(self._step + 1, self._total)
+        # Exponential decay: avoid log(0) by clamping
+        if self._end_f <= 0 or self._start_f <= 0:
+            raise ValueError("Exponential scheduler requires start_factor and end_factor > 0")
+        # factor = start_f * (end_f / start_f)^(step / total)
+        exponent = self._step / self._total
+        factor = self._start_f * ((self._end_f / self._start_f) ** exponent)
+        setattr(self._cfg, self._attr, self._init * factor)
+
+
+def _make_cfg_scheduler(cfg, attr: str, init_value: float, sched_dict: dict, total_iters: int) -> _BaseCfgScheduler | None:
+    """Factory to create appropriate scheduler based on config dict.
+
+    Args:
+        cfg: Config object to mutate
+        attr: Attribute name to annealing
+        init_value: Initial value before scheduling
+        sched_dict: Dict with keys: type (linear/exponential), start_factor, end_factor, total_iters (optional)
+        total_iters: Default total iterations if not in sched_dict
+
+    Returns:
+        Scheduler instance or None if sched_dict is None
+    """
+    if sched_dict is None:
+        return None
+
+    sched_type = sched_dict.get("type", "linear").lower()
+    start_f = sched_dict.get("start_factor", 1.0)
+    end_f = sched_dict.get("end_factor", 0.0)
+    total_i = sched_dict.get("total_iters", total_iters)
+
+    if sched_type == "linear":
+        return _LinearCfgScheduler(cfg, attr, init_value, start_factor=start_f, end_factor=end_f, total_iters=total_i)
+    elif sched_type == "exponential":
+        return _ExponentialCfgScheduler(cfg, attr, init_value, start_factor=start_f, end_factor=end_f, total_iters=total_i)
+    else:
+        raise ValueError(f"Unknown scheduler type: {sched_type}. Choose from: linear, exponential")
 
 
 # ============================================================
@@ -176,6 +345,10 @@ class FtrPPOTrainer:
                 torch.load(self.config.vecnorm_weights_path, map_location=self.device), strict=False
             )
 
+        # ---- auto-resume from crash checkpoint ----
+        self.crash_checkpoint = None
+        self._check_and_load_crash_checkpoint()
+
         # ---- data collection ----
         iteration_size = self.config.time_steps_per_batch * self.config.num_robots
         self.collector = SyncDataCollector(
@@ -216,7 +389,74 @@ class FtrPPOTrainer:
         self.optim = self.config.optimizer(self.optim_groups, **(self.config.optimizer_opts or {}))
         self.scheduler = self.config.scheduler(self.optim, **(self.config.scheduler_opts or {}))
 
+        # ---- action_bonus_coef scheduler ----
+        _abc_init = self.config.env_cfg_overrides.get("action_bonus_coef")
+        _abc_sched = self.config.action_bonus_coef_scheduler
+        if _abc_sched is not None and _abc_init is not None:
+            _total_iters = self.config.total_frames // (self.config.time_steps_per_batch * self.config.num_robots)
+            self.action_bonus_scheduler = _make_cfg_scheduler(
+                self.ftr_torchrl_env.ftr_env.unwrapped.cfg,
+                "action_bonus_coef",
+                _abc_init,
+                _abc_sched,
+                _total_iters,
+            )
+        else:
+            self.action_bonus_scheduler = None
+
         self.term_logger.info("Initialized FtrPPOTrainer.")
+
+    def _check_and_load_crash_checkpoint(self):
+        """Check for crash checkpoints or latest step checkpoint and auto-resume."""
+        weights_dir = Path(self.run_logger.weights_path)
+
+        # Priority 1: Check for crash checkpoints (saved on exception)
+        policy_crash = weights_dir / "policy_crash.pth"
+        vecnorm_crash = weights_dir / "vecnorm_crash.pth"
+
+        policy_to_load = None
+        vecnorm_to_load = None
+        checkpoint_source = None
+
+        if policy_crash.exists() and vecnorm_crash.exists():
+            policy_to_load = policy_crash
+            vecnorm_to_load = vecnorm_crash
+            checkpoint_source = "crash"
+        else:
+            # Priority 2: Find latest step checkpoint (by frame count)
+            step_policies = sorted(weights_dir.glob("policy_step_*.pth"),
+                                 key=lambda p: int(p.stem.split("_")[-1]))
+            step_vecnorms = sorted(weights_dir.glob("vecnorm_step_*.pth"),
+                                 key=lambda p: int(p.stem.split("_")[-1]))
+
+            if step_policies and step_vecnorms:
+                # Use highest frame count
+                policy_to_load = step_policies[-1]
+                vecnorm_to_load = step_vecnorms[-1]
+                checkpoint_source = "step"
+
+        if policy_to_load and vecnorm_to_load:
+            self.term_logger.warning(
+                f"Found {checkpoint_source} checkpoint: {policy_to_load.name} / {vecnorm_to_load.name}"
+            )
+            try:
+                policy_state = torch.load(policy_to_load, map_location=self.device)
+                self.actor_value_wrapper.load_state_dict(policy_state, strict=False)
+                self.term_logger.info(f"Loaded policy from {checkpoint_source} checkpoint")
+            except Exception as e:
+                self.term_logger.error(f"Failed to load policy: {e}")
+
+            try:
+                vecnorm_state = torch.load(vecnorm_to_load, map_location=self.device)
+                self.vecnorm.load_state_dict(vecnorm_state, strict=False)
+                self.term_logger.info(f"Loaded vecnorm from {checkpoint_source} checkpoint")
+            except Exception as e:
+                self.term_logger.error(f"Failed to load vecnorm: {e}")
+
+            self.crash_checkpoint = True
+            self.term_logger.warning(
+                f"Resuming from {checkpoint_source} checkpoint — training may have inconsistent metrics."
+            )
 
     # ------------------------------------------------------------------
     def train(self):
@@ -229,11 +469,12 @@ class FtrPPOTrainer:
         except Exception as e:
             self.term_logger.error(f"Training failed: {e}")
             traceback.print_exception(e)
-            if "CUDA error" in str(e) or "CUDA out of memory" in str(e):
+            if "CUDA error" in str(e) or "CUDA out of memory" in str(e) or "CommError" in str(type(e).__name__):
                 # CUDA context is dead — saving weights and running atexit/Isaac Sim
                 # cleanup handlers will deadlock. Exit immediately so the SLURM slot
                 # is freed and the job can be requeued rather than hanging for hours.
-                self.term_logger.error("CUDA error detected — calling os._exit(75) to skip cleanup.")
+                # Also exit on W&B CommError (TLS cert issues) to allow respawn.
+                self.term_logger.error(f"{type(e).__name__} detected — calling os._exit(75) to skip cleanup.")
                 import os as _os
                 _os._exit(75)
             try:
@@ -339,6 +580,14 @@ class FtrPPOTrainer:
             flat = tensordict_data.reshape(-1)
             n_valid = flat.shape[0]
 
+            # Reward variance decomposition & gradient contribution (diagnostic).
+            # Must be called BEFORE del flat and BEFORE pop_reward_series clears the accum.
+            _reward_series = self.ftr_torchrl_env.peek_reward_series()
+            reward_grad_stats = (
+                _compute_reward_grad_stats(flat, _reward_series, self.config.time_steps_per_batch)
+                if _reward_series else {}
+            )
+
             rollout_log_prob = flat["sample_log_prob"].mean().item()
             rollout_adv_mean = flat["advantage"].mean().item()
             rollout_adv_std = flat["advantage"].std().item()
@@ -387,8 +636,13 @@ class FtrPPOTrainer:
                 torch.cuda.empty_cache()
 
             self.scheduler.step()
+            if self.action_bonus_scheduler is not None:
+                self.action_bonus_scheduler.step()
+            _abc_current = self.action_bonus_scheduler.current_value if self.action_bonus_scheduler is not None else self.config.env_cfg_overrides.get("action_bonus_coef")
+
             log = {
                 **action_log,
+                **reward_grad_stats,
                 **self.ftr_torchrl_env.pop_reward_info(),
                 **self.ftr_torchrl_env.pop_termination_info(),
                 **self.ftr_torchrl_env.pop_state_stats(),
@@ -407,6 +661,7 @@ class FtrPPOTrainer:
                 "train/std_advantage": rollout_adv_std,
                 "train/total_grad_norm": grad_norm.item(),
                 **{f"train/{g['name']}_lr": g["lr"] for g in self.optim.param_groups},
+                "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
             }
 
             save_every = self.config.save_weights_every or self.config.eval_and_save_every
@@ -416,6 +671,12 @@ class FtrPPOTrainer:
             if i % self.config.eval_and_save_every == 0 and i > 0:
                 try:
                     eval_log = self._get_eval_rollout_results()
+                    for _ in range(self.config.eval_repeats - 1):
+                        for k, v in self._get_eval_rollout_results().items():
+                            eval_log[k] += v
+                    if self.config.eval_repeats > 1:
+                        for k in eval_log:
+                            eval_log[k] /= self.config.eval_repeats
                     log.update(eval_log)
 
                     if self.optuna_trial is not None:

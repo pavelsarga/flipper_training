@@ -67,16 +67,28 @@ class FlipperPolicyNode(Node):
             self.get_logger().error("config_path and policy_weights_path parameters are required!")
             raise ValueError("Missing required parameters")
 
-        # Initialize policy inference module
-        self.get_logger().info(f"Loading policy from {config_path}")
-        from flipper_training.experiments.ppo.policy_inference_module import PPOPolicyInferenceModule
-
-        self.policy = PPOPolicyInferenceModule(
-            train_config_path=config_path,
-            policy_weights_path=policy_weights_path,
-            vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
-            device=device,
+        # Auto-detect FTR vs native policy from config contents
+        self._is_ftr = self._detect_ftr_config(config_path)
+        self.get_logger().info(
+            f"Loading {'FTR' if self._is_ftr else 'native'} policy from {config_path}"
         )
+
+        if self._is_ftr:
+            from flipper_training.experiments.ppo.ftr_policy_inference_module import FtrPolicyInferenceModule
+            self.policy = FtrPolicyInferenceModule(
+                config_path=config_path,
+                policy_weights_path=policy_weights_path,
+                vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
+                device=device,
+            )
+        else:
+            from flipper_training.experiments.ppo.policy_inference_module import PPOPolicyInferenceModule
+            self.policy = PPOPolicyInferenceModule(
+                train_config_path=config_path,
+                policy_weights_path=policy_weights_path,
+                vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
+                device=device,
+            )
         self.get_logger().info("Policy loaded successfully")
 
         # State storage
@@ -118,6 +130,13 @@ class FlipperPolicyNode(Node):
             "front_right": self.create_publisher(Float64, "/flippers_cmd_vel/front_right", 10),
             "rear_left": self.create_publisher(Float64, "/flippers_cmd_vel/rear_left", 10),
             "rear_right": self.create_publisher(Float64, "/flippers_cmd_vel/rear_right", 10),
+        }
+        # FTR policy outputs position increments — use relative position commands
+        self.flipper_pos_rel_pubs = {
+            "front_left": self.create_publisher(Float64, "/flippers_cmd_pos_rel/front_left", 10),
+            "front_right": self.create_publisher(Float64, "/flippers_cmd_pos_rel/front_right", 10),
+            "rear_left": self.create_publisher(Float64, "/flippers_cmd_pos_rel/rear_left", 10),
+            "rear_right": self.create_publisher(Float64, "/flippers_cmd_pos_rel/rear_right", 10),
         }
 
         # Debug visualization publishers
@@ -591,31 +610,61 @@ class FlipperPolicyNode(Node):
             self.get_logger().error(f"Policy inference failed: {e}")
             return
 
-        # Parse action: [4 track velocities, 4 flipper rotational velocities]
-        # Convert to numpy if torch tensor
+        # Parse action and publish commands
         if hasattr(action, 'cpu'):
             action = action.cpu().numpy()
         action = np.asarray(action, dtype=np.float64)
-        track_velocities = action[:4]
-        flipper_velocities = action[4:8] * self.flipper_velocity_scale
 
-        # Publish cmd_vel
-        twist = self.track_velocities_to_twist(track_velocities)
-        self.cmd_vel_pub.publish(twist)
-
-        # Publish flipper velocities directly
+        twist = Twist()
         flipper_keys = ["front_left", "front_right", "rear_left", "rear_right"]
-        for i, key in enumerate(flipper_keys):
-            msg = Float64()
-            msg.data = float(flipper_velocities[i])
-            self.flipper_pubs[key].publish(msg)
+        if self._is_ftr:
+            # FTR: 6-D [v, w, fl, fr, rl, rr]
+            # Track: raw output is already in m/s and rad/s (clamped to 0.95 m/s, 1.0 rad/s in training)
+            twist.linear.x = float(action[0])
+            twist.angular.z = float(action[1])
+            self.cmd_vel_pub.publish(twist)
+            # Flippers: FTR outputs position increments (action × flipper_dt=5 degrees per physics step)
+            # Apply FTR front-flipper sign convention (same as FtrWheelArticulation: [-1,-1,1,1])
+            # Publish as relative position commands (rad)
+            flipper_compensation = np.array([-1.0, -1.0, 1.0, 1.0])
+            flipper_delta_rad = np.deg2rad(action[2:6] * 5.0) * flipper_compensation * self.flipper_velocity_scale
+            for i, key in enumerate(flipper_keys):
+                msg = Float64()
+                msg.data = float(flipper_delta_rad[i])
+                self.flipper_pos_rel_pubs[key].publish(msg)
+            self.get_logger().info(
+                f"CMD: vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) "
+                f"flipper_delta_deg=[{np.rad2deg(flipper_delta_rad[0]):.2f}, {np.rad2deg(flipper_delta_rad[1]):.2f}, "
+                f"{np.rad2deg(flipper_delta_rad[2]):.2f}, {np.rad2deg(flipper_delta_rad[3]):.2f}]",
+                throttle_duration_sec=0.5,
+            )
+        else:
+            # Native: 8-D [track_vl, track_vr, track_vl2, track_vr2, fl, fr, rl, rr]
+            track_velocities = action[:4]
+            twist = self.track_velocities_to_twist(track_velocities)
+            flipper_velocities = action[4:8] * self.flipper_velocity_scale
+            self.cmd_vel_pub.publish(twist)
+            for i, key in enumerate(flipper_keys):
+                msg = Float64()
+                msg.data = float(flipper_velocities[i])
+                self.flipper_pubs[key].publish(msg)
+            self.get_logger().info(
+                f"CMD: vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) "
+                f"flipper_vel=[{flipper_velocities[0]:.2f}, {flipper_velocities[1]:.2f}, "
+                f"{flipper_velocities[2]:.2f}, {flipper_velocities[3]:.2f}]",
+                throttle_duration_sec=0.5,
+            )
 
-        self.get_logger().info(
-            f"CMD: vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) "
-            f"flipper_vel=[{flipper_velocities[0]:.2f}, {flipper_velocities[1]:.2f}, "
-            f"{flipper_velocities[2]:.2f}, {flipper_velocities[3]:.2f}]",
-            throttle_duration_sec=0.5,
-        )
+
+    @staticmethod
+    def _detect_ftr_config(config_path: str) -> bool:
+        """Return True if config_path is an FTR training config (train_ftr.py)."""
+        try:
+            from omegaconf import OmegaConf
+            cfg = OmegaConf.load(config_path)
+            return "ftr_obs_encoder_opts" in cfg or "task" in cfg
+        except Exception:
+            return False
 
 
 def main(args=None):

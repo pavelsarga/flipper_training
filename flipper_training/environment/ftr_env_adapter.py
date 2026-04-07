@@ -160,6 +160,15 @@ class FtrTorchRLEnv(EnvBase):
             device=self.device,
         )
 
+    def peek_reward_series(self) -> dict[str, list[float]]:
+        """Return per-step scalar series for all accumulated reward components without clearing.
+
+        Each entry is a list of T floats — one mean-over-envs value per environment step
+        collected since the last pop_reward_info() call.  Useful for computing variance
+        decomposition and gradient contribution statistics before clearing the accumulator.
+        """
+        return {k: list(v) for k, v in self._reward_info_accum.items()}
+
     def pop_reward_info(self) -> dict[str, float]:
         """Return per-component reward means accumulated since the last call, then clear."""
         if not self._reward_info_accum:

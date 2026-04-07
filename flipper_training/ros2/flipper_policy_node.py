@@ -59,16 +59,28 @@ class FlipperPolicyNode(Node):
             self.get_logger().error("config_path and policy_weights_path parameters are required!")
             raise ValueError("Missing required parameters")
 
-        # Initialize policy inference module
-        self.get_logger().info(f"Loading policy from {config_path}")
-        from flipper_training.experiments.ppo.policy_inference_module import PPOPolicyInferenceModule
-
-        self.policy = PPOPolicyInferenceModule(
-            train_config_path=config_path,
-            policy_weights_path=policy_weights_path,
-            vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
-            device=device,
+        # Auto-detect FTR vs native policy from config contents
+        self._is_ftr = self._detect_ftr_config(config_path)
+        self.get_logger().info(
+            f"Loading {'FTR' if self._is_ftr else 'native'} policy from {config_path}"
         )
+
+        if self._is_ftr:
+            from flipper_training.experiments.ppo.ftr_policy_inference_module import FtrPolicyInferenceModule
+            self.policy = FtrPolicyInferenceModule(
+                config_path=config_path,
+                policy_weights_path=policy_weights_path,
+                vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
+                device=device,
+            )
+        else:
+            from flipper_training.experiments.ppo.policy_inference_module import PPOPolicyInferenceModule
+            self.policy = PPOPolicyInferenceModule(
+                train_config_path=config_path,
+                policy_weights_path=policy_weights_path,
+                vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
+                device=device,
+            )
         self.get_logger().info("Policy loaded successfully")
 
         # State storage
@@ -110,6 +122,9 @@ class FlipperPolicyNode(Node):
             "rear_left": self.create_publisher(Float64, "/flippers_cmd_vel/rear_left", 10),
             "rear_right": self.create_publisher(Float64, "/flippers_cmd_vel/rear_right", 10),
         }
+        # FTR policies output incremental flipper velocities — publish on velocity topics
+        # (same as above, but kept as a named alias for clarity)
+        self.flipper_vel_pubs = self.flipper_pubs
 
         # Debug visualization publishers
         self.heightmap_cloud_pub = self.create_publisher(PointCloud2, "/policy_heightmap_debug", 10)
@@ -568,31 +583,63 @@ class FlipperPolicyNode(Node):
             self.get_logger().error(f"Policy inference failed: {e}")
             return
 
-        # Parse action: [4 track velocities, 4 flipper rotational velocities]
-        # Convert to numpy if torch tensor
+        # Parse action output and publish commands
         if hasattr(action, 'cpu'):
             action = action.cpu().numpy()
         action = np.asarray(action, dtype=np.float64)
-        track_velocities = action[:4]
-        flipper_velocities = action[4:8] * self.flipper_velocity_scale
 
-        # Publish cmd_vel
-        twist = self.track_velocities_to_twist(track_velocities)
-        self.cmd_vel_pub.publish(twist)
+        if self._is_ftr:
+            # FTR action: [v, w, fl, fr, rl, rr] — 6-D
+            # v and w are already in m/s and rad/s (bounded by action spec ≈ [-1, 1])
+            twist = Twist()
+            twist.linear.x = float(action[0])
+            twist.angular.z = float(action[1])
+            self.cmd_vel_pub.publish(twist)
 
-        # Publish flipper velocities directly
-        flipper_keys = ["front_left", "front_right", "rear_left", "rear_right"]
-        for i, key in enumerate(flipper_keys):
-            msg = Float64()
-            msg.data = float(flipper_velocities[i])
-            self.flipper_pubs[key].publish(msg)
+            flipper_velocities = action[2:6] * self.flipper_velocity_scale
+            flipper_keys = ["front_left", "front_right", "rear_left", "rear_right"]
+            for i, key in enumerate(flipper_keys):
+                msg = Float64()
+                msg.data = float(flipper_velocities[i])
+                self.flipper_pubs[key].publish(msg)
 
-        self.get_logger().info(
-            f"CMD: vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) "
-            f"flipper_vel=[{flipper_velocities[0]:.2f}, {flipper_velocities[1]:.2f}, "
-            f"{flipper_velocities[2]:.2f}, {flipper_velocities[3]:.2f}]",
-            throttle_duration_sec=0.5,
-        )
+            self.get_logger().info(
+                f"CMD(ftr): vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) "
+                f"flipper_vel=[{flipper_velocities[0]:.2f}, {flipper_velocities[1]:.2f}, "
+                f"{flipper_velocities[2]:.2f}, {flipper_velocities[3]:.2f}]",
+                throttle_duration_sec=0.5,
+            )
+        else:
+            # Native action: [track_fl, track_fr, track_rl, track_rr, flip_fl, flip_fr, flip_rl, flip_rr] — 8-D
+            track_velocities = action[:4]
+            flipper_velocities = action[4:8] * self.flipper_velocity_scale
+
+            twist = self.track_velocities_to_twist(track_velocities)
+            self.cmd_vel_pub.publish(twist)
+
+            flipper_keys = ["front_left", "front_right", "rear_left", "rear_right"]
+            for i, key in enumerate(flipper_keys):
+                msg = Float64()
+                msg.data = float(flipper_velocities[i])
+                self.flipper_pubs[key].publish(msg)
+
+            self.get_logger().info(
+                f"CMD: vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) "
+                f"flipper_vel=[{flipper_velocities[0]:.2f}, {flipper_velocities[1]:.2f}, "
+                f"{flipper_velocities[2]:.2f}, {flipper_velocities[3]:.2f}]",
+                throttle_duration_sec=0.5,
+            )
+
+
+    @staticmethod
+    def _detect_ftr_config(config_path: str) -> bool:
+        """Return True if config_path is an FTR training config (train_ftr.py)."""
+        try:
+            from omegaconf import OmegaConf
+            cfg = OmegaConf.load(config_path)
+            return "ftr_obs_encoder_opts" in cfg or "task" in cfg
+        except Exception:
+            return False
 
 
 def main(args=None):
