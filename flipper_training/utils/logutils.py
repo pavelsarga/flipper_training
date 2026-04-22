@@ -99,7 +99,20 @@ class RunLogger:
         self.weights_path = self.logpath / "weights"
         self.weights_path.mkdir(exist_ok=True)
         if self.use_wandb:
-            self.wandb_run_id = hashlib.sha256(self.run_name.encode()).hexdigest()
+            # Check if this is a restart by looking for saved W&B run ID
+            wandb_id_file = self.logpath / ".wandb_run_id"
+            is_restart = wandb_id_file.exists()
+            if is_restart:
+                with open(wandb_id_file, "r") as f:
+                    self.wandb_run_id = f.read().strip()
+                self.terminal_logger.info(f"Detected restart — resuming W&B run {self.wandb_run_id}")
+                resume_mode = "allow"
+            else:
+                self.wandb_run_id = hashlib.sha256(self.run_name.encode()).hexdigest()
+                with open(wandb_id_file, "w") as f:
+                    f.write(self.wandb_run_id)
+                resume_mode = "never"
+
             confdict = OmegaConf.to_container(self.train_config, resolve=False)
             wandb.init(
                 project=PROJECT,
@@ -109,6 +122,7 @@ class RunLogger:
                 notes=self.wandb_run_id,
                 config=confdict,
                 save_code=True,
+                resume=resume_mode,
             )
             wandb.define_metric(self.step_metric_name)
         if self.use_tensorboard:
@@ -208,6 +222,9 @@ class RunLogger:
             f.close()
         if self.use_wandb:
             wandb.finish()
+            self.terminal_logger.info(
+                f"W&B run finished (ID: {self.wandb_run_id}). If the job restarts, W&B logging will resume in the same run."
+            )
         if self.use_tensorboard and self.tensorboard_writer is not None:
             self.tensorboard_writer.close()
         self.terminal_logger.info("RunLogger closed.")

@@ -1,5 +1,6 @@
 import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -22,9 +23,10 @@ from flipper_training.utils.meshes import (
     sample_points_from_convex_hull,
 )
 
-MESHDIR = ROOT / "meshes"
-YAMLDIR = ROOT / "robots"
-POINTCACHE = ROOT / ".robot_cache"
+_ROBOT_CFG_DIR = Path(__file__).resolve().parents[2]  # src/flipper_training/
+MESHDIR = _ROBOT_CFG_DIR / "meshes"
+YAMLDIR = _ROBOT_CFG_DIR / "robots"
+POINTCACHE = _ROBOT_CFG_DIR / ".robot_cache"
 
 
 def list_of_dicts_to_dict_of_lists(list_of_dicts: list[dict]) -> dict:

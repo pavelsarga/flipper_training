@@ -26,26 +26,6 @@ class ObservationEncoder(torch.nn.Module):
         super().__init__()
         self.output_dim = output_dim
 
-class FTR_HeightmapEncoder(ObservationEncoder):
-    """
-    CNN heightmap encoder for FTR-Bench
-
-    Args:
-        output_dim (int): The output dimension of the encoder.
-    """
-
-    def __init__(
-        self,
-        img_shape: tuple[int, int],
-        output_dim: int,
-        activate_output: bool = False,
-        **kwargs,
-    ):
-        super(ObservationEncoder,self).__init__()
-        self.img_shape = img_shape
-        self.output_dim = output_dim
-        self.activate_output = activate_output
-
 @dataclass(kw_only=True)
 class Observation(ABC):
     """

@@ -197,9 +197,13 @@ class FtrPPOConfig:
     extra_env_transforms: list = field(default_factory=list)
     # Env config overrides applied via setattr before env creation
     env_cfg_overrides: dict = field(default_factory=dict)
-    # Linear decay for action_bonus_coef (same semantics as LinearLR).
-    # Keys: start_factor (default 1.0), end_factor, total_iters.
-    # null = disabled (action_bonus_coef stays constant).
+    # Scheduler for step_penalty — anneals the per-step penalty over training.
+    # type: 'linear' or 'exponential'. Keys: start_factor, end_factor, total_iters.
+    # null = disabled (step_penalty stays constant).
+    step_penalty_scheduler: dict | None = None
+    # Scheduler for action_bonus_coef — anneals movement bonus over training.
+    # type: 'linear' or 'exponential'. Keys: start_factor, end_factor, total_iters.
+    # null = disabled (action_bonus_coef stays constant). Silently skipped if action_bonus_coef is null.
     action_bonus_coef_scheduler: dict | None = None
     # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
     sim_dt: float = 1 / 400
@@ -214,6 +218,7 @@ class FtrPPOConfig:
     physx_gpu_heap_capacity: int = 2**28
     physx_gpu_temp_buffer_capacity: int = 2**26
     physx_gpu_max_num_partitions: int = 8
+    physx_gpu_found_lost_aggregate_pairs_capacity: int = 2**27  # 128M; increase if PhysX logs buffer overflow
 
 
 class _BaseCfgScheduler:
@@ -235,6 +240,14 @@ class _BaseCfgScheduler:
     @property
     def current_value(self) -> float:
         return getattr(self._cfg, self._attr)
+
+    def state_dict(self) -> dict:
+        """Return scheduler state for checkpointing."""
+        return {"_step": self._step}
+
+    def load_state_dict(self, state_dict: dict):
+        """Restore scheduler state from checkpoint."""
+        self._step = state_dict.get("_step", 0)
 
 
 class _LinearCfgScheduler(_BaseCfgScheduler):
@@ -337,6 +350,8 @@ class FtrPPOTrainer:
         )
         self.actor_operator = self.actor_value_wrapper.get_policy_operator()
         self.value_operator = self.actor_value_wrapper.get_value_operator()
+        if self.config.policy_weights_path is not None:
+            self.term_logger.info(f"Loaded policy weights from {self.config.policy_weights_path}")
 
         # ---- transforms + VecNorm ----
         self.env, self.vecnorm = make_transformed_env(self.ftr_torchrl_env, self.config, policy_transforms)
@@ -344,6 +359,7 @@ class FtrPPOTrainer:
             self.vecnorm.load_state_dict(
                 torch.load(self.config.vecnorm_weights_path, map_location=self.device), strict=False
             )
+            self.term_logger.info(f"Loaded vecnorm weights from {self.config.vecnorm_weights_path}")
 
         # ---- auto-resume from crash checkpoint ----
         self.crash_checkpoint = None
@@ -389,11 +405,26 @@ class FtrPPOTrainer:
         self.optim = self.config.optimizer(self.optim_groups, **(self.config.optimizer_opts or {}))
         self.scheduler = self.config.scheduler(self.optim, **(self.config.scheduler_opts or {}))
 
+        _total_iters = self.config.total_frames // (self.config.time_steps_per_batch * self.config.num_robots)
+
+        # ---- step_penalty scheduler ----
+        _sp_init = self.config.env_cfg_overrides.get("step_penalty")
+        _sp_sched = self.config.step_penalty_scheduler
+        if _sp_sched is not None and _sp_init is not None:
+            self.step_penalty_scheduler = _make_cfg_scheduler(
+                self.ftr_torchrl_env.ftr_env.unwrapped.cfg,
+                "step_penalty",
+                _sp_init,
+                _sp_sched,
+                _total_iters,
+            )
+        else:
+            self.step_penalty_scheduler = None
+
         # ---- action_bonus_coef scheduler ----
         _abc_init = self.config.env_cfg_overrides.get("action_bonus_coef")
         _abc_sched = self.config.action_bonus_coef_scheduler
         if _abc_sched is not None and _abc_init is not None:
-            _total_iters = self.config.total_frames // (self.config.time_steps_per_batch * self.config.num_robots)
             self.action_bonus_scheduler = _make_cfg_scheduler(
                 self.ftr_torchrl_env.ftr_env.unwrapped.cfg,
                 "action_bonus_coef",
@@ -457,6 +488,67 @@ class FtrPPOTrainer:
             self.term_logger.warning(
                 f"Resuming from {checkpoint_source} checkpoint — training may have inconsistent metrics."
             )
+            # Try to load training state (optimizer, schedulers, iteration count)
+            resume_iteration, resume_frames = self._load_training_checkpoint()
+            if resume_iteration is not None:
+                self.resume_iteration = resume_iteration
+                self.resume_frames = resume_frames
+            else:
+                self.resume_iteration = None
+                self.resume_frames = None
+        else:
+            self.resume_iteration = None
+            self.resume_frames = None
+
+    def _save_training_checkpoint(self, iteration: int, total_collected_frames: int):
+        """Save training state (optimizers, schedulers, frame count) for resuming."""
+        checkpoint = {
+            "iteration": iteration,
+            "total_collected_frames": total_collected_frames,
+            "optimizer_state_dict": self.optim.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+        }
+        if self.step_penalty_scheduler is not None:
+            checkpoint["step_penalty_scheduler_state_dict"] = self.step_penalty_scheduler.state_dict()
+        if self.action_bonus_scheduler is not None:
+            checkpoint["action_bonus_scheduler_state_dict"] = self.action_bonus_scheduler.state_dict()
+        self.run_logger.save_weights(checkpoint, "training_state")
+
+    def _load_training_checkpoint(self):
+        """Load training state and return (iteration, total_collected_frames) to resume from."""
+        weights_dir = Path(self.run_logger.weights_path)
+        training_state_file = weights_dir / "training_state.pth"
+        if not training_state_file.exists():
+            return None, None
+        try:
+            checkpoint = torch.load(training_state_file, map_location=self.device)
+            # Only restore optimizer state if it's non-empty (may be reconstructed from CSV with empty state)
+            if checkpoint.get("optimizer_state_dict"):
+                try:
+                    self.optim.load_state_dict(checkpoint["optimizer_state_dict"])
+                except (KeyError, RuntimeError) as e:
+                    self.term_logger.warning(
+                        f"Failed to load optimizer state (may be OK if reconstructed from CSV): {e}. "
+                        f"Optimizer will restart with fresh momentum buffers."
+                    )
+            else:
+                self.term_logger.warning(
+                    "Optimizer state is empty (training_state.pth reconstructed from CSV). "
+                    "Optimizer momentum will be reset; training may be noisy for first few iterations."
+                )
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if "step_penalty_scheduler_state_dict" in checkpoint and self.step_penalty_scheduler is not None:
+                self.step_penalty_scheduler.load_state_dict(checkpoint["step_penalty_scheduler_state_dict"])
+            if "action_bonus_scheduler_state_dict" in checkpoint and self.action_bonus_scheduler is not None:
+                self.action_bonus_scheduler.load_state_dict(checkpoint["action_bonus_scheduler_state_dict"])
+            self.term_logger.info(
+                f"Loaded training checkpoint: resuming from iteration {checkpoint['iteration']}, "
+                f"total_collected_frames={checkpoint['total_collected_frames']}"
+            )
+            return checkpoint["iteration"], checkpoint["total_collected_frames"]
+        except Exception as e:
+            self.term_logger.warning(f"Failed to load training checkpoint: {e}")
+            return None, None
 
     # ------------------------------------------------------------------
     def train(self):
@@ -481,6 +573,10 @@ class FtrPPOTrainer:
                 self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), "policy_crash")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_crash")
                 self.term_logger.info("Saved crash checkpoint.")
+                if self.config.use_wandb:
+                    self.term_logger.info(
+                        f"W&B run {self.run_logger.wandb_run_id} will resume when the job restarts."
+                    )
             except Exception:
                 pass
             raise
@@ -503,8 +599,19 @@ class FtrPPOTrainer:
         if "cuda" in str(self.device):
             torch.cuda.empty_cache()
 
+        # Initialize progress bar and resume position
+        resume_iteration = getattr(self, "resume_iteration", None)
+        resume_frames = getattr(self, "resume_frames", None)
         pbar = tqdm(total=self.config.total_frames, desc="FTR PPO Training", unit="frames", leave=False)
+        if resume_frames is not None:
+            pbar.update(resume_frames)
+            self.term_logger.info(f"Resuming training — progress bar starting at {resume_frames} frames")
+
         for i, tensordict_data in enumerate(self.collector):
+            # Skip already-completed iterations if resuming from crash
+            if resume_iteration is not None and i < resume_iteration:
+                continue
+
             total_collected_frames = (i + 1) * iteration_size
             pbar.update(iteration_size)
 
@@ -636,6 +743,9 @@ class FtrPPOTrainer:
                 torch.cuda.empty_cache()
 
             self.scheduler.step()
+            if self.step_penalty_scheduler is not None:
+                self.step_penalty_scheduler.step()
+            _sp_current = self.step_penalty_scheduler.current_value if self.step_penalty_scheduler is not None else self.config.env_cfg_overrides.get("step_penalty")
             if self.action_bonus_scheduler is not None:
                 self.action_bonus_scheduler.step()
             _abc_current = self.action_bonus_scheduler.current_value if self.action_bonus_scheduler is not None else self.config.env_cfg_overrides.get("action_bonus_coef")
@@ -661,6 +771,7 @@ class FtrPPOTrainer:
                 "train/std_advantage": rollout_adv_std,
                 "train/total_grad_norm": grad_norm.item(),
                 **{f"train/{g['name']}_lr": g["lr"] for g in self.optim.param_groups},
+                "train/step_penalty": _sp_current if _sp_current is not None else 0.0,
                 "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
             }
 
@@ -668,6 +779,7 @@ class FtrPPOTrainer:
             if i % save_every == 0:
                 self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), f"policy_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
+                self._save_training_checkpoint(i, total_collected_frames)
             if i % self.config.eval_and_save_every == 0 and i > 0:
                 try:
                     eval_log = self._get_eval_rollout_results()
@@ -847,6 +959,7 @@ if __name__ == "__main__":
     env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
     env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
     env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
+    env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
 
     # Apply arbitrary direct-attribute overrides (e.g. potential reward params)
     for k, v in (_cfg.env_cfg_overrides or {}).items():

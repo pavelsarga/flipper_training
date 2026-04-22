@@ -16,7 +16,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import JointState, PointCloud2, PointField, Imu
+from sensor_msgs.msg import JointState, PointCloud2, PointField, Imu, Image as RosImage
 from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import Float64, MultiArrayDimension, MultiArrayLayout, Float32MultiArray
 from grid_map_msgs.msg import GridMap
@@ -50,6 +50,7 @@ class FlipperPolicyNode(Node):
         self.declare_parameter("heightmap_decay", 0.95)  # Temporal decay for heightmap
         self.declare_parameter("heightmap_layer", "elevation")  # Layer name in GridMap
         self.declare_parameter("flipper_velocity_scale", 1.0)  # Scale factor for flipper velocities
+        self.declare_parameter("track_velocity_scale", 1.0)   # Scale factor for FTR track velocity commands
         self.declare_parameter("publish_debug_cloud", True)  # Publish heightmap as point cloud for debugging
 
         # Get parameters
@@ -61,6 +62,7 @@ class FlipperPolicyNode(Node):
         self.heightmap_decay = self.get_parameter("heightmap_decay").get_parameter_value().double_value
         self.heightmap_layer = self.get_parameter("heightmap_layer").get_parameter_value().string_value
         self.flipper_velocity_scale = self.get_parameter("flipper_velocity_scale").get_parameter_value().double_value
+        self.track_velocity_scale = self.get_parameter("track_velocity_scale").get_parameter_value().double_value
         self.publish_debug_cloud = self.get_parameter("publish_debug_cloud").get_parameter_value().bool_value
 
         if not config_path or not policy_weights_path:
@@ -75,6 +77,11 @@ class FlipperPolicyNode(Node):
 
         if self._is_ftr:
             from flipper_training.experiments.ppo.ftr_policy_inference_module import FtrPolicyInferenceModule
+            from omegaconf import OmegaConf
+            _ftr_cfg = OmegaConf.load(config_path)
+            _max_deg = _ftr_cfg.get("env_cfg_overrides", {}).get("flipper_pos_max_deg", 90.0)
+            self._ftr_joint_limit_rad = float(np.deg2rad(_max_deg))
+            self.get_logger().info(f"FTR flipper limit: ±{_max_deg}° (±{self._ftr_joint_limit_rad:.3f} rad)")
             self.policy = FtrPolicyInferenceModule(
                 config_path=config_path,
                 policy_weights_path=policy_weights_path,
@@ -117,7 +124,7 @@ class FlipperPolicyNode(Node):
         # Note: ground_truth_odom uses RELIABLE QoS, so we must match it
         self.odom_sub = self.create_subscription(Odometry, "/ground_truth_odom", self.odom_callback, reliable_qos)
         self.imu_sub = self.create_subscription(Imu, "/imu/data", self.imu_callback, sensor_qos)
-        self.joint_state_sub = self.create_subscription(JointState, "/joint_state", self.joint_state_callback, sensor_qos)
+        self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, sensor_qos)
         # Goal uses VOLATILE to accept messages from any publisher (RViz, ros2 topic pub, etc.)
         self.goal_sub = self.create_subscription(PoseStamped, "/goal_pose", self.goal_callback, 10)
         self.goal_reset_sub = self.create_subscription(PoseStamped, "/goal_reset", self.goal_reset_callback, 10)
@@ -142,6 +149,8 @@ class FlipperPolicyNode(Node):
         # Debug visualization publishers
         self.heightmap_cloud_pub = self.create_publisher(PointCloud2, "/policy_heightmap_debug", 10)
         self.heightmap_gridmap_pub = self.create_publisher(GridMap, "/policy_heightmap", 10)
+        self.action_debug_pub = self.create_publisher(Float32MultiArray, "/policy_action_debug", 10)
+        self.heightmap_img_pub = self.create_publisher(RosImage, "/policy_heightmap_img", 10)
 
         # Current flipper positions (for integrating velocity commands)
         self.flipper_positions = {
@@ -561,6 +570,12 @@ class FlipperPolicyNode(Node):
             return
         xd_local, omega_local = velocities
 
+        # Goal-reached check (2D distance, ignoring height)
+        if goal_vec_local is not None and np.linalg.norm(goal_vec_local[:2]) < 0.5:
+            self.get_logger().info("Goal reached (< 0.5 m). Stopping.")
+            self.current_goal = None
+            goal_vec_local = None
+
         # Check required inputs
         if goal_vec_local is None:
             # No goal set - publish zero velocities to stand in place
@@ -615,27 +630,46 @@ class FlipperPolicyNode(Node):
             action = action.cpu().numpy()
         action = np.asarray(action, dtype=np.float64)
 
+        # Publish raw action for debug UI (before any scaling/sign compensation)
+        debug_msg = Float32MultiArray()
+        debug_msg.data = action.astype(np.float32).tolist()
+        self.action_debug_pub.publish(debug_msg)
+
+        # Publish heightmap as grayscale image for debug UI
+        self._publish_heightmap_image(self.current_heightmap)
+
         twist = Twist()
         flipper_keys = ["front_left", "front_right", "rear_left", "rear_right"]
         if self._is_ftr:
             # FTR: 6-D [v, w, fl, fr, rl, rr]
             # Track: raw output is already in m/s and rad/s (clamped to 0.95 m/s, 1.0 rad/s in training)
-            twist.linear.x = float(action[0])
-            twist.angular.z = float(action[1])
+            twist.linear.x = float(action[0] * self.track_velocity_scale)
+            twist.angular.z = float(action[1] * self.track_velocity_scale)
             self.cmd_vel_pub.publish(twist)
-            # Flippers: FTR outputs position increments (action × flipper_dt=5 degrees per physics step)
+            # Flippers: FTR policy outputs are proportional to angular velocity.
+            # Training used 5 deg/step at 200 Hz → ~17.5 rad/s max effective velocity.
+            # Gazebo hardware limit is 5.0 rad/s, so scale: action × 5.0 rad/s.
             # Apply FTR front-flipper sign convention (same as FtrWheelArticulation: [-1,-1,1,1])
-            # Publish as relative position commands (rad)
             flipper_compensation = np.array([-1.0, -1.0, 1.0, 1.0])
-            flipper_delta_rad = np.deg2rad(action[2:6] * 5.0) * flipper_compensation * self.flipper_velocity_scale
+            flipper_vel = action[2:6] * flipper_compensation * 5.0 * self.flipper_velocity_scale
+
+            # Enforce position limits from FTR config (flipper_pos_max_deg)
+            lim = self._ftr_joint_limit_rad
+            for i, key in enumerate(flipper_keys):
+                pos = self.flipper_positions[key]
+                if pos >= lim and flipper_vel[i] > 0:
+                    flipper_vel[i] = 0.0
+                elif pos <= -lim and flipper_vel[i] < 0:
+                    flipper_vel[i] = 0.0
+
             for i, key in enumerate(flipper_keys):
                 msg = Float64()
-                msg.data = float(flipper_delta_rad[i])
-                self.flipper_pos_rel_pubs[key].publish(msg)
+                msg.data = float(flipper_vel[i])
+                self.flipper_pubs[key].publish(msg)
             self.get_logger().info(
                 f"CMD: vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) "
-                f"flipper_delta_deg=[{np.rad2deg(flipper_delta_rad[0]):.2f}, {np.rad2deg(flipper_delta_rad[1]):.2f}, "
-                f"{np.rad2deg(flipper_delta_rad[2]):.2f}, {np.rad2deg(flipper_delta_rad[3]):.2f}]",
+                f"flipper_vel=[{flipper_vel[0]:.2f}, {flipper_vel[1]:.2f}, "
+                f"{flipper_vel[2]:.2f}, {flipper_vel[3]:.2f}] rad/s",
                 throttle_duration_sec=0.5,
             )
         else:
@@ -655,6 +689,25 @@ class FlipperPolicyNode(Node):
                 throttle_duration_sec=0.5,
             )
 
+
+    def _publish_heightmap_image(self, hmap: np.ndarray) -> None:
+        if hmap is None or hmap.size == 0:
+            return
+        # For FTR, resize to the 45×21 grid the policy actually uses
+        if self._is_ftr and hmap.shape != (45, 21):
+            import cv2
+            hmap = cv2.resize(hmap, (21, 45), interpolation=cv2.INTER_LINEAR)
+        h, w = hmap.shape
+        lo, hi = hmap.min(), hmap.max()
+        norm = ((hmap - lo) / (hi - lo + 1e-6) * 255).astype(np.uint8)
+        msg = RosImage()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.height = h
+        msg.width = w
+        msg.encoding = "mono8"
+        msg.step = w
+        msg.data = norm.tobytes()
+        self.heightmap_img_pub.publish(msg)
 
     @staticmethod
     def _detect_ftr_config(config_path: str) -> bool:

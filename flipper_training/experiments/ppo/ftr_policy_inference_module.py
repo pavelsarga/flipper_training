@@ -173,7 +173,9 @@ class FtrPolicyInferenceModule:
             np.array([roll / np.pi, pitch / np.pi], dtype=np.float32),                        # [2]
             np.asarray(xd_local,     dtype=np.float32) / self._HM_DIAG,                       # [3]
             np.asarray(omega_local,  dtype=np.float32) / np.pi,                               # [3]
-            (np.asarray(thetas, dtype=np.float32) + self.joint_limit) / (2.0 * self.joint_limit),  # [4]
+            # FTR logical positions: front flippers are sign-flipped vs Gazebo joint angles
+            # (mirrors FtrWheelArticulation.get_all_flipper_positions: positions * [-1,-1,1,1])
+            (np.asarray(thetas, dtype=np.float32) * np.array([-1., -1., 1., 1.], dtype=np.float32) + self.joint_limit) / (2.0 * self.joint_limit),  # [4]
             np.asarray(goal_vec_local, dtype=np.float32) / self._HM_DIAG,                     # [3]
             self._prev_action.cpu().numpy(),                                                   # [6]
         ])  # total: 966

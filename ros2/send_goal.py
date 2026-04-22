@@ -63,8 +63,7 @@ def main():
     time.sleep(0.5)  # Give time for message to be sent
 
     node.destroy_node()
-    if rclpy.ok():
-        rclpy.shutdown()
+    rclpy.shutdown()
 
 
 if __name__ == "__main__":

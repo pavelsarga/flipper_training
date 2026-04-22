@@ -78,3 +78,4 @@ class GradientExperimentConfig:
     optimizer_opts: dict[str, Any] = field(default_factory=dict)
     heightmap_gen_opts: dict[str, Any] = field(default_factory=dict)
     engine_compile_opts: dict[str, Any] = field(default_factory=dict)
+    eval_repeats: int = 1

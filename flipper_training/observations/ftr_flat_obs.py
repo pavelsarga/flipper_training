@@ -18,19 +18,20 @@ class FtrFlatEncoder(ObservationEncoder):
 
 class FtrCNNFlatEncoder(ObservationEncoder):
     HM_SIZE = (45, 21)   # 945 values
-    STATE_DIM = 21       # 2+3+3+4+3+6
+    HM_DIM = 945
 
-    def __init__(self, output_dim: int, cnn_output_dim: int = 128, input_dim: int = None, **mlp_kwargs):
+    def __init__(self, output_dim: int, state_dim: int = 21, cnn_output_dim: int = 128, input_dim: int = None, **mlp_kwargs):
         super().__init__(output_dim)
+        self.state_dim = state_dim
         self.cnn = FTR_HeightmapEncoder(self.HM_SIZE, output_dim=cnn_output_dim)
-        self.mlp = MLP(in_dim=cnn_output_dim + self.STATE_DIM, out_dim=output_dim,
+        self.mlp = MLP(in_dim=cnn_output_dim + state_dim, out_dim=output_dim,
                        activate_last_layer=True, **mlp_kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [N, 966]
-        hm = x[..., :945].view(*x.shape[:-1], 1, 45, 21)  # [N,1,45,21]
-        state = x[..., 945:]                                # [N,21]
-        latent = self.cnn(hm)                               # [N,cnn_output_dim]
+        # x: [N, HM_DIM + state_dim]
+        hm = x[..., :self.HM_DIM].view(*x.shape[:-1], 1, 45, 21)  # [N,1,45,21]
+        state = x[..., self.HM_DIM:]                                # [N, state_dim]
+        latent = self.cnn(hm)                                        # [N,cnn_output_dim]
         return self.mlp(torch.cat([latent, state], dim=-1))
 
 @dataclass(kw_only=True)

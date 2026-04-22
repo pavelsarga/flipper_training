@@ -40,6 +40,15 @@ parser.add_argument(
     "--plot_interval", type=int, default=1,
     help="Save a heightmap every N steps (default: 1 = every step).",
 )
+parser.add_argument(
+    "--const_linear_vel", type=float, default=None,
+    help="Override action[:,0] (linear velocity) with this constant value in [-1,1]. "
+         "Use for policies trained without forward command control.",
+)
+parser.add_argument(
+    "--invert_rear_flippers", action="store_true",
+    help="Multiply rear flipper actions (action[:,4:]) by -1.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args, unknown_args = parser.parse_known_args()
 app_launcher = AppLauncher(args)
@@ -57,7 +66,7 @@ from omegaconf import OmegaConf
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 import flipper_training  # registers OmegaConf resolvers
-from flipper_training.environment.ftr_env_adapter import FtrTorchRLEnv
+from flipper_training.environment.ftr_env_adapter import FtrTorchRLEnv, OBS_KEY
 from flipper_training.experiments.ppo.common import make_transformed_env
 from flipper_training.experiments.ppo.train_ftr import FtrPPOConfig
 from flipper_training.utils.logutils import get_terminal_logger
@@ -71,6 +80,65 @@ import gymnasium
 # ============================================================
 
 logger = get_terminal_logger("eval_ftr")
+
+
+class _ActionOverrideWrapper(torch.nn.Module):
+    """Wraps a TensorDict policy operator to override action components."""
+
+    def __init__(self, actor, const_linear_vel: float | None = None, invert_rear_flippers: bool = False):
+        super().__init__()
+        self.actor = actor
+        self.const_linear_vel = const_linear_vel
+        self.invert_rear_flippers = invert_rear_flippers
+
+    def forward(self, td):
+        td = self.actor(td)
+        if self.const_linear_vel is not None:
+            td["action"][..., 0] = self.const_linear_vel
+        if self.invert_rear_flippers:
+            td["action"][..., 4:] = -td["action"][..., 4:]
+        return td
+
+
+# 16 observation groups: name → (start_idx, end_idx) in the 966-dim flat obs vector
+_OBS_SLICES = [
+    ("heightmap",   0,   945),
+    ("roll",        945, 946),
+    ("pitch",       946, 947),
+    ("lin_vel_x",   947, 948),
+    ("lin_vel_y",   948, 949),
+    ("lin_vel_z",   949, 950),
+    ("ang_vel_x",   950, 951),
+    ("ang_vel_y",   951, 952),
+    ("ang_vel_z",   952, 953),
+    ("flipper_fl",  953, 954),
+    ("flipper_fr",  954, 955),
+    ("flipper_rl",  955, 956),
+    ("flipper_rr",  956, 957),
+    ("goal_x",      957, 958),
+    ("goal_y",      958, 959),
+    ("goal_z",      959, 960),
+]
+
+
+def _compute_obs_stats(obs: torch.Tensor) -> dict[str, float]:
+    """Compute mean/std/min/max for each observation group.
+
+    Args:
+        obs: Tensor of shape [..., 966] (e.g. [N, T, 966] or [N*T, 966]).
+
+    Returns:
+        Dict with keys like ``observations/roll_mean``, ``observations/roll_std``, etc.
+    """
+    obs_flat = obs.reshape(-1, obs.shape[-1])  # [S, 966]
+    stats: dict[str, float] = {}
+    for name, s, e in _OBS_SLICES:
+        vals = obs_flat[:, s:e].reshape(-1)
+        stats[f"observations/{name}_mean"] = vals.mean().item()
+        stats[f"observations/{name}_std"] = vals.std().item()
+        stats[f"observations/{name}_min"] = vals.min().item()
+        stats[f"observations/{name}_max"] = vals.max().item()
+    return stats
 
 
 def _save_heightmap(ftr_gym_env, step: int, out_dir: "Path") -> None:
@@ -134,12 +202,14 @@ def _run_single_rollout_with_heightmap(
     td = env.reset()
     total_reward = 0.0
     n_steps = 0
+    obs_list: list[torch.Tensor] = []
 
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
         for step in range(max_steps):
             if plot_interval > 0 and step % plot_interval == 0:
                 _save_heightmap(ftr_gym_env, step, out_dir)
 
+            obs_list.append(td[OBS_KEY].detach())
             td = actor(td)
             td = env.step(td)
             total_reward += td["next", "reward"].mean().item()
@@ -167,6 +237,8 @@ def _run_single_rollout_with_heightmap(
         "eval/mean_step_reward": total_reward / max(n_steps, 1),
         "eval/rollout_steps": float(n_steps),
     }
+    if obs_list:
+        results.update(_compute_obs_stats(torch.stack(obs_list)))
     term_info = ftr_torchrl_env.pop_termination_info()
     results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
     results.update(ftr_torchrl_env.pop_reward_info())
@@ -186,6 +258,7 @@ def _run_single_rollout(env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor,
         "eval/pct_truncated":    rollout["next", "truncated"].float().mean().item(),
         "eval/rollout_steps":    float(rollout.shape[1]),
     }
+    results.update(_compute_obs_stats(rollout[OBS_KEY]))
     del rollout
 
     # Termination stats (success / failure rates per episode)
@@ -219,6 +292,8 @@ def run_eval(
     repeats: int,
     plot_heightmap: bool = False,
     plot_interval: int = 1,
+    const_linear_vel: float | None = None,
+    invert_rear_flippers: bool = False,
 ) -> None:
     cfg = FtrPPOConfig(**raw_cfg)
     device = set_device(cfg.device)
@@ -238,6 +313,13 @@ def run_eval(
         device=device,
     )
     actor = actor_value_wrapper.get_policy_operator()
+
+    if const_linear_vel is not None or invert_rear_flippers:
+        if const_linear_vel is not None:
+            logger.info(f"Overriding linear velocity with constant: {const_linear_vel}")
+        if invert_rear_flippers:
+            logger.info("Inverting flipper actions (multiplying by -1)")
+        actor = _ActionOverrideWrapper(actor, const_linear_vel=const_linear_vel, invert_rear_flippers=invert_rear_flippers)
 
     env, vecnorm = make_transformed_env(ftr_torchrl_env, cfg, policy_transforms)
     if cfg.vecnorm_weights_path:
@@ -360,6 +442,8 @@ if __name__ == "__main__":
         repeats=args.repeats,
         plot_heightmap=args.plot_heightmap,
         plot_interval=args.plot_interval,
+        const_linear_vel=args.const_linear_vel,
+        invert_rear_flippers=args.invert_rear_flippers,
     )
 
     simulation_app.close()

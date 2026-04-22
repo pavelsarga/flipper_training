@@ -201,6 +201,16 @@ def perform_study(
         # SQLite: give each writer up to 5 min to acquire the file lock.
         # Without this, parallel SLURM tasks racing on schema init get "database is locked".
         engine_kwargs = {"connect_args": {"timeout": 300}} if conn_str.startswith("sqlite:///") else {}
+        # Fix any 'finite' (lowercase) rows written by buggy recovery scripts before
+        # RDBStorage reads them — SQLAlchemy's enum processor raises LookupError on them.
+        sqlite_path = conn_str[len("sqlite:///"):]
+        import sqlite3 as _sqlite3
+        with _sqlite3.connect(sqlite_path, timeout=60) as _conn:
+            n = _conn.execute(
+                "UPDATE trial_values SET value_type = 'FINITE' WHERE value_type = 'finite'"
+            ).rowcount
+            if n > 0:
+                TERM_LOGGER.warning(f"Fixed {n} trial_values row(s) with lowercase 'finite' → 'FINITE'")
     else:
         sslmode = db_secret.get("sslmode", "require")
         conn_str = (
@@ -227,7 +237,7 @@ def perform_study(
         ),
         pruner = optuna.pruners.MedianPruner(
             n_startup_trials=20,   # don't prune until 20 trials complete (reliable baseline)
-            n_warmup_steps=30,     # don't prune before eval report 30
+            n_warmup_steps=6,     # don't prune before eval report n
             interval_steps=1,      # check at every eval report
             n_min_trials=5,        # need >= 5 completed trials at this step to compare
         )

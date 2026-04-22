@@ -56,6 +56,7 @@ def _resolve_paths(context):
                 "heightmap_decay": float(LaunchConfiguration("heightmap_decay").perform(context)),
                 "heightmap_layer": LaunchConfiguration("heightmap_layer").perform(context),
                 "flipper_velocity_scale": float(LaunchConfiguration("flipper_velocity_scale").perform(context)),
+                "track_velocity_scale": float(LaunchConfiguration("track_velocity_scale").perform(context)),
             }
         ],
     )
@@ -66,7 +67,7 @@ def generate_launch_description():
     # --- run_dir shortcut (auto-resolves config + weights) ---
     run_dir_arg = DeclareLaunchArgument(
         "run_dir",
-        default_value="/home/robot/workspaces/robot_rodeo_gym_ws/logs/train_ftr_10750834",
+        default_value="/home/robot/workspaces/robot_rodeo_gym_ws/logs/optuna_ftr_10794091/optuna_ftr_10794091_109",
         description="Path to a training run directory. If set, config.yaml and weights/policy_final.pth "
                     "are loaded automatically (overrides config_path/policy_weights_path/vecnorm_weights_path).",
     )
@@ -84,7 +85,7 @@ def generate_launch_description():
     # --- individual path args (used when run_dir is not set) ---
     config_path_arg = DeclareLaunchArgument(
         "config_path",
-        default_value="/home/robot/workspaces/robot_rodeo_gym_ws/logs/train_ftr_10750834/ftr_config_new_v2.yaml",
+        default_value="",
         description="Path to the training config YAML file (ignored when run_dir is set).",
     )
     policy_weights_path_arg = DeclareLaunchArgument(
@@ -121,8 +122,14 @@ def generate_launch_description():
     )
     flipper_velocity_scale_arg = DeclareLaunchArgument(
         "flipper_velocity_scale",
-        default_value="10.0",
+        default_value="0.1",
         description="Scale factor for flipper velocity commands",
+    )
+    track_velocity_scale_arg = DeclareLaunchArgument(
+        "track_velocity_scale",
+        default_value="0.05",
+        description="Scale factor for FTR track velocity commands (linear and angular). "
+                    "Use <1.0 if robot moves too fast compared to Isaac Sim training.",
     )
 
     return LaunchDescription(
@@ -138,6 +145,7 @@ def generate_launch_description():
             heightmap_decay_arg,
             heightmap_layer_arg,
             flipper_velocity_scale_arg,
+            track_velocity_scale_arg,
             OpaqueFunction(function=_resolve_paths),
         ]
     )
