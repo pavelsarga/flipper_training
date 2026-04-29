@@ -438,33 +438,38 @@ class FtrPPOTrainer:
         self.term_logger.info("Initialized FtrPPOTrainer.")
 
     def _check_and_load_crash_checkpoint(self):
-        """Check for crash checkpoints or latest step checkpoint and auto-resume."""
-        weights_dir = Path(self.run_logger.weights_path)
+        """Check for crash checkpoints or latest step checkpoint and auto-resume.
 
-        # Priority 1: Check for crash checkpoints (saved on exception)
-        policy_crash = weights_dir / "policy_crash.pth"
-        vecnorm_crash = weights_dir / "vecnorm_crash.pth"
+        Searches the current attempt's weights dir first, then previous attempt dirs
+        in reverse order, so a respawned run automatically picks up the best available
+        checkpoint from any earlier attempt in the same SLURM job.
+        """
+        candidate_dirs = self.run_logger.candidate_weight_dirs()
 
         policy_to_load = None
         vecnorm_to_load = None
         checkpoint_source = None
 
-        if policy_crash.exists() and vecnorm_crash.exists():
-            policy_to_load = policy_crash
-            vecnorm_to_load = vecnorm_crash
-            checkpoint_source = "crash"
-        else:
-            # Priority 2: Find latest step checkpoint (by frame count)
-            step_policies = sorted(weights_dir.glob("policy_step_*.pth"),
-                                 key=lambda p: int(p.stem.split("_")[-1]))
-            step_vecnorms = sorted(weights_dir.glob("vecnorm_step_*.pth"),
-                                 key=lambda p: int(p.stem.split("_")[-1]))
+        for weights_dir in candidate_dirs:
+            # Priority 1: crash checkpoint (saved on unhandled exception)
+            policy_crash = weights_dir / "policy_crash.pth"
+            vecnorm_crash = weights_dir / "vecnorm_crash.pth"
+            if policy_crash.exists() and vecnorm_crash.exists():
+                policy_to_load = policy_crash
+                vecnorm_to_load = vecnorm_crash
+                checkpoint_source = f"crash ({weights_dir.parent.name})"
+                break
 
+            # Priority 2: latest periodic step checkpoint
+            step_policies = sorted(weights_dir.glob("policy_step_*.pth"),
+                                   key=lambda p: int(p.stem.split("_")[-1]))
+            step_vecnorms = sorted(weights_dir.glob("vecnorm_step_*.pth"),
+                                   key=lambda p: int(p.stem.split("_")[-1]))
             if step_policies and step_vecnorms:
-                # Use highest frame count
                 policy_to_load = step_policies[-1]
                 vecnorm_to_load = step_vecnorms[-1]
-                checkpoint_source = "step"
+                checkpoint_source = f"step ({weights_dir.parent.name})"
+                break
 
         if policy_to_load and vecnorm_to_load:
             self.term_logger.warning(
@@ -515,10 +520,17 @@ class FtrPPOTrainer:
         self.run_logger.save_weights(checkpoint, "training_state")
 
     def _load_training_checkpoint(self):
-        """Load training state and return (iteration, total_collected_frames) to resume from."""
-        weights_dir = Path(self.run_logger.weights_path)
-        training_state_file = weights_dir / "training_state.pth"
-        if not training_state_file.exists():
+        """Load training state and return (iteration, total_collected_frames) to resume from.
+
+        Searches candidate dirs (current attempt, then previous attempts) for training_state.pth.
+        """
+        training_state_file = None
+        for weights_dir in self.run_logger.candidate_weight_dirs():
+            candidate = weights_dir / "training_state.pth"
+            if candidate.exists():
+                training_state_file = candidate
+                break
+        if training_state_file is None:
             return None, None
         try:
             checkpoint = torch.load(training_state_file, map_location=self.device)
@@ -572,7 +584,11 @@ class FtrPPOTrainer:
             try:
                 self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), "policy_crash")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_crash")
-                self.term_logger.info("Saved crash checkpoint.")
+                # Save training state so the next attempt restores the correct LR/optimizer position.
+                _crash_iter = getattr(self, "_current_iteration", 0)
+                _crash_frames = getattr(self, "_current_total_frames", 0)
+                self._save_training_checkpoint(_crash_iter, _crash_frames)
+                self.term_logger.info(f"Saved crash checkpoint at iter={_crash_iter}, frames={_crash_frames}.")
                 if self.config.use_wandb:
                     self.term_logger.info(
                         f"W&B run {self.run_logger.wandb_run_id} will resume when the job restarts."
@@ -599,20 +615,23 @@ class FtrPPOTrainer:
         if "cuda" in str(self.device):
             torch.cuda.empty_cache()
 
-        # Initialize progress bar and resume position
+        # Initialize progress bar and resume position.
+        # iter_offset shifts i so that total_collected_frames and periodic-save
+        # cadence are correct without wasting GPU cycles re-running old rollouts.
         resume_iteration = getattr(self, "resume_iteration", None)
         resume_frames = getattr(self, "resume_frames", None)
+        iter_offset = resume_iteration if resume_iteration is not None else 0
         pbar = tqdm(total=self.config.total_frames, desc="FTR PPO Training", unit="frames", leave=False)
         if resume_frames is not None:
             pbar.update(resume_frames)
-            self.term_logger.info(f"Resuming training — progress bar starting at {resume_frames} frames")
+            self.term_logger.info(f"Resuming training — progress bar starting at {resume_frames} frames (iter_offset={iter_offset})")
 
         for i, tensordict_data in enumerate(self.collector):
-            # Skip already-completed iterations if resuming from crash
-            if resume_iteration is not None and i < resume_iteration:
-                continue
-
-            total_collected_frames = (i + 1) * iteration_size
+            effective_i = i + iter_offset
+            total_collected_frames = (effective_i + 1) * iteration_size
+            # Track for crash checkpoint
+            self._current_iteration = effective_i
+            self._current_total_frames = total_collected_frames
             pbar.update(iteration_size)
 
             # FTR env does not produce "curr_state"; pop safely.
@@ -776,11 +795,11 @@ class FtrPPOTrainer:
             }
 
             save_every = self.config.save_weights_every or self.config.eval_and_save_every
-            if i % save_every == 0:
+            if effective_i % save_every == 0:
                 self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), f"policy_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
-                self._save_training_checkpoint(i, total_collected_frames)
-            if i % self.config.eval_and_save_every == 0 and i > 0:
+                self._save_training_checkpoint(effective_i, total_collected_frames)
+            if effective_i % self.config.eval_and_save_every == 0 and effective_i > 0:
                 try:
                     eval_log = self._get_eval_rollout_results()
                     for _ in range(self.config.eval_repeats - 1):
@@ -884,7 +903,16 @@ if __name__ == "__main__":
         raw_cfg.use_wandb = False
         raw_cfg.use_tensorboard = False
     else:
-        raw_cfg = _load_raw_config(args.config, unknown_args)
+        # On SLURM respawn, prefer the config saved by the previous attempt so that
+        # reward weights, LR schedule, and all other hyperparameters are identical
+        # to what the checkpoint was trained with. Fall back to args.config only when
+        # no previous attempt exists (i.e. this is the first run of the job).
+        prev_cfg_path = RunLogger.latest_attempt_config()
+        if prev_cfg_path is not None:
+            print(f"[INFO] Respawn detected — loading config from previous attempt: {prev_cfg_path}", flush=True)
+            raw_cfg = _load_raw_config(str(prev_cfg_path), unknown_args)
+        else:
+            raw_cfg = _load_raw_config(args.config, unknown_args)
 
     # Apply CLI overrides for num_envs / terrain / task before constructing FtrPPOConfig
     if args.num_envs is not None:

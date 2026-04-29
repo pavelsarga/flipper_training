@@ -85,7 +85,9 @@ class RunLogger:
         ts = time.strftime("%Y-%m-%d_%H-%M-%S") + f"_{os.getpid()}"
         run_name = f"{self.train_config['name']}_{ts}"
 
-        # Under SLURM jobs, store everything in the SLURM log directory.
+        # Under SLURM jobs, store everything in a per-attempt subdirectory so
+        # that respawns within the same job ID get a fresh folder rather than
+        # overwriting CSVs and weights from the previous attempt.
         # Otherwise fall back to runs/<category>/<run_name>.
         slurm_logpath = self._slurm_log_dir()
         if slurm_logpath is not None:
@@ -93,26 +95,19 @@ class RunLogger:
         else:
             self.logpath = ROOT / f"runs/{self.category}/{run_name}"
 
-        self.run_name = self.logpath.name  # use logdir name so W&B matches filesystem
+        import re as _re
+        _lp = Path(self.logpath)
+        self.run_name = (
+            f"{_lp.parent.name}_{_lp.name}"
+            if _re.match(r"attempt_\d+$", _lp.name)
+            else _lp.name
+        )
         self.terminal_logger.info(f"RunLogger initialized for run {self.run_name} at {self.logpath}")
         self.logpath.mkdir(parents=True, exist_ok=True)
         self.weights_path = self.logpath / "weights"
         self.weights_path.mkdir(exist_ok=True)
         if self.use_wandb:
-            # Check if this is a restart by looking for saved W&B run ID
-            wandb_id_file = self.logpath / ".wandb_run_id"
-            is_restart = wandb_id_file.exists()
-            if is_restart:
-                with open(wandb_id_file, "r") as f:
-                    self.wandb_run_id = f.read().strip()
-                self.terminal_logger.info(f"Detected restart — resuming W&B run {self.wandb_run_id}")
-                resume_mode = "allow"
-            else:
-                self.wandb_run_id = hashlib.sha256(self.run_name.encode()).hexdigest()
-                with open(wandb_id_file, "w") as f:
-                    f.write(self.wandb_run_id)
-                resume_mode = "never"
-
+            self.wandb_run_id = hashlib.sha256((self.run_name + ts).encode()).hexdigest()
             confdict = OmegaConf.to_container(self.train_config, resolve=False)
             wandb.init(
                 project=PROJECT,
@@ -122,7 +117,7 @@ class RunLogger:
                 notes=self.wandb_run_id,
                 config=confdict,
                 save_code=True,
-                resume=resume_mode,
+                resume="never",
             )
             wandb.define_metric(self.step_metric_name)
         if self.use_tensorboard:
@@ -139,22 +134,73 @@ class RunLogger:
         """Return the SLURM log subdirectory for this job, or None if not in a SLURM job.
 
         Array jobs:  logs/<name>_<array_job_id>/<name>_<array_job_id>_<task_id>/
-        Single jobs: logs/<name>_<job_id>/
+        Single jobs: logs/<name>_<job_id>/attempt_0/  (attempt_1/ on respawn, etc.)
+
+        Single jobs use per-attempt subdirectories so that each respawn within the
+        same SLURM job ID gets a fresh folder — separate CSVs, weights, and W&B run.
         """
         job_name = os.environ.get("SLURM_JOB_NAME", "")
         array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID")
         task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
         job_id = os.environ.get("SLURM_JOB_ID")
         if array_job_id and task_id:
-            # Array job: logs/optuna_ftr_123/optuna_ftr_123_45/
+            # Array job: task ID already makes each run unique — no attempt dirs needed.
             log_dir_name = f"{job_name}_{array_job_id}" if job_name else f"slurm_{array_job_id}"
             task_dir_name = f"{log_dir_name}_{task_id}"
             return ROOT / f"logs/{log_dir_name}/{task_dir_name}"
         elif job_id:
-            # Single job: logs/train_ftr_456/
+            # Single job: find the next unused attempt_N directory.
             log_dir_name = f"{job_name}_{job_id}" if job_name else f"slurm_{job_id}"
-            return ROOT / f"logs/{log_dir_name}"
+            job_dir = ROOT / f"logs/{log_dir_name}"
+            n = 0
+            while (job_dir / f"attempt_{n}").exists():
+                n += 1
+            return job_dir / f"attempt_{n}"
         return None
+
+    @staticmethod
+    def latest_attempt_config() -> Path | None:
+        """Return config.yaml from the most recent previous attempt in this SLURM job, or None.
+
+        Used on respawn to load the exact same config that was used for attempt_0 rather than
+        re-reading from configs/ (which may have changed between attempts).
+        Only applies to single SLURM jobs with attempt_N layout; returns None otherwise.
+        """
+        job_name = os.environ.get("SLURM_JOB_NAME", "")
+        array_job_id = os.environ.get("SLURM_ARRAY_JOB_ID")
+        task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
+        job_id = os.environ.get("SLURM_JOB_ID")
+        if not job_id or (array_job_id and task_id):
+            return None
+        log_dir_name = f"{job_name}_{job_id}" if job_name else f"slurm_{job_id}"
+        job_dir = ROOT / f"logs/{log_dir_name}"
+        latest: Path | None = None
+        n = 0
+        while (job_dir / f"attempt_{n}").exists():
+            cfg = job_dir / f"attempt_{n}" / "config.yaml"
+            if cfg.exists():
+                latest = cfg
+            n += 1
+        return latest  # None if no previous attempt exists yet
+
+    def candidate_weight_dirs(self) -> list[Path]:
+        """Return weight directories to search for checkpoints, most-recent-first.
+
+        For SLURM single-job respawns (attempt_N layout) this includes the weights
+        dirs of all previous attempts so that a respawned run can pick up where the
+        last attempt left off even though it has a fresh log folder.
+        """
+        import re
+        dirs: list[Path] = [Path(self.weights_path)]
+        m = re.match(r"attempt_(\d+)$", Path(self.logpath).name)
+        if m:
+            n = int(m.group(1))
+            parent = Path(self.logpath).parent
+            for i in range(n - 1, -1, -1):
+                sibling = parent / f"attempt_{i}" / "weights"
+                if sibling.exists():
+                    dirs.append(sibling)
+        return dirs
 
     def _save_config(self):
         OmegaConf.save(self.train_config, self.logpath / "config.yaml")
@@ -222,9 +268,7 @@ class RunLogger:
             f.close()
         if self.use_wandb:
             wandb.finish()
-            self.terminal_logger.info(
-                f"W&B run finished (ID: {self.wandb_run_id}). If the job restarts, W&B logging will resume in the same run."
-            )
+            self.terminal_logger.info(f"W&B run finished (ID: {self.wandb_run_id}).")
         if self.use_tensorboard and self.tensorboard_writer is not None:
             self.tensorboard_writer.close()
         self.terminal_logger.info("RunLogger closed.")
