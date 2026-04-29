@@ -102,7 +102,7 @@ def generate_launch_description():
     # --- node config args ---
     device_arg = DeclareLaunchArgument(
         "device",
-        default_value="cuda:0",
+        default_value="cpu",
         description="Device to run inference on (cpu or cuda:N)",
     )
     control_rate_arg = DeclareLaunchArgument(
@@ -117,7 +117,7 @@ def generate_launch_description():
     )
     heightmap_layer_arg = DeclareLaunchArgument(
         "heightmap_layer",
-        default_value="elevation",
+        default_value="elevation_inpainted",
         description="Name of the elevation layer in GridMap",
     )
     flipper_velocity_scale_arg = DeclareLaunchArgument(

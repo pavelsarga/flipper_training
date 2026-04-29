@@ -112,7 +112,7 @@ class FlipperPolicyNode(Node):
         self.joint_state_sub = self.create_subscription(JointState, "/joint_state", self.joint_state_callback, sensor_qos)
         # Goal uses VOLATILE to accept messages from any publisher (RViz, ros2 topic pub, etc.)
         self.goal_sub = self.create_subscription(PoseStamped, "/goal_pose", self.goal_callback, 10)
-        self.elevation_map_sub = self.create_subscription(GridMap, "/elevation_map", self.elevation_map_callback, reliable_qos)
+        self.elevation_map_sub = self.create_subscription(GridMap, "/elevation_map_raw_post", self.elevation_map_callback, reliable_qos)
 
         # Publishers
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
