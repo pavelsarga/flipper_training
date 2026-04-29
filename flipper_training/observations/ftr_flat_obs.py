@@ -20,18 +20,27 @@ class FtrCNNFlatEncoder(ObservationEncoder):
     HM_SIZE = (45, 21)   # 945 values
     HM_DIM = 945
 
-    def __init__(self, output_dim: int, state_dim: int = 21, cnn_output_dim: int = 128, input_dim: int = None, **mlp_kwargs):
+    def __init__(self, output_dim: int, state_dim: int = 21, cnn_output_dim: int = 128, state_proj_dim: int | None = None, input_dim: int | None = None, **mlp_kwargs):
         super().__init__(output_dim)
         self.state_dim = state_dim
         self.cnn = FTR_HeightmapEncoder(self.HM_SIZE, output_dim=cnn_output_dim)
-        self.mlp = MLP(in_dim=cnn_output_dim + state_dim, out_dim=output_dim,
-                       activate_last_layer=True, **mlp_kwargs)
+        # Optional learned projection to bring state up to a comparable scale before fusion.
+        # Without this, the 21-dim state is structurally dominated by the 128-dim CNN output.
+        if state_proj_dim is not None:
+            self.state_proj = MLP(in_dim=state_dim, out_dim=state_proj_dim, hidden_dim=state_proj_dim, num_hidden=1, layernorm=False, activate_last_layer=True)
+            fusion_dim = cnn_output_dim + state_proj_dim
+        else:
+            self.state_proj = None
+            fusion_dim = cnn_output_dim + state_dim
+        self.mlp = MLP(in_dim=fusion_dim, out_dim=output_dim, activate_last_layer=True, **mlp_kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [N, HM_DIM + state_dim]
         hm = x[..., :self.HM_DIM].view(*x.shape[:-1], 1, 45, 21)  # [N,1,45,21]
         state = x[..., self.HM_DIM:]                                # [N, state_dim]
         latent = self.cnn(hm)                                        # [N,cnn_output_dim]
+        if self.state_proj is not None:
+            state = self.state_proj(state)                           # [N, state_proj_dim]
         return self.mlp(torch.cat([latent, state], dim=-1))
 
 @dataclass(kw_only=True)
