@@ -49,6 +49,11 @@ parser.add_argument(
     "--invert_rear_flippers", action="store_true",
     help="Multiply rear flipper actions (action[:,4:]) by -1.",
 )
+parser.add_argument(
+    "--map", type=str, default=None,
+    metavar="TERRAIN",
+    help="Override the terrain from the saved config (e.g. ground, cur_mixed, cur_stairs_up, exp_stair33_up).",
+)
 AppLauncher.add_app_launcher_args(parser)
 args, unknown_args = parser.parse_known_args()
 app_launcher = AppLauncher(args)
@@ -380,6 +385,10 @@ if __name__ == "__main__":
 
     if args.num_envs is not None:
         raw_cfg.num_robots = args.num_envs
+
+    if args.map is not None:
+        raw_cfg.terrain = args.map
+        logger.info(f"Terrain overridden: {args.map}")
 
     max_steps = args.max_steps if args.max_steps is not None else raw_cfg.get("max_eval_steps", 0)
 
