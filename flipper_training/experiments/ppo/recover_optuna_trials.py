@@ -301,9 +301,45 @@ def recover_trial(trial_num: int, optuna_cfg_path: str, ws_root: Path) -> bool:
     for k, v in sorted(metrics.items()):
         LOGGER.info(f"  {k}: {v:.4f}")
 
-    success_rate = metrics.get("eval/success_rate", 0.0)
-    submit_result_to_db(sqlite_path, frozen._trial_id, success_rate)
-    LOGGER.info(f"Trial {trial_num} recovered — success_rate={success_rate:.4f}")
+    # Compute the same composite score that optuna_train_ftr.py uses so this
+    # recovered trial is directly comparable to normally-completed trials.
+    metrics_to_opt: list[str] = list(optuna_cfg_raw.get("metrics_to_optimize", ["eval/success_rate"]))
+    metric_weights: list[float] | None = list(optuna_cfg_raw["metric_weights"]) if "metric_weights" in optuna_cfg_raw else None
+
+    component_values = []
+    for metric in metrics_to_opt:
+        val = metrics.get(metric, 0.0)
+        if metric not in metrics:
+            LOGGER.warning(f"Metric '{metric}' missing from eval results (available: {list(metrics.keys())}). Using 0.0.")
+        component_values.append(val)
+
+    if metric_weights is not None:
+        score = sum(w * v for w, v in zip(metric_weights, component_values))
+        components = dict(zip(metrics_to_opt, component_values))
+        LOGGER.info(f"Trial {trial_num} done — score={score:.4f}  components={components}")
+    else:
+        # Multi-objective: submit first metric as the single value (best-effort)
+        score = component_values[0] if component_values else 0.0
+        LOGGER.info(f"Trial {trial_num} done — {dict(zip(metrics_to_opt, component_values))}")
+
+    # Write component metrics as user attrs (mirrors optuna_train_ftr.py)
+    conn = sqlite3.connect(sqlite_path, timeout=60)
+    try:
+        for metric_name, metric_val in zip(metrics_to_opt, component_values):
+            conn.execute(
+                "INSERT OR REPLACE INTO trial_user_attributes (trial_id, key, value_json) VALUES (?, ?, ?)",
+                (frozen._trial_id, metric_name, str(metric_val)),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO trial_user_attributes (trial_id, key, value_json) VALUES (?, ?, ?)",
+            (frozen._trial_id, "score", str(score)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    submit_result_to_db(sqlite_path, frozen._trial_id, score)
+    LOGGER.info(f"Trial {trial_num} recovered — score={score:.4f}")
     return True
 
 

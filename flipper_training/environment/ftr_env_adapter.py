@@ -8,8 +8,10 @@ Usage:
 """
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from tensordict import TensorDict
 from torchrl.data import Binary, Bounded, Composite, Unbounded
@@ -39,11 +41,13 @@ class FtrTorchRLEnv(EnvBase):
         ftr_env: GymEnv,
         encoder_opts: dict,
         device: str | torch.device = "cuda:0",
+        shock_scale: float | None = None,
     ):
         num_envs: int = ftr_env.unwrapped.num_envs
         super().__init__(device=device, batch_size=[num_envs])
 
         self.ftr_env = ftr_env
+        self._shock_scale: float | None = shock_scale
         self._last_obs: torch.Tensor | None = None
         self._reward_info_accum: dict[str, list[float]] = {}
         self._state_stats_accum: dict[str, list[float]] = {}
@@ -170,10 +174,24 @@ class FtrTorchRLEnv(EnvBase):
         return {k: list(v) for k, v in self._reward_info_accum.items()}
 
     def pop_reward_info(self) -> dict[str, float]:
-        """Return per-component reward means accumulated since the last call, then clear."""
+        """Return per-component reward means accumulated since the last call, then clear.
+
+        For shock/accel_magnitude also emits p90/p95/p99 percentile keys so callers
+        can compute a peak-sensitive normalised metric without losing the mean.
+        """
         if not self._reward_info_accum:
             return {}
         result = {k: sum(v) / len(v) for k, v in self._reward_info_accum.items()}
+        if "shock/accel_magnitude" in self._reward_info_accum:
+            vals = np.asarray(self._reward_info_accum["shock/accel_magnitude"], dtype=np.float32)
+            if len(vals) >= 10:
+                for pct in (90, 95, 99):
+                    p_val = float(np.percentile(vals, pct))
+                    result[f"shock/accel_p{pct}"] = p_val
+                    if self._shock_scale is not None:
+                        result[f"shock/shock_p{pct}_normalised"] = (
+                            2.0 / (1.0 + math.exp(-p_val / self._shock_scale)) - 1.0
+                        )
         self._reward_info_accum.clear()
         return result
 

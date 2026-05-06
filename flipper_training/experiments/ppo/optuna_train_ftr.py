@@ -56,6 +56,7 @@ class OptunaFtrConfig:
     optuna_values: list                # [low, high] for numeric; list of choices for categorical
     frozen_params: dict[str, Any] | None = None  # params frozen from a previous stage (dotlist keys)
     slurm_params: dict[str, Any] | None = None
+    metric_weights: list[float] | None = None     # if set, scalarize objectives into one weighted sum (single-objective study)
 
 
 def define_search_space(trial: optuna.Trial, keys: list, types: list, values: list) -> dict:
@@ -132,6 +133,11 @@ def objective(
     for k, v in (trial_cfg.env_cfg_overrides or {}).items():
         setattr(env_cfg, k, v)
 
+    # Raw accel logging flag + interval (path is set by FtrPPOTrainer after RunLogger is created)
+    if trial_cfg.log_raw_accel:
+        env_cfg.log_raw_accel = True
+        env_cfg.log_raw_accel_interval = trial_cfg.log_raw_accel_interval
+
     ftr_gym_env = gymnasium.make(task, cfg=env_cfg)
     try:
         trainer = FtrPPOTrainer(updated_config, ftr_gym_env, optuna_trial=trial)
@@ -144,12 +150,38 @@ def objective(
         if "CUDA error" in str(e) or "CUDA out of memory" in str(e):
             # CUDA context is dead — env.close() and Isaac Sim atexit handlers will
             # deadlock.  Mark the trial as FAIL in Optuna before hard-exiting.
+            # Try the Optuna API first; fall back to direct sqlite3 because concurrent
+            # SLURM tasks frequently hold the SQLite write-lock, causing the API call
+            # to raise and leave the trial stuck as RUNNING indefinitely.
+            _marked = False
             try:
                 from optuna.trial import TrialState as _TS
                 trial._storage.set_trial_state_values(trial._trial_id, _TS.FAIL, values=None)
+                _marked = True
                 TERM_LOGGER.info(f"Trial {trial.number} marked as FAIL in Optuna DB (CUDA crash).")
             except Exception as _mark_err:
-                TERM_LOGGER.warning(f"Could not mark trial as FAIL before exit: {_mark_err}")
+                TERM_LOGGER.warning(f"Optuna API FAIL mark failed: {_mark_err} — trying direct SQLite.")
+            if not _marked:
+                try:
+                    import sqlite3 as _sq3
+                    import datetime as _dt
+                    import os as _osp
+                    _db_cfg = OmegaConf.load(ROOT / "optuna_db.yaml")
+                    _url = str(_db_cfg.get("url", ""))
+                    if _url.startswith("sqlite:///"):
+                        _sp = _url[len("sqlite:///"):]
+                        if _sp.startswith("/ws/"):
+                            _ws_root = "/ws" if _osp.path.isdir("/ws") else str(ROOT).rsplit("/src/", 1)[0]
+                            _sp = _ws_root + _sp[3:]
+                        with _sq3.connect(_sp, timeout=30) as _conn:
+                            _conn.execute(
+                                "UPDATE trials SET state='FAIL', datetime_complete=? "
+                                "WHERE trial_id=? AND state='RUNNING'",
+                                (_dt.datetime.utcnow().isoformat(sep=" "), trial._trial_id),
+                            )
+                        TERM_LOGGER.info(f"Trial {trial.number} marked as FAIL via direct SQLite (CUDA crash).")
+                except Exception as _sq_err:
+                    TERM_LOGGER.warning(f"Direct SQLite FAIL mark also failed: {_sq_err}")
             import os as _os
             _os._exit(75)
         ftr_gym_env.close()
@@ -170,6 +202,14 @@ def objective(
             result.append(0.0)
         else:
             result.append(metrics[metric])
+
+    if optuna_cfg.metric_weights is not None:
+        score = sum(w * v for w, v in zip(optuna_cfg.metric_weights, result))
+        for metric_name, metric_val in zip(optuna_cfg.metrics_to_optimize, result):
+            trial.set_user_attr(metric_name, metric_val)
+        trial.set_user_attr("score", score)
+        TERM_LOGGER.info(f"Trial {trial.number} done — score={score:.4f}  components={dict(zip(optuna_cfg.metrics_to_optimize, result))}")
+        return (score,)
 
     TERM_LOGGER.info(f"Trial {trial.number} done — {dict(zip(optuna_cfg.metrics_to_optimize, result))}")
     return tuple(result)
@@ -322,8 +362,12 @@ if __name__ == "__main__":
         n_keys = len(optuna_cfg.optuna_keys)
         if len(optuna_cfg.optuna_types) != n_keys or len(optuna_cfg.optuna_values) != n_keys:
             raise ValueError("optuna_keys, optuna_types, and optuna_values must have the same length.")
-        if len(optuna_cfg.directions) != len(optuna_cfg.metrics_to_optimize):
+        if optuna_cfg.metric_weights is None and len(optuna_cfg.directions) != len(optuna_cfg.metrics_to_optimize):
             raise ValueError("directions and metrics_to_optimize must have the same length.")
+        if optuna_cfg.metric_weights is not None and len(optuna_cfg.directions) != 1:
+            raise ValueError("When metric_weights is set (scalarised mode), directions must have exactly one entry.")
+        if optuna_cfg.metric_weights is not None and len(optuna_cfg.metric_weights) != len(optuna_cfg.metrics_to_optimize):
+            raise ValueError("metric_weights must have the same length as metrics_to_optimize.")
 
         TERM_LOGGER.info(f"Search space: {n_keys} parameters over {optuna_cfg.num_trials} total trials.")
         TERM_LOGGER.info(f"Optimising:   {optuna_cfg.metrics_to_optimize}  ({optuna_cfg.directions})")

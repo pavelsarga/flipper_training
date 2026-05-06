@@ -443,7 +443,14 @@ if __name__ == "__main__":
     for k, v in (_cfg.env_cfg_overrides or {}).items():
         setattr(env_cfg, k, v)
 
+    if _cfg.log_raw_accel:
+        env_cfg.log_raw_accel = True
+        env_cfg.log_raw_accel_interval = _cfg.log_raw_accel_interval
+
     ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
+
+    if _cfg.log_raw_accel:
+        ftr_gym_env.unwrapped.cfg.log_raw_accel_path = str(run_dir / "raw_accel_eval.npz")
 
     run_eval(
         raw_cfg, ftr_gym_env,

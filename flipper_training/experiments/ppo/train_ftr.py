@@ -220,6 +220,9 @@ class FtrPPOConfig:
     physx_gpu_max_num_partitions: int = 8
     physx_gpu_found_lost_aggregate_pairs_capacity: int = 2**27  # 128M; increase if PhysX logs buffer overflow
 
+    log_raw_accel: bool = False
+    log_raw_accel_interval: int = 50   # flush every N reward steps; 0 = only at run end
+
 
 class _BaseCfgScheduler:
     """Base class for config attribute schedulers."""
@@ -332,13 +335,21 @@ class FtrPPOTrainer:
         if self.optuna_trial is not None:
             self.optuna_trial.set_user_attr("logpath", str(self.run_logger.logpath))
         self.term_logger = get_terminal_logger("ftr_ppo_train")
+
+        if self.config.log_raw_accel:
+            ftr_gym_env.unwrapped.cfg.log_raw_accel_path = str(self.run_logger.logpath / "raw_accel.npz")
         self.term_logger.info(
             f"Seed: {self.config.seed}  "
             f"(random ✓  numpy ✓  torch ✓  cuda ✓)"
         )
 
         # ---- environment ----
-        self.ftr_torchrl_env = FtrTorchRLEnv(ftr_gym_env, encoder_opts=self.config.ftr_obs_encoder_opts, device=self.device)
+        self.ftr_torchrl_env = FtrTorchRLEnv(
+            ftr_gym_env,
+            encoder_opts=self.config.ftr_obs_encoder_opts,
+            device=self.device,
+            shock_scale=self.config.env_cfg_overrides.get("shock_scale"),
+        )
         self.env = self.ftr_torchrl_env
 
         # ---- policy ----
@@ -857,7 +868,15 @@ class FtrPPOTrainer:
         }
         del eval_rollout
         results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in self.ftr_torchrl_env.pop_termination_info().items()})
-        self.ftr_torchrl_env.pop_reward_info()  # discard eval reward info; don't mix into train log
+        _eval_reward_info = self.ftr_torchrl_env.pop_reward_info()
+        _shock_keys = (
+            "shock/accel_magnitude", "shock/shock_normalised",
+            "shock/accel_p90", "shock/accel_p95", "shock/accel_p99",
+            "shock/shock_p90_normalised", "shock/shock_p95_normalised", "shock/shock_p99_normalised",
+        )
+        for _shock_key in _shock_keys:
+            if _shock_key in _eval_reward_info:
+                results[f"eval/{_shock_key.split('/', 1)[1]}"] = _eval_reward_info[_shock_key]
         return results
 
     def _post_training_evaluation(self) -> dict[str, float]:
@@ -993,6 +1012,13 @@ if __name__ == "__main__":
     for k, v in (_cfg.env_cfg_overrides or {}).items():
         setattr(env_cfg, k, v)
 
+    # Raw accel logging: enable flag + interval now; path is set by FtrPPOTrainer after
+    # RunLogger is created (logpath not known until then).
+    if _cfg.log_raw_accel:
+        env_cfg.log_raw_accel = True
+        env_cfg.log_raw_accel_interval = _cfg.log_raw_accel_interval
+        # log_raw_accel_path stays None until trainer patches it below
+
     ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
 
     if args.play is not None:
@@ -1000,7 +1026,12 @@ if __name__ == "__main__":
         from flipper_training.experiments.ppo.common import make_transformed_env
         from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-        env = FtrTorchRLEnv(ftr_gym_env, encoder_opts=_cfg.ftr_obs_encoder_opts, device=_cfg.device)
+        env = FtrTorchRLEnv(
+            ftr_gym_env,
+            encoder_opts=_cfg.ftr_obs_encoder_opts,
+            device=_cfg.device,
+            shock_scale=_cfg.env_cfg_overrides.get("shock_scale"),
+        )
         policy_cfg = _cfg.policy_config(**_cfg.policy_opts)
         actor_value_wrapper, _, policy_transforms = policy_cfg.create(
             env=env, weights_path=_cfg.policy_weights_path, device=_cfg.device
