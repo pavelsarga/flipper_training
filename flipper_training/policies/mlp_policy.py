@@ -90,7 +90,10 @@ class MLPPolicyConfig(PolicyConfig):
 
         # Load weights if path provided
         if weights_path := kwargs.get("weights_path", None):
-            missing_unexpected = actor_value_wrapper.load_state_dict(torch.load(weights_path, map_location=actor_value_wrapper.device), strict=False)
+            sd = torch.load(weights_path, map_location=actor_value_wrapper.device)
+            if key_remapper := kwargs.get("key_remapper", None):
+                sd = key_remapper(sd)
+            missing_unexpected = actor_value_wrapper.load_state_dict(sd, strict=False)
             self.logger.info(f"Loaded weights from {kwargs['weights_path']}")
             if missing_unexpected.missing_keys:
                 self.logger.warning(f"Missing keys: {missing_unexpected.missing_keys}")

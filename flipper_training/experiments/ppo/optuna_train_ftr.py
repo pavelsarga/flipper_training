@@ -277,7 +277,7 @@ def perform_study(
         ),
         pruner = optuna.pruners.MedianPruner(
             n_startup_trials=20,   # don't prune until 20 trials complete (reliable baseline)
-            n_warmup_steps=6,     # don't prune before eval report n
+            n_warmup_steps=5,     # don't prune before eval report n
             interval_steps=1,      # check at every eval report
             n_min_trials=5,        # need >= 5 completed trials at this step to compare
         )

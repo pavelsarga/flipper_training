@@ -60,8 +60,10 @@ class _RandomActorModule(nn.Module):
 
         # When syncing, sample only 2 parameter sets (front pair, rear pair)
         n_sine_sets = 2 if sync_flippers else n_flipper_actions
-        freqs = torch.empty(n_robots, n_sine_sets).uniform_(freq_min, freq_max, generator=rng)
-        amps = torch.empty(n_robots, n_sine_sets).uniform_(amp_min, amp_max, generator=rng)
+        f_lo, f_hi = min(freq_min, freq_max), max(freq_min, freq_max)
+        a_lo, a_hi = min(amp_min, amp_max), max(amp_min, amp_max)
+        freqs = torch.empty(n_robots, n_sine_sets).uniform_(f_lo, f_hi, generator=rng)
+        amps = torch.empty(n_robots, n_sine_sets).uniform_(a_lo, a_hi, generator=rng)
         phases = torch.empty(n_robots, n_sine_sets).uniform_(0.0, 2.0 * math.pi, generator=rng)
         self.register_buffer("freqs", freqs)
         self.register_buffer("amps", amps)

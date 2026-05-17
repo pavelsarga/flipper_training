@@ -130,7 +130,7 @@ def _compute_reward_grad_stats(
     for key, series in reward_series.items():
         if key in _REWARD_ANALYSIS_EXCLUDE or not key.startswith("rew/"):
             continue
-        r_i = torch.tensor(series, dtype=torch.float32, device=r_total.device)
+        r_i = torch.tensor(series[-T:], dtype=torch.float32, device=r_total.device)
         # Skip zero-variance components (e.g. disabled penalties).
         if r_i.std() < 1e-6:
             continue
@@ -659,6 +659,7 @@ class FtrPPOTrainer:
             # corrupts advantages for the whole preceding segment.  Filtering at the
             # trajectory level (entire row in [num_envs, time]) removes both the
             # explosion step AND the contaminated pre-explosion bootstrap in one shot.
+            n_dirty = 0
             explosion_flags = tensordict_data.get(("next", "explosion"), None)
             if explosion_flags is not None:
                 has_explosion = explosion_flags.squeeze(-1).any(dim=1)  # [num_envs]
@@ -750,6 +751,7 @@ class FtrPPOTrainer:
                 torch.cuda.empty_cache()
 
             n_subbatches = max(1, n_valid // self.config.frames_per_sub_batch)
+            skipped_updates = 0
             for _j in range(self.config.epochs_per_batch):
                 for _k in range(n_subbatches):
                     sub_batch = self.replay_buffer.sample().to(self.device)
@@ -765,6 +767,7 @@ class FtrPPOTrainer:
                     if not grad_norm.isfinite():
                         self.term_logger.warning(f"Skipping update: non-finite grad norm ({grad_norm:.4g})")
                         self.optim.zero_grad()
+                        skipped_updates += 1
                     else:
                         self.optim.step()
                         self.optim.zero_grad()
@@ -803,6 +806,9 @@ class FtrPPOTrainer:
                 **{f"train/{g['name']}_lr": g["lr"] for g in self.optim.param_groups},
                 "train/step_penalty": _sp_current if _sp_current is not None else 0.0,
                 "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
+                "explosions/dirty_envs": n_dirty,
+                "explosions/skipped_updates": skipped_updates,
+                "explosions/skipped_updates_frac": skipped_updates / (n_subbatches * self.config.epochs_per_batch),
             }
 
             save_every = self.config.save_weights_every or self.config.eval_and_save_every

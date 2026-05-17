@@ -56,6 +56,13 @@ class FtrTorchRLEnv(EnvBase):
         self._term_explosion: int = 0
         self._term_total: int = 0
 
+        # Per-robot tracking (disabled by default; activate via enable_per_env_tracking())
+        self._per_env_tracking: bool = False
+        self._per_env_episodes: torch.Tensor | None = None
+        self._per_env_success: torch.Tensor | None = None
+        self._per_env_failure: torch.Tensor | None = None
+        self._per_env_explosion: torch.Tensor | None = None
+
         # Instantiate the observation descriptor so make_transformed_env can build VecNorm keys.
         from flipper_training.observations.ftr_flat_obs import FtrFlatObservation
 
@@ -136,6 +143,14 @@ class FtrTorchRLEnv(EnvBase):
                 if "explosion" in _info:
                     self._term_explosion += _info["explosion"].long().sum().item()
 
+                if self._per_env_tracking:
+                    done_mask = (terminated | truncated).squeeze(-1)
+                    self._per_env_episodes  += done_mask.long().to(self.device)
+                    self._per_env_success   += _info["success"].long().to(self.device)
+                    self._per_env_failure   += _info["failure"].long().to(self.device)
+                    if "explosion" in _info:
+                        self._per_env_explosion += _info["explosion"].long().to(self.device)
+
         # Sanitize observation: NaN from invalid robot state (fallen off terrain) must not reach
         # the policy or VecNorm running statistics on the next step.
         obs = torch.nan_to_num(obs_dict["policy"].to(self.device), nan=0.0, posinf=0.0, neginf=0.0)
@@ -213,6 +228,38 @@ class FtrTorchRLEnv(EnvBase):
             "env/explosion_rate": self._term_explosion / self._term_total,
         }
         self._term_success = self._term_failure = self._term_explosion = self._term_total = 0
+        return result
+
+    def enable_per_env_tracking(self) -> None:
+        """Activate per-robot episode counters. Call once before the rollout loop."""
+        n = self.batch_size[0]
+        self._per_env_tracking = True
+        self._per_env_episodes  = torch.zeros(n, dtype=torch.long, device=self.device)
+        self._per_env_success   = torch.zeros(n, dtype=torch.long, device=self.device)
+        self._per_env_failure   = torch.zeros(n, dtype=torch.long, device=self.device)
+        self._per_env_explosion = torch.zeros(n, dtype=torch.long, device=self.device)
+
+    def pop_per_env_termination(self) -> dict[int, dict[str, int]]:
+        """Return per-robot episode counts then reset all counters.
+
+        Returns ``{robot_idx: {"episodes": N, "successes": N, "failures": N, "explosions": N}}``.
+        Only meaningful after ``enable_per_env_tracking()`` was called.
+        """
+        if not self._per_env_tracking or self._per_env_episodes is None:
+            return {}
+        result = {
+            i: {
+                "episodes":   int(self._per_env_episodes[i].item()),
+                "successes":  int(self._per_env_success[i].item()),
+                "failures":   int(self._per_env_failure[i].item()),
+                "explosions": int(self._per_env_explosion[i].item()),
+            }
+            for i in range(self.batch_size[0])
+        }
+        self._per_env_episodes.zero_()
+        self._per_env_success.zero_()
+        self._per_env_failure.zero_()
+        self._per_env_explosion.zero_()
         return result
 
     def _set_seed(self, seed: int | None) -> None:

@@ -8,19 +8,17 @@ from flipper_training.utils.geometry import quaternion_to_roll, quaternion_to_pi
 
 __all__ = [
     "RollPitchGoal",
+    "GoalDistance",
     "PotentialGoal",
     "PotentialGoalWithVelocityBonus",
     "PotentialGoalWithConditionalVelocityBonus",
     "PotentialGoalWithConditionalVelocityBonusAndJointCommandBonus",
-    "GoalDistance",
     "PotentialGoalWithJointVelVariancePenalty",
     "PotentialGoalWithFinishVelocityPenalty",
     "PotentialGoalWithStepAscentBonus",
     "PotentialGoalWithPenaltiesConfigurable",
-    "PotentialGoalWithJointVelVariancePenalty",
-    "PotentialGoalWithFinishVelocityPenalty",
-    "PotentialGoalWithStepAscentBonus",
-    "PotentialGoalWithPenaltiesConfigurable",
+    "PotentialGoalWithSideLatentPreference",
+    "PotentialGoalSimplified",
 ]
 
 

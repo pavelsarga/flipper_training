@@ -263,6 +263,8 @@ def eval_trial(
         env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
         env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
         env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
+    elif _cfg.num_robots > 512:
+        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
     for k, v in (_cfg.env_cfg_overrides or {}).items():
         setattr(env_cfg, k, v)
 
