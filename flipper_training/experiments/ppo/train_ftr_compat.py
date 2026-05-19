@@ -47,6 +47,8 @@ from flipper_training.heightmaps.flat import FlatHeightmapGenerator
 from flipper_training.heightmaps.stairs import StairsHeightmapGenerator
 from flipper_training.heightmaps.barrier import BarrierHeightmapGenerator
 from flipper_training.heightmaps.mixed import MixedHeightmapGenerator
+from flipper_training.heightmaps.trunks import TrunkHeightmapGenerator
+from flipper_training.heightmaps.multi_gaussian import MultiGaussianHeightmapGenerator
 from flipper_training.observations.ftr_compat_obs import FtrCompatObservation
 from flipper_training.rl_objectives.random_nav import RandomNavigationObjective
 from flipper_training.rl_rewards.ftr_compat_reward import FtrCompatReward
@@ -69,6 +71,46 @@ _TERRAIN_MAP: dict[str, type] = {
     "cur_steps_up":    BarrierHeightmapGenerator,
     "cur_steps_down":  BarrierHeightmapGenerator,
     "cur_waves":       MixedHeightmapGenerator,
+    "native_mixed":    MixedHeightmapGenerator,
+    "native_flat":     FlatHeightmapGenerator,
+    "native_stairs":   StairsHeightmapGenerator,
+    "native_gaussian": MultiGaussianHeightmapGenerator,
+    "native_trunks":   TrunkHeightmapGenerator,
+}
+
+# Default opts for native terrain types (used when no heightmap_gen_opts are provided).
+_NATIVE_TERRAIN_DEFAULTS: dict[str, dict] = {
+    "native_mixed": {
+        "classes": [
+            MultiGaussianHeightmapGenerator,
+            StairsHeightmapGenerator,
+            TrunkHeightmapGenerator,
+            BarrierHeightmapGenerator,
+        ],
+        "opts": [
+            {  # Bumpy gaussian hills
+                "min_gaussians": 150, "max_gaussians": 250,
+                "min_height_fraction": 0.03, "max_height_fraction": 0.15,
+                "min_std_fraction": 0.04, "max_std_fraction": 0.12,
+                "min_sigma_ratio": 0.5,
+            },
+            {  # Stairs
+                "min_steps": 3, "max_steps": 8,
+                "min_step_height": 0.12, "max_step_height": 0.35,
+            },
+            {  # Log/trunk obstacle
+                "min_trunk_height": 0.15, "max_trunk_height": 0.35,
+                "min_trunk_width": 0.6, "max_trunk_width": 1.2,
+                "max_dist_from_origin": 0.8,
+            },
+            {  # Step/barrier
+                "min_height": 0.15, "max_height": 0.5,
+                "min_length": 0.5, "max_length": 1.5,
+                "min_thickness": 0.8, "max_thickness": 1.2,
+            },
+        ],
+        "weights": [0.4, 0.25, 0.2, 0.15],
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -92,8 +134,9 @@ def _resolve_heightmap_gen(cfg: DictConfig):
             f"Or set 'heightmap_gen' explicitly in the config."
         )
 
-    # For FTR terrain types, automatically resolve the .map file path.
-    opts: dict = dict(OmegaConf.to_container(cfg.heightmap_gen_opts, resolve=True)) if OmegaConf.select(cfg, "heightmap_gen_opts") else {}
+    # Apply built-in defaults for native terrain types, then let config opts override.
+    defaults = _NATIVE_TERRAIN_DEFAULTS.get(terrain_name, {})
+    opts: dict = defaults | (dict(OmegaConf.to_container(cfg.heightmap_gen_opts, resolve=True)) if OmegaConf.select(cfg, "heightmap_gen_opts") else {})
     if issubclass(gen_cls, FtrTerrainPatchGenerator) and "map_path" not in opts:
         map_file = _FTR_MAP_DIR / f"{terrain_name}.map"
         if not map_file.exists():

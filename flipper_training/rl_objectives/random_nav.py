@@ -1,7 +1,11 @@
 import torch
 import logging
 from tqdm import trange
-from typing import Literal, override
+from typing import Literal
+try:
+    from typing import override
+except ImportError:
+    from typing_extensions import override
 from dataclasses import dataclass
 from flipper_training.engine.engine_state import PhysicsState
 from flipper_training.rl_objectives import BaseObjective
@@ -71,11 +75,11 @@ class RandomNavigationObjective(BaseObjective):
             goal_ij = valid_indices[goal_idx]  # Shape: (n_samples, 2)
             # Compute xyz coordinates using this robot's terrain data
             start_xyz = torch.stack(
-                [g[batch_index, *start_ij.unbind(-1)] for g in [self.terrain_config.x_grid, self.terrain_config.y_grid, self.terrain_config.z_grid]],
+                [g[batch_index, start_ij[:, 0], start_ij[:, 1]] for g in [self.terrain_config.x_grid, self.terrain_config.y_grid, self.terrain_config.z_grid]],
                 dim=-1,
             ).to("cpu")
             goal_xyz = torch.stack(
-                [g[batch_index, *goal_ij.unbind(-1)] for g in [self.terrain_config.x_grid, self.terrain_config.y_grid, self.terrain_config.z_grid]],
+                [g[batch_index, goal_ij[:, 0], goal_ij[:, 1]] for g in [self.terrain_config.x_grid, self.terrain_config.y_grid, self.terrain_config.z_grid]],
                 dim=-1,
             ).to("cpu")
             # Validate pairs (ensure batch dimension is respected in _is_start_goal_xyz_valid)
