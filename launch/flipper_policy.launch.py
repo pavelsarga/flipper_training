@@ -57,6 +57,7 @@ def _resolve_paths(context):
                 "heightmap_layer": LaunchConfiguration("heightmap_layer").perform(context),
                 "flipper_velocity_scale": float(LaunchConfiguration("flipper_velocity_scale").perform(context)),
                 "track_velocity_scale": float(LaunchConfiguration("track_velocity_scale").perform(context)),
+                "disable_turning": LaunchConfiguration("disable_turning").perform(context).lower() == "true",
             }
         ],
     )
@@ -67,7 +68,7 @@ def generate_launch_description():
     # --- run_dir shortcut (auto-resolves config + weights) ---
     run_dir_arg = DeclareLaunchArgument(
         "run_dir",
-        default_value="/home/robot/workspaces/robot_rodeo_gym_ws/logs/optuna_ftr_10794091/optuna_ftr_10794091_109",
+        default_value="/home/robot/workspaces/robot_rodeo_gym_ws/experiments/best_long/attempt_0",
         description="Path to a training run directory. If set, config.yaml and weights/policy_final.pth "
                     "are loaded automatically (overrides config_path/policy_weights_path/vecnorm_weights_path).",
     )
@@ -107,8 +108,10 @@ def generate_launch_description():
     )
     control_rate_arg = DeclareLaunchArgument(
         "control_rate",
-        default_value="10.0",
-        description="Control loop rate in Hz",
+        default_value="40.0",
+        description="Control loop rate in Hz. Must match training: sim_dt × decimation. "
+                    "FTR/CrossingEnv with sim_dt=0.005, decimation=5 → 40 Hz. "
+                    "Native flipper_training with sim_dt=1/400, engine_iters_per_env_step=4 → 100 Hz.",
     )
     heightmap_decay_arg = DeclareLaunchArgument(
         "heightmap_decay",
@@ -117,19 +120,24 @@ def generate_launch_description():
     )
     heightmap_layer_arg = DeclareLaunchArgument(
         "heightmap_layer",
-        default_value="elevation_inpainted",
+        default_value="elevation",
         description="Name of the elevation layer in GridMap",
     )
     flipper_velocity_scale_arg = DeclareLaunchArgument(
         "flipper_velocity_scale",
-        default_value="0.1",
+        default_value="1",
         description="Scale factor for flipper velocity commands",
     )
     track_velocity_scale_arg = DeclareLaunchArgument(
         "track_velocity_scale",
-        default_value="0.05",
+        default_value="1",
         description="Scale factor for FTR track velocity commands (linear and angular). "
                     "Use <1.0 if robot moves too fast compared to Isaac Sim training.",
+    )
+    disable_turning_arg = DeclareLaunchArgument(
+        "disable_turning",
+        default_value="true",
+        description="If true, forces angular velocity to 0 on every step (straight-line only).",
     )
 
     return LaunchDescription(
@@ -146,6 +154,7 @@ def generate_launch_description():
             heightmap_layer_arg,
             flipper_velocity_scale_arg,
             track_velocity_scale_arg,
+            disable_turning_arg,
             OpaqueFunction(function=_resolve_paths),
         ]
     )

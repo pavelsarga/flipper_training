@@ -52,6 +52,7 @@ class FlipperPolicyNode(Node):
         self.declare_parameter("flipper_velocity_scale", 1.0)  # Scale factor for flipper velocities
         self.declare_parameter("track_velocity_scale", 1.0)   # Scale factor for FTR track velocity commands
         self.declare_parameter("publish_debug_cloud", True)  # Publish heightmap as point cloud for debugging
+        self.declare_parameter("disable_turning", False)  # Force angular velocity to 0
 
         # Get parameters
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
@@ -64,6 +65,7 @@ class FlipperPolicyNode(Node):
         self.flipper_velocity_scale = self.get_parameter("flipper_velocity_scale").get_parameter_value().double_value
         self.track_velocity_scale = self.get_parameter("track_velocity_scale").get_parameter_value().double_value
         self.publish_debug_cloud = self.get_parameter("publish_debug_cloud").get_parameter_value().bool_value
+        self.disable_turning = self.get_parameter("disable_turning").get_parameter_value().bool_value
 
         if not config_path or not policy_weights_path:
             self.get_logger().error("config_path and policy_weights_path parameters are required!")
@@ -124,7 +126,7 @@ class FlipperPolicyNode(Node):
         # Note: ground_truth_odom uses RELIABLE QoS, so we must match it
         self.odom_sub = self.create_subscription(Odometry, "/ground_truth_odom", self.odom_callback, reliable_qos)
         self.imu_sub = self.create_subscription(Imu, "/imu/data", self.imu_callback, sensor_qos)
-        self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, sensor_qos)
+        self.joint_state_sub = self.create_subscription(JointState, "/joint_state", self.joint_state_callback, sensor_qos)
         # Goal uses VOLATILE to accept messages from any publisher (RViz, ros2 topic pub, etc.)
         self.goal_sub = self.create_subscription(PoseStamped, "/goal_pose", self.goal_callback, 10)
         self.goal_reset_sub = self.create_subscription(PoseStamped, "/goal_reset", self.goal_reset_callback, 10)
@@ -644,14 +646,16 @@ class FlipperPolicyNode(Node):
             # FTR: 6-D [v, w, fl, fr, rl, rr]
             # Track: raw output is already in m/s and rad/s (clamped to 0.95 m/s, 1.0 rad/s in training)
             twist.linear.x = float(action[0] * self.track_velocity_scale)
-            twist.angular.z = float(action[1] * self.track_velocity_scale)
+            twist.angular.z = 0.0 if self.disable_turning else float(action[1] * self.track_velocity_scale)
             self.cmd_vel_pub.publish(twist)
-            # Flippers: FTR policy outputs are proportional to angular velocity.
-            # Training used 5 deg/step at 200 Hz → ~17.5 rad/s max effective velocity.
-            # Gazebo hardware limit is 5.0 rad/s, so scale: action × 5.0 rad/s.
+            # Flippers: FTR policy outputs incremental position (degrees/step).
+            # Training (this config): sim_dt=0.005, decimation=5 → control rate = 40 Hz.
+            # flipper_dt=5 deg/step → max = 5 deg × 40 Hz × π/180 = 3.49 rad/s.
+            # Convert to velocity: action × 5_deg_per_step × control_rate × π/180.
+            # control_rate must match training: set via launch arg or compute from sim_dt×decimation.
             # Apply FTR front-flipper sign convention (same as FtrWheelArticulation: [-1,-1,1,1])
             flipper_compensation = np.array([-1.0, -1.0, 1.0, 1.0])
-            flipper_vel = action[2:6] * flipper_compensation * 5.0 * self.flipper_velocity_scale
+            flipper_vel = action[2:6] * flipper_compensation * np.deg2rad(5.0) * (1.0 / self.dt) * self.flipper_velocity_scale
 
             # Enforce position limits from FTR config (flipper_pos_max_deg)
             lim = self._ftr_joint_limit_rad
@@ -676,6 +680,8 @@ class FlipperPolicyNode(Node):
             # Native: 8-D [track_vl, track_vr, track_vl2, track_vr2, fl, fr, rl, rr]
             track_velocities = action[:4]
             twist = self.track_velocities_to_twist(track_velocities)
+            if self.disable_turning:
+                twist.angular.z = 0.0
             flipper_velocities = action[4:8] * self.flipper_velocity_scale
             self.cmd_vel_pub.publish(twist)
             for i, key in enumerate(flipper_keys):
