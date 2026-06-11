@@ -207,6 +207,7 @@ class FtrPPOConfig:
     action_bonus_coef_scheduler: dict | None = None
     # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
     sim_dt: float = 1 / 400
+    decimation: int = 5                  # physics steps per policy step; control_freq = 1 / (sim_dt * decimation)
     solver_position_iterations: int = 16
     solver_velocity_iterations: int = 4
     max_depenetration_velocity: float = 0.15
@@ -873,7 +874,7 @@ class FtrPPOTrainer:
             "eval/pct_truncated": eval_rollout["next", "truncated"].float().mean().item(),
         }
         del eval_rollout
-        results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in self.ftr_torchrl_env.pop_termination_info().items()})
+        results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in self.ftr_torchrl_env.pop_termination_info().items()})
         _eval_reward_info = self.ftr_torchrl_env.pop_reward_info()
         _shock_keys = (
             "shock/accel_magnitude", "shock/shock_normalised",
@@ -936,6 +937,9 @@ if __name__ == "__main__":
         if prev_cfg_path is not None:
             print(f"[INFO] Respawn detected — loading config from previous attempt: {prev_cfg_path}", flush=True)
             raw_cfg = _load_raw_config(str(prev_cfg_path), unknown_args)
+            if not raw_cfg:
+                print(f"[WARNING] Previous attempt config at {prev_cfg_path} is empty — falling back to {args.config}", flush=True)
+                raw_cfg = _load_raw_config(args.config, unknown_args)
         else:
             raw_cfg = _load_raw_config(args.config, unknown_args)
 
@@ -991,8 +995,9 @@ if __name__ == "__main__":
     env_cfg.scene.num_envs = _cfg.num_robots
     env_cfg.terrain_name = _cfg.terrain
 
-    # --- Simulation timestep ---
+    # --- Simulation timestep and decimation ---
     env_cfg.sim.dt = _cfg.sim_dt
+    env_cfg.decimation = _cfg.decimation
 
     # --- Rigid body properties ---
     env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
