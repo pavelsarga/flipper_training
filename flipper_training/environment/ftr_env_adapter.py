@@ -225,7 +225,7 @@ class FtrTorchRLEnv(EnvBase):
         result = {
             "env/success_rate": self._term_success / self._term_total,
             "env/failure_rate": self._term_failure / self._term_total,
-            "env/explosion_rate": self._term_explosion / self._term_total,
+            "explosions/rate": self._term_explosion / self._term_total,
         }
         self._term_success = self._term_failure = self._term_explosion = self._term_total = 0
         return result

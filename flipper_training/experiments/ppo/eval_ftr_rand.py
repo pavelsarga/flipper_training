@@ -188,7 +188,7 @@ def _run_single_rollout_with_heightmap(
         "eval/rollout_steps": float(n_steps),
     }
     term_info = ftr_torchrl_env.pop_termination_info()
-    results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
     results.update(ftr_torchrl_env.pop_reward_info())
     return results
 
@@ -206,7 +206,7 @@ def _run_single_rollout(env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor,
     }
     del rollout
     term_info = ftr_torchrl_env.pop_termination_info()
-    results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
     results.update(ftr_torchrl_env.pop_reward_info())
     return results
 
@@ -343,7 +343,7 @@ def _run_single_rollout_tracked(
     }
     results.update(obs_stats)
     term_info = ftr_torchrl_env.pop_termination_info()
-    results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
     results.update(ftr_torchrl_env.pop_reward_info())
     return results, episode_records
 

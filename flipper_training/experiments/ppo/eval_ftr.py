@@ -75,6 +75,10 @@ parser.add_argument(
     "--eval_id", type=str, default=None,
     help="Identifier for this eval run (default: auto UTC timestamp).",
 )
+parser.add_argument(
+    "--print_actions", action="store_true",
+    help="Print the policy's action vector each step for env 0. Requires num_envs=1.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args, unknown_args = parser.parse_known_args()
 app_launcher = AppLauncher(args)
@@ -211,6 +215,58 @@ def _print_lin_vels(ftr_gym_env, label: str = "Linear velocities") -> None:
 
 
 
+_ACTION_LABELS_6 = ["lin_vel", "ang_vel", "fl_flip", "fr_flip", "rl_flip", "rr_flip"]
+_ACTION_LABELS_8 = ["track_fl", "track_fr", "track_rl", "track_rr", "flip_fl", "flip_fr", "flip_rl", "flip_rr"]
+
+
+def _run_single_rollout_print_actions(
+    env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor, max_steps: int,
+) -> dict[str, float]:
+    """Manual step loop that prints the policy action vector each step for env 0."""
+    td = env.reset()
+    action_dim: int | None = None
+    labels: list[str] | None = None
+    total_reward = 0.0
+    n_steps = 0
+
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
+        for step in range(max_steps):
+            td = actor(td)
+
+            if action_dim is None:
+                action_dim = td["action"].shape[-1]
+                if action_dim == 6:
+                    labels = _ACTION_LABELS_6
+                elif action_dim == 8:
+                    labels = _ACTION_LABELS_8
+                else:
+                    labels = [f"a[{i}]" for i in range(action_dim)]
+                header = "  ".join(f"{l:>9}" for l in labels)
+                logger.info(f"step   {header}")
+                logger.info("-" * (7 + 11 * action_dim))
+
+            a = td["action"][0].cpu()
+            vals = "  ".join(f"{v:>9.4f}" for v in a.tolist())
+            logger.info(f"{step:>5}  {vals}")
+
+            td = env.step(td)
+            total_reward += td["next", "reward"].mean().item()
+            n_steps += 1
+
+            if td["next", "done"].all():
+                break
+            td = td["next"]
+
+    results: dict[str, float] = {
+        "eval/mean_step_reward": total_reward / max(n_steps, 1),
+        "eval/rollout_steps": float(n_steps),
+    }
+    term_info = ftr_torchrl_env.pop_termination_info()
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
+    results.update(ftr_torchrl_env.pop_reward_info())
+    return results
+
+
 def _run_single_rollout_with_heightmap(
     env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor, max_steps: int,
     out_dir: "Path", plot_interval: int,
@@ -262,7 +318,7 @@ def _run_single_rollout_with_heightmap(
     if obs_list:
         results.update(_compute_obs_stats(torch.stack(obs_list)))
     term_info = ftr_torchrl_env.pop_termination_info()
-    results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
     results.update(ftr_torchrl_env.pop_reward_info())
     return results
 
@@ -284,7 +340,7 @@ def _run_single_rollout(env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor,
 
     # Termination stats (success / failure rates per episode)
     term_info = ftr_torchrl_env.pop_termination_info()
-    results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
 
     # Per-component reward means
     results.update(ftr_torchrl_env.pop_reward_info())
@@ -436,7 +492,7 @@ def _run_single_rollout_tracked(
     }
     results.update(obs_stats)
     term_info = ftr_torchrl_env.pop_termination_info()
-    results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
     results.update(ftr_torchrl_env.pop_reward_info())
     return results, episode_records
 
@@ -469,6 +525,7 @@ def run_eval(
     env_names_yaml: "str | None" = None,
     eval_id: "str | None" = None,
     policy_label: "str | None" = None,
+    print_actions: bool = False,
 ) -> None:
     cfg = FtrPPOConfig(**raw_cfg)
     device = set_device(cfg.device)
@@ -519,6 +576,8 @@ def run_eval(
 
     if plot_heightmap and ftr_gym_env.unwrapped.num_envs != 1:
         raise ValueError("--plot_heightmap requires num_envs=1 (pass --num_envs 1)")
+    if print_actions and ftr_gym_env.unwrapped.num_envs != 1:
+        raise ValueError("--print_actions requires num_envs=1 (pass --num_envs 1)")
 
     # Resolve CSV-output settings
     _output_dir = Path(output_dir) if output_dir else None
@@ -538,7 +597,10 @@ def run_eval(
 
     for r in range(repeats):
         logger.info(f"Running eval rollout {r + 1}/{repeats} (max_steps={max_steps}) ...")
-        if plot_heightmap:
+        if print_actions:
+            results = _run_single_rollout_print_actions(env, ftr_torchrl_env, ftr_gym_env, actor, max_steps)
+            episode_records: list[EpisodeRecord] = []
+        elif plot_heightmap:
             from datetime import datetime
             out_dir = Path(f"/tmp/ftr_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}_r{r+1}")
             results = _run_single_rollout_with_heightmap(
@@ -725,6 +787,7 @@ if __name__ == "__main__":
         num_env_types=args.num_env_types,
         env_names_yaml=args.env_names_yaml,
         eval_id=args.eval_id,
+        print_actions=args.print_actions,
     )
 
     os._exit(0)

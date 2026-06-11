@@ -178,7 +178,7 @@ class RunLogger:
         n = 0
         while (job_dir / f"attempt_{n}").exists():
             cfg = job_dir / f"attempt_{n}" / "config.yaml"
-            if cfg.exists():
+            if cfg.exists() and cfg.stat().st_size > 0:
                 latest = cfg
             n += 1
         return latest  # None if no previous attempt exists yet
@@ -203,7 +203,13 @@ class RunLogger:
         return dirs
 
     def _save_config(self):
-        OmegaConf.save(self.train_config, self.logpath / "config.yaml")
+        path = self.logpath / "config.yaml"
+        OmegaConf.save(self.train_config, path)
+        # fsync to ensure the config survives on NFS filesystems (common on HPC clusters).
+        # Without this, writes may be lost on job preemption or node failure.
+        with open(path, "r+b") as f:
+            f.flush()
+            os.fsync(f.fileno())
 
     def _init_logfile(self, name: str, sample_row: dict[str, Any]):
         self.logfiles[name] = open(self.logpath / f"{name}.csv", "w")
