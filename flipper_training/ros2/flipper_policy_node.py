@@ -66,7 +66,7 @@ class FlipperPolicyNode(Node):
         )
 
         if self._is_ftr:
-            from flipper_training.experiments.ppo.ftr_policy_inference_module import FtrPolicyInferenceModule
+            from marv_rl_training.ppo.ftr_policy_inference_module import FtrPolicyInferenceModule
             self.policy = FtrPolicyInferenceModule(
                 config_path=config_path,
                 policy_weights_path=policy_weights_path,

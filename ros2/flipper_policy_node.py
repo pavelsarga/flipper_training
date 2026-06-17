@@ -78,7 +78,7 @@ class FlipperPolicyNode(Node):
         )
 
         if self._is_ftr:
-            from flipper_training.experiments.ppo.ftr_policy_inference_module import FtrPolicyInferenceModule
+            from marv_rl_training.ppo.ftr_policy_inference_module import FtrPolicyInferenceModule
             from omegaconf import OmegaConf
             _ftr_cfg = OmegaConf.load(config_path)
             _max_deg = _ftr_cfg.get("env_cfg_overrides", {}).get("flipper_pos_max_deg", 90.0)
