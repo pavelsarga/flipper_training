@@ -63,7 +63,20 @@ def prepare_configs(rng: torch.Generator, cfg: "PPOExperimentConfig") -> Tuple[T
     return terrain_config, physics_config, robot_model, device
 
 
-def prepare_env(train_config: "PPOExperimentConfig", mode: Literal["train", "eval"]) -> tuple["Env", torch.device, torch.Generator]:
+def prepare_env(
+    train_config: "PPOExperimentConfig", mode: Literal["train", "eval"], force_return_derivative: bool = False
+) -> tuple["Env", torch.device, torch.Generator]:
+    """Args:
+    force_return_derivative: force ``Env(return_derivative=True)`` regardless of
+        ``mode``. Normally only ``mode="eval"`` needs ``PhysicsStateDer``
+        (``xdd``/``f_spring``/``f_friction``/...) in the observation
+        tensordict; ``experiments/creps/train.py`` also needs it during
+        TRAINING (``mode="train"``) for its Sec III hard-impact safety
+        criterion, hence this separate flag instead of misusing
+        ``mode="eval"`` (which would be confusing for a training loop and
+        could silently start meaning something else if "eval" mode ever grows
+        other side effects here).
+    """
     # Init configs and RL-related objects
     rng = seed_all(train_config.seed)
     terrain_config, physics_config, robot_model, device = prepare_configs(rng, train_config)
@@ -83,9 +96,10 @@ def prepare_env(train_config: "PPOExperimentConfig", mode: Literal["train", "eva
         differentiable=False,
         engine_compile_opts=train_config.engine_compile_opts,
         out_dtype=train_config.training_dtype,
-        return_derivative=mode == "eval",  # needed for evaluation
+        return_derivative=mode == "eval" or force_return_derivative,  # needed for evaluation, or when explicitly forced
         engine_iters_per_step=train_config.engine_iters_per_env_step,
         generator=rng,
+        emit_clean_observations=train_config.emit_clean_observations,
     )
     check_env_specs(base_env)
     return base_env, device, rng
@@ -140,6 +154,16 @@ def log_from_eval_rollout(eval_rollout: "TensorDict") -> dict[str, int | float]:
 
 def make_transformed_env(env: "Env", train_config: "PPOExperimentConfig", policy_transforms: list[Transform]) -> tuple[TransformedEnv, VecNorm]:
     vecnorm_keys = [o.name for o in env.observations if o.supports_vecnorm]
+    if getattr(env, "emit_clean_observations", False):
+        # Normalise the "clean" mirror (see Env.emit_clean_observations / C-TRAC's denoising
+        # target) with the SAME vecnorm-eligibility as its noisy counterpart, so the C-VAE's
+        # reconstruction target stays in the same representation the actor/critic actually see.
+        # Each nested ("clean", name) key gets its OWN running mean/std (VecNorm tracks stats
+        # per in_key) rather than literally sharing the noisy key's statistics -- since
+        # observation noise is zero-mean, the two independently-tracked estimates converge to
+        # (and in practice track very closely) the same statistics; a deliberate, documented
+        # approximation rather than plumbing a stat-sharing mechanism VecNorm doesn't expose.
+        vecnorm_keys += [("clean", o.name) for o in env.observations if o.supports_vecnorm]
     if train_config.vecnorm_on_reward:
         vecnorm_keys.append("reward")
     vecnorm = VecNorm(

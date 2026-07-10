@@ -11,7 +11,14 @@ from flipper_training.experiments.ppo.common import (
 )
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import LazyTensorStorage, SamplerWithoutReplacement, TensorDictReplayBuffer
-from config import PPOExperimentConfig, OmegaConf
+# Was `from config import PPOExperimentConfig, OmegaConf` -- a bare `config` module only resolves
+# when this file is run as a plain script from within experiments/ppo/ (script-dir sys.path[0]
+# aliases the sibling config.py to top-level `config`). It raises `ModuleNotFoundError: No module
+# named 'config'` under the CLAUDE.md-documented `python -m flipper_training.experiments.ppo.train`
+# invocation, since `-m` does not add the submodule's own directory to sys.path. Fully-qualified
+# imports work under both invocation styles.
+from flipper_training.experiments.ppo.config import PPOExperimentConfig
+from omegaconf import OmegaConf
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE

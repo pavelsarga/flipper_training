@@ -73,7 +73,11 @@ class FixedStartGoalNavigation(BaseObjective):
         environment by adding the initial orientation and drop height.
         """
         if self.resample_random_joint_angles_on_reset and self.init_joint_angles == "random":
-            self.initial_joint_angles = self._get_initial_joint_angles()
+            # BUGFIX (audit round-3): _get_initial_joint_angles requires the count,
+            # same as the constructor call above -- calling it bare raised TypeError
+            # whenever resample_random_joint_angles_on_reset was combined with
+            # init_joint_angles="random" (e.g. test_configs/deterministic_flats_debug.yaml).
+            self.initial_joint_angles = self._get_initial_joint_angles(self.physics_config.num_robots)
         start_state = PhysicsState.dummy(
             robot_model=self.robot_model,
             batch_size=self.physics_config.num_robots,

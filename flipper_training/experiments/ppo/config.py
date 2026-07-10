@@ -84,3 +84,9 @@ class PPOExperimentConfig:
     optimizer_opts: dict[str, Any] = field(default_factory=dict)
     heightmap_gen_opts: dict[str, Any] = field(default_factory=dict)
     engine_compile_opts: dict[str, Any] = field(default_factory=dict)
+    # Also compute+emit a noiseless mirror of every observation under a "clean" sub-key each step
+    # (-> Env.emit_clean_observations). Off by default (byte-identical to before this field
+    # existed); C-TRAC's "full" config turns it on to supply the C-VAE denoising loss its clean
+    # reconstruction target (Pan et al. 2025 Sec. IV-C) -- see ctrac_policy.py /
+    # experiments/ctrac/train.py. No effect on any other experiment/trainer.
+    emit_clean_observations: bool = False

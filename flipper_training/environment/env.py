@@ -42,6 +42,7 @@ class Env(EnvBase):
         return_derivative: bool = False,
         engine_iters_per_step: int = 1,
         generator: torch.Generator | None = None,
+        emit_clean_observations: bool = False,
         **kwargs,
     ):
         super().__init__(device=device, **kwargs)
@@ -53,6 +54,7 @@ class Env(EnvBase):
         self.return_derivative = return_derivative
         self.engine_iters_per_step = engine_iters_per_step
         self.generator = generator
+        self.emit_clean_observations = emit_clean_observations
         # Physics configs
         self.phys_cfg = physics_config.to(device)
         self.robot_cfg = robot_model_config.to(device)
@@ -63,6 +65,20 @@ class Env(EnvBase):
         self.objective = objective_factory(self)
         self.reward = reward_factory(self)
         self.observations = [o(self) for o in observation_factories]
+        # Parallel noiseless mirror of self.observations, used ONLY when emit_clean_observations
+        # is set (C-TRAC's C-VAE denoising target, Pan et al. 2025 Sec. IV-C -- the paper's
+        # denoising autoencoder reconstructs the CLEAN o_{t+1} from a NOISY o_t^H, so the noisy
+        # and clean values must both be emitted from the same step). For observations that
+        # already have apply_noise=False, "clean" is by definition identical to the normal
+        # value, so we alias the SAME instance (skips a redundant recompute in _get_observations)
+        # instead of constructing a second one; only observations with apply_noise=True get a
+        # genuinely separate apply_noise=False instance built via the SAME factory + config
+        # (Observation.make_factory's **kwargs override, see observations/__init__.py).
+        self.clean_observations = (
+            [f(self, apply_noise=False) if getattr(o, "apply_noise", False) else o for f, o in zip(observation_factories, self.observations)]
+            if emit_clean_observations
+            else []
+        )
         # RL State variables
         self.step_count = torch.zeros((self.n_robots,), device=self.device, dtype=torch.int32)
         self.step_limits = torch.zeros((self.n_robots,), device=self.device, dtype=torch.int32)
@@ -208,8 +224,14 @@ class Env(EnvBase):
             }
         else:
             der_spec = {}
+        if self.emit_clean_observations:
+            # Clean mirrors have IDENTICAL shape/dtype to their normal counterpart (only the
+            # noise differs), so the same per-observation specs apply under the "clean" prefix.
+            clean_spec = {"clean": Composite(obs_specs, device=self.device, shape=(self.n_robots,))}
+        else:
+            clean_spec = {}
         return Composite(
-            obs_specs | state_spec | der_spec,  # Include the physics state in the observation spec
+            obs_specs | state_spec | der_spec | clean_spec,  # Include the physics state in the observation spec
             device=self.device,
             shape=(self.n_robots,),
         )
@@ -245,11 +267,15 @@ class Env(EnvBase):
         prev_state_der: PhysicsStateDer,
         curr_state: PhysicsState,
     ) -> TensorDict:
-        obs_td = TensorDict(
-            {o.name: o(prev_state=prev_state, action=action, prev_state_der=prev_state_der, curr_state=curr_state) for o in self.observations},
-            device=self.device,
-            batch_size=[self.n_robots],
-        )
+        kwargs = dict(prev_state=prev_state, action=action, prev_state_der=prev_state_der, curr_state=curr_state)
+        values = {o.name: o(**kwargs) for o in self.observations}
+        obs_td = TensorDict(values, device=self.device, batch_size=[self.n_robots])
+        if self.emit_clean_observations:
+            # Reuse the already-computed value for observations whose clean mirror is aliased to
+            # the same (already noise-free) instance -- see __init__ -- only actually-noised
+            # observations get recomputed here.
+            clean_values = {o.name: values[o.name] if co is o else co(**kwargs) for o, co in zip(self.observations, self.clean_observations)}
+            obs_td["clean"] = TensorDict(clean_values, device=self.device, batch_size=[self.n_robots])
         obs_td[Env.STATE_KEY] = curr_state.to_tensordict()
         if self.return_derivative:
             obs_td[Env.PREV_STATE_DER_KEY] = prev_state_der.to_tensordict()
