@@ -159,12 +159,27 @@ class Heightmap(Observation):
     def from_realistic_world(self, tensordict: TensorDictBase) -> torch.Tensor:
         """Resample a real elevation map (``/elevation_map``, see ``flipper_policy_node.py``) onto ``percep_extent``.
 
-        Expects ``tensordict["heightmap"]`` (H_src, W_src), robot-local-frame, and
-        ``tensordict["heightmap_extent"]`` = (x_max, y_max, x_min, y_min) — the same
-        convention documented for the ROS deploy node's elevation-map callback.
-        Raises if the supplied extent does not fully cover ``percep_extent``.
+        Expects ``tensordict["heightmap"]`` (H_src, W_src) up to leading singleton dims,
+        robot-local-frame, and ``tensordict["heightmap_extent"]`` = (x_max, y_max, x_min,
+        y_min) — the same convention documented for the ROS deploy node's elevation-map
+        callback. Raises if the supplied extent does not fully cover ``percep_extent``.
+
+        Live-sim-found bug (round 4): ``policy_inference_module.infer_action()`` builds its
+        input tensordict via a blanket ``torch.tensor(v).unsqueeze(0)`` over EVERY kwarg
+        (adding a batch dim of 1), so ``tensordict["heightmap"]`` actually arrives as
+        ``(1, H_src, W_src)``, not the bare ``(H_src, W_src)`` this docstring used to claim
+        without qualification — ``.unsqueeze(0).unsqueeze(0)`` on that made a 5-D tensor and
+        crashed ``grid_sample`` ("expected grid to have size 3 in last dimension") the
+        instant this was exercised through the real ROS node (never reached by the
+        differentiable-physics ``Env``, which never calls this method — only caught by
+        actually running ``flipper_policy_node.py`` against the live sim). Fixed by
+        unconditionally squeezing down to exactly 2-D first, so both the bare-2-D case
+        (e.g. a hand-built test tensordict) and the batched-3-D real deploy case work
+        identically.
         """
-        hm: torch.Tensor = tensordict["heightmap"].to(self.env.device)  # (H_src, W_src)
+        hm: torch.Tensor = tensordict["heightmap"].to(self.env.device)
+        while hm.ndim > 2:
+            hm = hm.squeeze(0)
         extent = tensordict["heightmap_extent"]
         if isinstance(extent, torch.Tensor):
             extent = extent.cpu().squeeze().tolist()
@@ -176,11 +191,24 @@ class Heightmap(Observation):
         grid_v = 2 * (px - extent[0]) / (extent[2] - extent[0]) - 1
         grid_u = 2 * (py - extent[1]) / (extent[3] - extent[1]) - 1
         grid = torch.stack((grid_u, grid_v), dim=-1).unsqueeze(0)  # (1, H_p, W_p, 2)
+        # grid_sample(input=(N=1,C=1,H_src,W_src), grid=(N=1,H_p,W_p,2)) -> (N=1,C=1,H_p,W_p),
+        # already exactly get_spec()'s (n_robots, 1, H_p, W_p) 4-D shape (matches __call__'s
+        # (b, 1, H, W) too) -- do NOT squeeze this, a second live-sim-found bug (round 4):
+        # a now-removed `.squeeze(0)` here silently dropped the leading dim, so the actor's
+        # EncoderCombiner received a 3-D (1, H_p, W_p) heightmap instead of 4-D (1, 1, H_p,
+        # W_p) -- one dim short of what HeightmapEncoder's Conv2d stack was built for, which
+        # surfaced downstream as an opaque "mat1 and mat2 shapes cannot be multiplied"
+        # RuntimeError inside the flattened Linear layer, not as an obvious shape error at
+        # the source. Only reachable via the real ROS deploy path (`_to_realistic_env`) --
+        # the differentiable-physics `Env`'s own `Heightmap.__call__` never calls this method,
+        # so no amount of training/eval-rollout testing could have caught it; only found by
+        # actually running `flipper_policy_node.py` against the live sim and inspecting the
+        # tensordict shapes at the crash site.
         z = torch.nn.functional.grid_sample(hm.unsqueeze(0).unsqueeze(0), grid, mode="bilinear", padding_mode="border", align_corners=True)
         z = z.clamp(self.interval[0], self.interval[1])
         if self.normalize_to_interval:
             z = z / (self.interval[1] - self.interval[0])
-        return z.squeeze(0).to(self.env.out_dtype)  # (1, H_p, W_p)
+        return z.to(self.env.out_dtype)  # (1, 1, H_p, W_p) -- n_robots=1, channel=1
 
     def get_spec(self) -> Unbounded:
         return Unbounded(

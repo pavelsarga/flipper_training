@@ -89,8 +89,14 @@ are the pre-training template init, NOT the SAC-learned critic — harmless for 
 actor + C-VAE (whose torchrl conversion has no such disconnection — verified in the same
 way) are faithfully saved/restored.
 
-Saves ``policy_final.pth`` (``wrapper.state_dict()``: actor + Q-template-init + C-VAE) via
-``RunLogger`` under ``runs/ctrac/<run_name>/weights/``. Deploy through
+Saves ``policy_final.pth`` (``wrapper.state_dict()``: actor + Q-template-init + C-VAE) AND
+``vecnorm_final.pth`` (plus ``policy_step_<i>``/``vecnorm_step_<i>`` at every
+``eval_and_save_every``) via ``RunLogger`` under ``runs/ctrac/<run_name>/weights/`` — the
+same two-file pattern ``experiments/ppo/train.py`` uses (round-4 fix: this trainer used to
+save only the policy, never the VecNorm running statistics, so a checkpoint alone could not
+actually restore the observation normalisation ``run_flipper_policy_sim.sh`` /
+``PPOPolicyInferenceModule`` expect — the doc claim "deploy exactly like every other
+baseline" was not literally true until this was added). Deploy through
 ``run_flipper_policy_sim.sh`` / ``flipper_policy_node`` exactly like every other baseline
 here — they only ever call ``get_policy_operator()(td)["action"]``, so the critics/C-VAE
 training-only state in the checkpoint is simply ignored at deploy time.
@@ -98,6 +104,7 @@ training-only state in the checkpoint is simply ignored at deploy time.
 
 from __future__ import annotations
 
+import dataclasses
 import traceback
 from typing import TYPE_CHECKING
 
@@ -128,6 +135,14 @@ if TYPE_CHECKING:
 
 __all__ = ["CTRACTrainer"]
 
+# PPOExperimentConfig is a strict dataclass (no **kwargs catch-all): filter out the
+# ctrac-only top-level keys (gamma/target_tau/alpha_init/.../n_iters/... — the "Additional
+# (optional) top-level config keys" list in this module's docstring) before constructing it,
+# otherwise ANY config that actually used those documented ctrac keys would fail to even
+# load (`PPOExperimentConfig(**config)` raises "unexpected keyword argument" on the first
+# one) — same pattern as `experiments/dqn/train.py` and `experiments/creps/train.py`.
+_PPO_CFG_FIELDS = {f.name for f in dataclasses.fields(PPOExperimentConfig)}
+
 
 def _cfg(c, k, d):
     """Read an optional key straight off the raw OmegaConf dict (not a PPOExperimentConfig field)."""
@@ -139,7 +154,7 @@ class CTRACTrainer:
 
     def __init__(self, config: "DictConfig"):
         self.raw_config = config
-        self.config = PPOExperimentConfig(**config)
+        self.config = PPOExperimentConfig(**{k: v for k, v in config.items() if k in _PPO_CFG_FIELDS})
         self.term_logger = get_terminal_logger("ctrac_train")
         self.run_logger = RunLogger(
             train_config=config,
@@ -295,9 +310,11 @@ class CTRACTrainer:
             if i % self.config.eval_and_save_every == 0:
                 log.update(self._get_eval_rollout_results())
                 self.run_logger.save_weights(self.wrapper.state_dict(), f"policy_step_{i}")
+                self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{i}")
             self.run_logger.log_data(log, i)
 
         self.run_logger.save_weights(self.wrapper.state_dict(), "policy_final")
+        self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_final")
 
     # ------------------------------------------------------------------ stage steps
     def _stage1_step(self) -> dict[str, float]:

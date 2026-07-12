@@ -80,6 +80,47 @@ full architecture with everything turned on):
     (``history_len=1``-equivalent), the same graceful-missing-state behaviour
     ``state_machine_policy`` already documents for its own recurrent carry.
 
+  Concretely, not hypothetically: traced ``policy_inference_module.py``'s
+  ``infer_action()`` (what ``ros2/flipper_policy_node.py``'s
+  ``control_callback`` calls every control tick) end to end. It builds a
+  FRESH tensordict from raw kwargs each call, does ``env_td =
+  self.env.step(world_td)``, then a bare ``self.actor_operator(env_td["next"])``
+  — nothing captures ``env_td["next", HISTORY_KEY]`` (or GRU/LSTM/
+  ``state_machine``'s own ``RECURRENT_KEY``) back into the NEXT tick's
+  ``world_td``. So today, through THIS specific node, multi-frame history
+  does not actually accumulate across real control ticks — every tick hits
+  the bare-call fallback above, i.e. live-deployed behaviour is
+  ``history_len=1``-equivalent regardless of the configured ``history_len``,
+  identically to how GRU/LSTM/``state_machine``'s own recurrent carry already
+  behaves through this same node (this is a pre-existing property of
+  ``infer_action()``'s per-tick calling convention, not introduced here, and
+  it affects every recurrent policy in this repo the same way, not just
+  C-TRAC). History DOES accumulate for real wherever a caller threads
+  ``next -> current`` across steps — every ``SyncDataCollector`` /
+  ``Env.rollout()`` usage does this automatically (training, this trainer's
+  own eval rollouts, ``check_env_specs``), so the C-VAE genuinely trains and
+  evaluates on real multi-frame windows; only this one ROS inference
+  wrapper's per-tick convention is memoryless. Fixing that wrapper (for every
+  recurrent policy in this repo, not just C-TRAC) is out of scope here.
+
+  One level deeper, live-sim-verified: that memorylessness was supposed to be
+  HARMLESS (degrade to ``history_len=1``-equivalent, per ``_FrameHistoryBuffer``'s
+  own docstring below) but, before this pass, actually CRASHED instead — a real bug,
+  not just a fidelity gap, only reachable by running the actual ROS node (a plain
+  unit test that calls the actor operator directly on a truly bare tensordict, with
+  no ``TensorDictPrimer``/``InitTracker`` in the picture at all, does NOT reproduce
+  this: that is an easier case than what ``infer_action()`` actually produces).
+  ``TensorDictPrimer``'s zero-fill only ever gets computed by its reset-time code
+  path; ``infer_action()`` never calls ``env.reset()``, so every tick instead hits
+  the primer's weaker step-time path, which left a non-tensor placeholder at
+  ``HISTORY_KEY`` that crashed the ring buffer's ``buf.abs()`` check. Fixed
+  defensively in ``_FrameHistoryBuffer.forward`` itself (treat anything that isn't
+  literally a ``torch.Tensor`` as "not primed", not just ``None``) rather than by
+  fighting ``TensorDictPrimer`` internals — see that class's docstring for the full
+  trace. Re-verified end to end after the fix: `flipper_policy_node.py` against the
+  live Gazebo sim, 28 consecutive control ticks, zero errors, well-formed published
+  `/cmd_vel` + `/flippers_cmd_vel/*` commands throughout.
+
   ``history_len=1`` (the default) is an exact identity — the ring buffer always
   holds exactly the current frame, so "y_enc_hist" == "y_enc" bit-for-bit and
   training reduces exactly to this file's previous single-frame behaviour. This
@@ -210,34 +251,53 @@ full architecture with everything turned on):
   authors chose to write the vector).
 
   **Why this MUST be an env-side transform, not a policy-operator submodule**
-  (unlike the history ring buffer above): torchrl 0.8.1's ``SACLoss`` computes
-  both the actor loss and the SAC target value via
-  ``dist = self.actor_network.get_dist(td); a = dist.rsample()`` and feeds
-  ``a`` STRAIGHT to ``self.qvalue_network`` (verified against the installed
-  ``torchrl/objectives/sac.py``'s ``_actor_loss``/``_compute_target_v2``) — it
-  NEVER re-runs the actor's ``forward()`` after sampling, so a deterministic
-  "expand 5-D to 8-D" module placed after the ``ProbabilisticActor`` inside the
-  same ``TensorDictSequential`` would be silently skipped on exactly those two
-  code paths, and the critic (built for one specific action width) would then
-  receive a 5-D tensor on those calls, crashing. The only way to keep the
-  actor's OWN distribution genuinely 5-dimensional (matching Eq. 3, including
-  SAC's entropy term being computed over the TRUE 5 degrees of freedom, not an
-  8-D space with tied means but independent per-dimension noise) while still
-  giving the physics engine a valid 8-D command is to expand OUTSIDE the actor
-  entirely, as an env-side action transform — exactly the use case
-  ``torchrl.envs.transforms.Transform``'s ``in_keys_inv``/``_inv_call`` exists
-  for. ``EffectiveActionTransform`` (below) does this: ``TransformedEnv._step``
-  calls ``transform.inv()`` on a CLONE of the incoming tensordict to build what
-  is actually handed to the base env's ``_step`` (verified in
-  ``torchrl/envs/transforms/transforms.py``) — the ORIGINAL tensordict (whose
-  "action" is untouched, still 5-D) is what gets "next"-merged and returned,
-  i.e. what the collector yields and the replay buffer stores. So collection,
-  the replay buffer, the critic, and every ``SACLoss`` code path all
-  consistently see the 5-D action; only the (transparent, internal) physics
-  step receives the expanded 8-D command. The critic (``get_qvalue_operator()``)
-  is therefore ALWAYS built for the env-native width (8-D) regardless of this
-  option — it is the ENV's action-transform that reconciles the two, never the
-  critic itself.
+  (unlike the history ring buffer above), AND why the critic's action input
+  tracks the actor's width instead of staying env-native — both driven by the
+  same fact: torchrl 0.8.1's ``SACLoss`` computes both the actor loss and the
+  SAC target value via ``dist = self.actor_network.get_dist(td); a =
+  dist.rsample()`` and feeds ``a`` STRAIGHT to ``self.qvalue_network``
+  (verified against the installed ``torchrl/objectives/sac.py``'s
+  ``_actor_loss``/``_compute_target_v2`` — and reproduced empirically: an
+  earlier revision of this file built the critic at the env-native width
+  unconditionally and hit exactly this crash, ``RuntimeError`` out of the
+  vmapped ``_ConcatQ`` linear layer, the moment ``effective_action_5d=True``
+  reached its first SAC update). It NEVER re-runs the actor's ``forward()``
+  after sampling, so:
+
+  1. A deterministic "expand 5-D to 8-D" module placed after the
+     ``ProbabilisticActor`` inside the same ``TensorDictSequential`` would be
+     silently skipped on exactly those two code paths (``dist.rsample()`` is
+     read directly off the actor's distribution, not off anything downstream
+     of it) — ruling out a policy-operator submodule as the fix.
+  2. Consequently, ``self.qvalue_network`` MUST accept whatever width
+     ``dist.rsample()`` produces — the actor's OWN ``actor_adim`` (5 when this
+     option is on, 8 otherwise) — on every SAC code path (``_actor_loss``,
+     ``_compute_target_v2``, and the plain ``_qvalue_v2_loss`` update, which
+     reads the REPLAY-STORED "action"). So ``get_qvalue_operator()``'s
+     ``_ConcatQ`` is built with ``actor_adim``, not ``env_adim`` — this is also
+     the MORE paper-faithful choice independent of the torchrl constraint:
+     Sec. IV-A.3 defines the critic as ``Q_phi(s_t, a_t)`` using the SAME
+     ``a_t`` as Eq. 3 (5-D in the paper), never an 8-D physical expansion of
+     it.
+  3. The physics engine still needs a valid 8-D command every step, and that
+     translation has to happen SOMEWHERE — expanding INSIDE the actor operator
+     is ruled out by point 1, so it happens OUTSIDE the actor entirely, as an
+     env-side action transform, exactly the use case
+     ``torchrl.envs.transforms.Transform``'s ``in_keys_inv``/``_inv_call``
+     exists for. ``EffectiveActionTransform`` (below) does this:
+     ``TransformedEnv._step`` calls ``transform.inv()`` on a CLONE of the
+     incoming tensordict to build what is actually handed to the base env's
+     ``_step`` (verified in ``torchrl/envs/transforms/transforms.py``) — the
+     ORIGINAL tensordict (whose "action" is untouched, still 5-D) is what gets
+     "next"-merged and returned, i.e. what the collector yields and the replay
+     buffer stores. So collection, the replay buffer, the (now 5-D-native)
+     critic, and every ``SACLoss`` code path all consistently see the 5-D
+     action; only the (transparent, internal) physics step — which
+     ``EffectiveActionTransform`` alone touches — receives the expanded 8-D
+     command. Nothing "reconciles" an 8-D critic with a 5-D actor because
+     there is no such mismatch to reconcile: the critic is 5-D-native in this
+     mode, full stop, and the env-side transform's only job is feeding the
+     physics engine, not bridging an actor/critic width gap.
 
   **Consequence for the deploy contract**: with ``effective_action_5d=True``,
   ``get_policy_operator()(td)["action"]`` returns the 5-D EFFECTIVE action, NOT
@@ -341,6 +401,20 @@ class ContactVAE(nn.Module):
     actor operator); this module maps ``y_enc_hist`` to the latent and the
     decoder heads.
 
+    Honest note on paper fidelity (decoder head count, found on a round-4 re-audit,
+    pre-existing from an earlier pass, not touched by round 4's checklist): Sec. IV-C's
+    text says the multi-head decoder's "first head estimates c~_t and c~_t^prob"
+    (singular "first head" for both quantities) and "the second reconstructs and denoises
+    the observation" -- i.e. TWO heads total, one shared between contact-position and
+    contact-probability. This class instead gives contact position (``dec_contact``),
+    contact probability (``dec_prob``), and denoising reconstruction (``dec_denoise``)
+    THREE fully independent single-purpose MLPs (no shared sub-trunk between
+    ``dec_contact``/``dec_prob``) — every output the paper describes is still produced and
+    supervised by exactly the loss terms Eq. 12-14 specify, so this does not change what
+    is learned or how it is scored, only whether position/probability share decoder
+    parameters before their respective final layers. Not resolved here: changing it would
+    touch the single-frame architecture this round was told to extend, not regress.
+
     ``forward(y_enc_hist) -> (z, contact_est, contact_prob)`` is the policy-path
     inference used inside the actor operator (reparameterised sample of ``z``
     in train mode, posterior mean in eval mode).
@@ -433,6 +507,23 @@ class _FrameHistoryBuffer(TensorDictModuleBase):
     carried buffer is absent (bare/transform-free call), all-zero (never primed), or ``is_init``
     fires. ``history_len=1`` is an exact identity regardless of any of the above (see class
     call-site docs) — "y_enc_hist" always equals "y_enc" bit-for-bit.
+
+    Live-sim-found bug (round 4): also treats a carried buffer as "not primed" whenever it is
+    not literally a ``torch.Tensor`` — needed because ``TensorDictPrimer``'s zero-fill only
+    ever gets computed by its ``_reset_func`` (a real ``torch.full(spec.shape, 0.0, ...)``
+    call), which runs on ``env.reset()``; its weaker ``_step()`` path (taken on every bare
+    ``env.step()`` call with no preceding reset in the SAME process, e.g. every single tick of
+    ``policy_inference_module.infer_action()``, which never calls ``reset()`` at all) just
+    tries to copy forward whatever the PREVIOUS "current" tensordict held at this key, and on
+    the very first such call there is nothing to copy — verified empirically that this leaves
+    a ``tensordict.tensorclass.NonTensorData`` placeholder at ``HISTORY_KEY`` instead of a zero
+    tensor, which crashed ``buf.abs()`` with ``RuntimeError: Tensor list must have at least one
+    tensor`` (``NonTensorData`` has no tensor leaves to reduce) the instant this was exercised
+    through the real ROS node — never reachable via a collector/``Env.rollout()``, both of
+    which always call ``reset()`` first. Not a ``TensorDictPrimer`` misuse on this class's
+    part (state_machine_policy's ``RECURRENT_KEY`` primer uses the identical
+    ``default_value={KEY: 0.0}`` call pattern and would hit the exact same issue under the
+    same reset-less calling convention) — fixed here, defensively, at the point of use.
     """
 
     def __init__(self, enc_dim: int, history_len: int):
@@ -448,6 +539,10 @@ class _FrameHistoryBuffer(TensorDictModuleBase):
         fresh = y_enc.unsqueeze(-2).expand(*batch_shape, self.history_len, self.enc_dim).clone()
 
         buf = tensordict.get(HISTORY_KEY, None)
+        if not isinstance(buf, torch.Tensor):
+            # Absent (bare call), or a non-tensor primer placeholder (see docstring above) --
+            # both mean "no real history was ever carried in", so degrade the same way.
+            buf = None
         if buf is None:
             new_buf = fresh
         else:
@@ -806,19 +901,26 @@ class CTRACConfig(PolicyConfig):
 
         # ----- asymmetric Q TEMPLATE: Q(obs, privileged, action); own encoder, never the
         # actor/C-VAE's shared one. SINGLE-FRAME (Eq. 2 / Fig. 2 feed the privileged obs to the
-        # critic directly, no history-encoder box on that path) and ALWAYS env-native action
-        # width, regardless of effective_action_5d (module docstring's "5-D effective action
-        # option" section). ONE template only — SACLoss(..., num_qvalue_nets=N) expands it into
-        # N independent parameter sets internally (see the module docstring's "Asymmetric
-        # privileged twin-Q critic" section for why this file does NOT build N separate
-        # nn.Module instances itself: this torchrl version's SACLoss._set_in_keys crashes on a
-        # plain list of modules).
+        # critic directly, no history-encoder box on that path). Action width matches the
+        # ACTOR's own ``actor_adim`` (env-native 8-D by default, or the paper's literal 5-D
+        # Eq. 3 width when effective_action_5d=True) — NOT unconditionally env-native; see the
+        # module docstring's "5-D effective action option" section for why this MUST track the
+        # actor (torchrl 0.8.1's SACLoss._actor_loss/_compute_target_v2 feed the actor's freshly
+        # --rsampled action straight to this Q-network on every SAC loss code path, so a width
+        # mismatch is a hard crash, not just an inconsistency) — and for why this is also the
+        # MORE paper-faithful choice regardless (Sec. IV-A.3: "the critic employs ... Q_phi(s_t,
+        # a_t)" with the SAME a_t as Eq. 3, i.e. 5-D in the paper, not an 8-D expansion of it).
+        # ONE template only — SACLoss(..., num_qvalue_nets=N) expands it into N independent
+        # parameter sets internally (see the module docstring's "Asymmetric privileged twin-Q
+        # critic" section for why this file does NOT build N separate nn.Module instances
+        # itself: this torchrl version's SACLoss._set_in_keys crashes on a plain list of
+        # modules).
         critic_obs = actor_obs + [obs_by_name[n] for n in priv_names]
         q_enc = self._enc_mod(critic_obs, "y_q")
         qvalue_op = TensorDictSequential(
             q_enc,
             TensorDictModule(
-                _ConcatQ(q_enc.module.output_dim, env_adim, self.qvalue_mlp_opts),
+                _ConcatQ(q_enc.module.output_dim, actor_adim, self.qvalue_mlp_opts),
                 in_keys=["y_q", "action"],
                 out_keys=["state_action_value"],
             ),

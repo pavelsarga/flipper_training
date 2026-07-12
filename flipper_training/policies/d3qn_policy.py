@@ -230,17 +230,40 @@ class _IncrementalToContinuous(TensorDictModuleBase):
     A full ``TensorDictModuleBase`` (not a plain ``nn.Module`` wrapped in
     ``TensorDictModule``) because the raw-stash-or-plain-key fallback needs the
     whole tensordict, not a fixed positional set of tensors.
+
+    **Front-pair sign bug found + fixed this pass (2026-07-12 audit):** ``delta_pairs``
+    (Eq. 3's ``a_i,j = i*delta_f, j*delta_f``) is defined in the PAPER's ``theta_f1``/
+    ``theta_f2`` sign convention (Eq. 2: positive = flipper above chassis) -- Eq. 3's own
+    prose ties the action directly to that state symbol ("discrete angular increments of
+    delta_theta_f when the flipper rotates"). But this bridge writes directly into the
+    engine's RAW angular-velocity slots (``engine.py``: ``thetas_d = controls[...]``), whose
+    sign is NOT the paper's theta_f1/theta_f2 convention -- it is MARV's own mesh-geometry
+    convention (see ``observations/pan_terrain.py``'s module docstring: raw front-theta
+    increasing = flipper moves DOWN, i.e. ``theta_f1 = -raw_front``; raw rear-theta
+    increasing = UP, i.e. ``theta_f2 = +raw_rear``, already the same sign). An earlier
+    revision applied ``delta_pairs`` straight to the raw velocity slots with NO correction,
+    which is silently correct for the REAR pair (raw and paper agree) but INVERTS the FRONT
+    pair (raw and paper disagree) -- i.e. selecting "i=+1" actually drove ``theta_f1``
+    DOWN, not up, contradicting a literal reading of Eq. 3. Confirmed empirically against a
+    real ``Env``: applying the "i=+1,j=0" one-hot action for 5 sub-steps from a random reset
+    state moved ``theta_f1`` by ~-1.3 rad (strongly negative), not positive. Fixed by
+    applying ``raw_sign`` (mirroring ``pan_terrain.py``'s front=-1/rear=+1 convention
+    exactly) to ``delta_pairs`` before it is expanded onto the per-flipper velocity slots,
+    so the front and rear pair are now symmetric in what they mean relative to
+    theta_f1/theta_f2, matching how the paper itself treats them symmetrically ("The front
+    and rear flippers have three motion elements: ...").
     """
 
     def __init__(
         self,
         angle_obs_key: str,
         raw_stash_key: str,
-        delta_pairs: torch.Tensor,  # [9, 2]  (front_delta, rear_delta), Eq. 3
+        delta_pairs: torch.Tensor,  # [9, 2]  (front_delta, rear_delta), Eq. 3, PAPER (theta_f1/theta_f2) sign
         angle_idx: torch.Tensor,  # [n_flip] long, offsets of the flipper angles inside angle_obs_key
         angle_scale: torch.Tensor,  # [n_flip]  obs -> rad affine: theta = obs * scale + offset
         angle_offset: torch.Tensor,  # [n_flip]
         delta_expand: torch.Tensor,  # [n_flip, 2] one-hot (is_front, is_rear) per flipper
+        raw_sign: torch.Tensor,  # [2] (front, rear) PAPER-sign -> RAW-engine-sign correction, see class docstring
         joint_low: torch.Tensor,  # [n_flip]
         joint_high: torch.Tensor,  # [n_flip]
         track_cmd: torch.Tensor,  # [n_drive]
@@ -256,6 +279,7 @@ class _IncrementalToContinuous(TensorDictModuleBase):
         self.register_buffer("angle_scale", angle_scale)
         self.register_buffer("angle_offset", angle_offset)
         self.register_buffer("delta_expand", delta_expand)
+        self.register_buffer("raw_sign", raw_sign)
         self.register_buffer("joint_low", joint_low)
         self.register_buffer("joint_high", joint_high)
         self.register_buffer("track_cmd", track_cmd)
@@ -272,8 +296,9 @@ class _IncrementalToContinuous(TensorDictModuleBase):
         one_hot = tensordict.get("action")
         dev = one_hot.device
         idx = one_hot.argmax(dim=-1)
-        pair = self.delta_pairs.to(dev)[idx]  # [B, 2] = (front_delta, rear_delta)
-        deltas = pair @ self.delta_expand.to(dev).T  # [B, n_flip]
+        pair = self.delta_pairs.to(dev)[idx]  # [B, 2] = (front_delta, rear_delta), PAPER (theta_f1/theta_f2) sign
+        raw_pair = pair * self.raw_sign.to(dev)  # -> RAW engine sign (see class docstring's "front-pair sign bug" note)
+        deltas = raw_pair @ self.delta_expand.to(dev).T  # [B, n_flip], now RAW-engine-signed
         theta = self._current_theta(tensordict)
         # Velocity semantics (see class docstring): hold -> 0, +-delta -> a
         # constant rotation rate, zeroed when the flipper is already at the
@@ -407,6 +432,23 @@ class D3QNPolicyConfig(PolicyConfig):
             slots) of the flippers sharing the front / rear delta. Must
             partition ``range(n_flip)``. Default ``(0, 1)`` / ``(2, 3)`` =
             [FL, FR] front, [RL, RR] rear.
+        front_rear_action_sign: only used when ``incremental=True``. ``(front, rear)``
+            sign correction from Eq. 3's PAPER-frame delta (``a_i,j = i*delta_f, j*delta_f``,
+            defined against ``theta_f1``/``theta_f2``, Eq. 2's positive-up convention) to the
+            RAW engine angular-velocity slots this bridge actually writes into. MUST match
+            ``observations/pan_terrain.py``'s own front/rear raw-vs-paper sign convention
+            (module docstring's "Sign conventions" section) or the ACTION applied and the
+            STATE read back by ``PanTerrainState``/``PanReward`` disagree about which
+            direction is "positive". Default ``(-1.0, 1.0)`` is MARV's convention (raw front
+            theta increasing = flipper DOWN, so ``theta_f1 = -raw``; raw rear theta
+            increasing = UP, so ``theta_f2 = +raw``, already paper-signed) -- override for a
+            robot whose mesh geometry gives a different front/rear raw-sign relationship.
+            **Audit finding (2026-07-12):** an earlier revision applied the paper-frame delta
+            straight to the raw velocity slots with no correction, which is a no-op for the
+            rear pair (correct by accident, since MARV's rear raw sign already matches the
+            paper) but SILENTLY INVERTED the front pair (selecting "i=+1" drove ``theta_f1``
+            down, not up) -- confirmed empirically against a real ``Env`` (see
+            ``_IncrementalToContinuous``'s docstring) before being fixed.
         fig5_topology: build the LITERAL AT-D3QN Fig. 5 network (``_Fig5DuelingQ``:
             terrain-branch MLP -> fusion -> 16-dim S_t' -> dueling V/A heads, all
             LeakyReLU) instead of the generic ``EncoderCombiner`` + ``mlp_opts``
@@ -439,6 +481,7 @@ class D3QNPolicyConfig(PolicyConfig):
     flipper_angle_offset: float | list[float] | None = None
     front_pair: tuple[int, ...] = (0, 1)
     rear_pair: tuple[int, ...] = (2, 3)
+    front_rear_action_sign: tuple[float, float] = (-1.0, 1.0)
     fig5_topology: bool = False
     fig5_obs_key: str = "PanTerrainState"
     fig5_negative_slope: float = 0.01
@@ -538,6 +581,7 @@ class D3QNPolicyConfig(PolicyConfig):
             angle_scale=angle_scale,
             angle_offset=angle_offset,
             delta_expand=_pair_expand_matrix(self.front_pair, self.rear_pair, n_flip),
+            raw_sign=torch.tensor(list(self.front_rear_action_sign), dtype=torch.float32),
             joint_low=joint_low,
             joint_high=joint_high,
             track_cmd=track_cmd,

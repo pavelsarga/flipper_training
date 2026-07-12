@@ -1,3 +1,5 @@
+import dataclasses
+
 import torch
 import numpy as np
 from flipper_training.experiments.ppo.common import (
@@ -10,6 +12,22 @@ from pathlib import Path
 from flipper_training.utils.logutils import get_terminal_logger
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
+# PPOExperimentConfig is a strict dataclass (no **kwargs catch-all). Several native
+# trainers store extra, trainer-specific top-level keys in their saved config alongside
+# the PPOExperimentConfig-schema ones -- e.g. C-TRAC's gamma/target_tau/alpha_init/.../
+# n_iters (see experiments/ctrac/train.py's module docstring's "Additional (optional)
+# top-level config keys" list), plus DQN's/C-REPS's own trainer-specific keys. Loading
+# ANY such config's raw dict straight into PPOExperimentConfig(**config) crashes on the
+# first unrecognised key ("unexpected keyword argument") -- this is what made every
+# C-TRAC checkpoint UNDEPLOYABLE via this module before this fix (found while live-sim
+# testing a C-TRAC checkpoint against flipper_policy_node: crashed at construction,
+# before even reaching the policy/env). Filtering to only PPOExperimentConfig's own
+# declared fields mirrors the exact pattern experiments/ctrac/train.py (and dqn/creps)
+# already use when constructing the SAME dataclass from the SAME kind of config for
+# training, and is a strict no-op for any config whose raw dict was already
+# PPOExperimentConfig-shaped (plain PPO-trained configs are unaffected).
+_PPO_CFG_FIELDS = {f.name for f in dataclasses.fields(PPOExperimentConfig)}
+
 
 class PPOPolicyInferenceModule:
     """
@@ -20,7 +38,7 @@ class PPOPolicyInferenceModule:
         self, train_config_path: Path | str, policy_weights_path: Path | str, vecnorm_weights_path: Path | str | None = None, device: str = "cpu"
     ):
         config = OmegaConf.load(train_config_path)
-        train_config = PPOExperimentConfig(**config)
+        train_config = PPOExperimentConfig(**{k: v for k, v in config.items() if k in _PPO_CFG_FIELDS})
         train_config.device = device
         train_config.num_robots = 1  # Single robot for inference
         train_config.engine_compile_opts = None  # Disable engine compilation for inference on robot
