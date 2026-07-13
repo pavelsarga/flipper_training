@@ -7,8 +7,8 @@ Faithful-to-the-paper parts (Sec III-IV):
 
 * **Hand-coded local flipper policies pi^q with ZERO learnable parameters** (Sec III,
   Sec IV-B). Each of the ``K`` states holds a fixed flipper-angle *template*
-  (Fig. 1: neutral / ascending-front / ascending-rear / stairs-up / descending-front /
-  descending-rear / stairs-down), overlaid with a PD **body-roll stabilization** term
+  (Fig. 1: neutral / ascending-front / up-stairs / ascending-rear / descending-front /
+  down-stairs / descending-rear), overlaid with a PD **body-roll stabilization** term
   (Eq. 7, left group [1,3] gets ``-(phi*kp - phid*kd)``, right group [2,4] the opposite
   sign) and a **stagnation escape** term linear in a stagnation feature ``st in [0,1]``
   (Eq. 8); the three overlays are summed per Eq. 9. The paper's templates are target
@@ -46,8 +46,7 @@ Honest deviations from the paper (documented, deliberate):
   flattened/shuffled PPO batches used by this trainer, this one-step relabelling is
   what lets gradients reach the gate within a single stored transition.
 * The paper's per-template torque levels (Fig. 1) are not modelled (no torque
-  interface in this engine), and the stagnation feature compares the observed forward
-  speed against the constant commanded track speed instead of a path-follower target.
+  interface in this engine).
 
 VecNorm note: primitives must read *raw* observations. ``create()`` therefore returns
 a ``RenameTransform(create_copy=True)`` that stashes the raw observation under
@@ -60,6 +59,138 @@ Deployment: stateless single-tick calls work out of the box (``p`` re-initialise
 the Algorithm-1 one-hot each call). For *stateful* deployment feed
 ``td["next", "recurrent_state_p"]`` back as ``td["recurrent_state_p"]`` on the next
 tick — the same carry the generic node needs for GRU/LSTM hidden states.
+
+Alignment with the author's own code (2026-07 pass)
+====================================================
+
+The paper's text is symbolic (Eq. 6-10); the actual numeric constants and network
+shapes live only in the author's own repo, ``silverjoda/augmented_robot_trackers``
+(silverjoda = Teymur Azayev), cloned read-only at
+``/home/cnuc/upstream_refs/azayev2022``. That repo is a ROS1 stack for the same
+CTU MARV/TRADR robot family this project targets, and is treated as ground truth
+below wherever the paper text alone was ambiguous. Every constant changed in this
+pass, with its source ``file:line``:
+
+* **State count/order/names (K=7)** — ``src/envs/marv_dataset_flipper_env.py:9-15``
+  and ``src/control/marv_flipper_controller.py:33-39`` both enumerate the SAME 7
+  states in the SAME order: NEUTRAL, ASCENDING_FRONT, UP_STAIRS, ASCENDING_REAR,
+  DESCENDING_FRONT, DOWN_STAIRS, DESCENDING_REAR. ``DEFAULT_TEMPLATES`` below is
+  now keyed/ordered identically (``neutral, ascending_front, up_stairs,
+  ascending_rear, descending_front, down_stairs, descending_rear`` — previously
+  this repo used a different order/naming, ``stairs_up``/``stairs_down``).
+* **Flipper-angle templates** (Eq. 9's ``a_temp``) —
+  ``src/control/configs/marv_flipper_controller_config.yaml:23-30``
+  (``FLIPPERS_<STATE>``, order ``[front_left, front_right, rear_left, rear_right]``).
+  Transcribed verbatim into ``DEFAULT_TEMPLATES`` under the working hypothesis that
+  his raw sign convention matches this repo's documented one (front: -pi/2=up,
+  +pi/2=down; rear: +pi/2=up, -pi/2=down, per this package's own CLAUDE.md) — cross-
+  checked qualitatively against Fig. 1's per-state descriptions (e.g. NEUTRAL folds
+  both ends toward their "up" limit; ASCENDING_REAR presses the front down onto the
+  obstacle top while extending the rear down to reach it) and found consistent for
+  5 of 7 states; DESCENDING_REAR's sign is the one state where the qualitative check
+  is inconclusive (documented here rather than silently assumed). No URDF for his
+  robot was available in the cloned repo to derive the mapping analytically. His
+  ``NEUTRAL`` front value (``-2`` rad) exceeds this engine's joint limit
+  (``robots/marv.yaml`` joint_limits=[-1.57, 1.57]) — read as "commanded past the
+  mechanical hard stop to rest fully retracted," so it is clamped to ``-pi/2`` here
+  (same physical intent, different actuator limit).
+* **PD roll-stabilization gains (Eq. 7)** —
+  ``src/control/configs/marv_flipper_modulator_config.yaml:25-26``:
+  ``roll_stabilization_p=1.4``, ``roll_stabilization_d=0.0`` (old repo defaults were
+  0.5/0.1, unsourced guesses). The per-flipper sign pattern this module already used
+  (``stab_signs = [-1, +1, +1, -1]`` for ``[FL, FR, RL, RR]``) was independently
+  re-derived from ``src/control/marv_flipper_modulator.py:130-138`` and found to
+  ALREADY match exactly (his code pairs FL with RR and FR with RL, a diagonal
+  grouping — not the simple "left/right" grouping the paper prose describes in
+  Eq. 7 — this repo's sign pattern was already faithful to the *code*; only the
+  gains kp/kd were unsourced guesses, now fixed).
+* **Escape-maneuver constants (Eq. 8)** —
+  ``src/control/marv_flipper_modulator.py:143-157``. The paper text only gives a
+  worked example for ASCENDING_REAR (Eq. 8 itself: front ``-0.3*st``, rear
+  ``+0.5*st``); the ACTUAL DEPLOYED constants in his modulator code differ from the
+  paper's own worked example (front ``+0.5*st``, rear ``-0.7*st`` for
+  ASCENDING_REAR) AND, critically, escape terms exist for 5 of 7 states, not just
+  ASCENDING_REAR — this repo previously modelled only the ascending-rear case as
+  non-zero. Per the mission's own precedence rule (author's code overrides paper
+  text where they conflict — here they flatly disagree in both sign and magnitude),
+  the CODE values are used, transcribed into ``DEFAULT_ESCAPE_DELTAS`` for all 7
+  states (front-pair / rear-pair corrections, replicated across left/right exactly
+  as his code does — his ``front_flipper_correction``/``rear_flipper_correction``
+  are shared, non-differential terms, unlike the roll-stabilization overlay).
+* **SDSM transition-network architecture** —
+  ``src/policies/policies.py``: ``MiniMLP`` (``:89-101``) is
+  ``Linear(feat_dim, 64) -> LeakyReLU -> Linear(64, out_dim)`` (ONE hidden layer,
+  hidden width 64, leaky-ReLU, Xavier-normal init) and is the architecture actually
+  deployed (``"linear": False`` in
+  ``src/control/configs/marv_flipper_controller_config.yaml:10``, i.e. the
+  non-linear per-state net, not the linear fallback). ``DSM.__init__``
+  (``:216-240``) builds one such net per source state ``k``, each with
+  ``out_dim = len(state_transition_dict[k])`` — i.e. his transition graph is
+  SPARSE (each state can only reach a small, hand-specified subset of the other
+  states), not the dense/fully-connected K-to-K gate this repo previously used
+  unconditionally. `gate_mlp_opts` default in `configs/baselines/azayev.yaml` is
+  now ``num_hidden: 1, hidden_dim: 64, activation: torch.nn.LeakyReLU`` to match
+  (previously 2 hidden layers, Tanh, unsourced). The sparse topology itself —
+  ``src/envs/marv_dataset_flipper_env.py:33-39`` /
+  ``src/control/marv_flipper_controller.py:53-59`` (``state_transition_dict``,
+  identical in both files) — is reproduced as ``DEFAULT_TRANSITION_TOPOLOGY``
+  below and applied as a ``-inf``-logit mask before the gate's softmax whenever the
+  7 canonical state names are in use (``restrict_topology=True`` by default, the
+  same restricted-softmax construction his sparse per-state output layers
+  implement, just parameterized densely for implementation simplicity — the two
+  are mathematically equivalent: masking disallowed entries to zero probability
+  before renormalizing is the same distribution family as never having those output
+  units in the first place).
+* **Inference rule (Algorithm 1)** — ``src/policies/policies.py:257``
+  (``current_state = argmax(new_state_distrib)``) confirms the primitive is always
+  selected by hard argmax of the (softly-propagated) state distribution, both
+  during his training AND at inference — this module's existing ``hard_inference``
+  flag + "Action readout timing" deviation above already implement this correctly
+  (soft blend only during PPO training, for gradient flow the paper's IL loss never
+  needed since it backprops through a state-classification cross-entropy, not
+  through the zero-parameter primitive's action).
+
+What was **NOT** transferred, and why:
+
+* **Observation feature vector / per-flipper elevation bounding boxes (Eq. 10)**.
+  His ``feat_dim=9`` gate input is ``[pitch] + frontal_low_feat(4) +
+  rear_low_feat(4)`` (``src/envs/marv_dataset_flipper_env.py:98``,
+  ``src/control/marv_flipper_controller.py:199``), where each 4-vector is
+  ``(avg_height, min_bnd, max_bnd, point_count_intensity)`` computed by cropping a
+  local traversability point cloud to a box and taking robust height statistics
+  (``src/perception/marv_feature_processor.py:230-256``,
+  ``get_pc_feat``/``get_bnd_pts``). The box extents themselves
+  (``src/perception/configs/marv_feature_processor_config.yaml:10-16``, all in the
+  zero-roll-pitch base-link frame, ``[x_lo, x_hi, y_lo, y_hi, z_lo, z_hi]`` metres):
+  ``front_low_feat_bnd=[0.35,0.7,-0.35,0.35,-0.3,0.4]``,
+  ``front_mid_feat_bnd=[0.35,0.7,-0.35,0.35,0.4,0.6]``,
+  ``rear_low_feat_bnd=[-0.4,-0.0,-0.35,0.35,-0.2,0.3]``, plus 4 narrower
+  per-flipper boxes (``fl/fr/rl/rr_flipper_feat_bnd``, e.g.
+  ``[0.35,0.7,0.05,0.35,-0.3,0.4]``). This project's ``StateMachinePolicyConfig``
+  gate instead reads this repo's shared ``y_shared`` encoder output (here, an MLP
+  over ``LocalStateVector`` — roll/pitch/velocity/flipper-angles/goal-vector, NO
+  local-terrain channel) because there is no equivalent Observation class in
+  ``flipper_training/observations/`` that crops a local heightmap patch into these
+  7 boxes and reduces it to (mean/min/max-height, coverage) statistics per box —
+  building one is a real, non-trivial new Observation type (new encoder pipeline,
+  new heightmap-sampling code, its own tests) rather than a constant swap, and is
+  out of scope for this alignment pass. The exact extents above are recorded here
+  so a future pass can build ``ElevationBoxFeatures`` (or similar) against this
+  repo's heightmap grid and wire it as ``obs_key`` without re-deriving Eq. 10 from
+  scratch.
+* **Stagnation-feature construction** (the ``st`` fed into Eq. 8, as opposed to
+  Eq. 8's linear escape mapping itself, which IS transferred above). His ``st`` is
+  a persistent integrator, not an instantaneous ratio:
+  ``src/perception/marv_feature_processor.py:552-560`` — increments by 0.10/tick
+  while ``avg_lin_vel < 0.04 m/s`` AND the commanded track speed exceeds
+  ``0.15 m/s`` (i.e., commanded to move but not actually moving), decays by
+  0.05/tick otherwise, resets to 0 on every state change, and is clipped to
+  ``[0, 1]``. This module's ``st = clamp(1 - vx/track_velocity, 0, 1)`` is a
+  stateless proxy requiring no extra recurrent carry. Replicating his integrator
+  faithfully would need a new persistent tensordict key (analogous to
+  ``recurrent_state_p``) plus the two velocity-average queues his code keeps —
+  a real architectural addition, not a constant change, so it is documented here
+  as an honest gap rather than silently approximated further.
 """
 
 from __future__ import annotations
@@ -79,30 +210,60 @@ from flipper_training.environment.env import Env
 from flipper_training.utils.logutils import get_terminal_logger
 from . import PolicyConfig, EncoderCombiner, MLP
 
-__all__ = ["StateMachinePolicyConfig", "DEFAULT_TEMPLATES"]
+__all__ = ["StateMachinePolicyConfig", "DEFAULT_TEMPLATES", "DEFAULT_ESCAPE_DELTAS", "DEFAULT_TRANSITION_TOPOLOGY"]
 
 RECURRENT_KEY = "recurrent_state_p"
 RAW_OBS_STASH_KEY = "hfc_raw_obs"
 
-# Default flipper-angle templates distilled from Fig. 1 / Sec. I of the paper, in this
-# repo's angle convention (see CLAUDE.md): order [front-left, front-right, rear-left,
-# rear-right]; angle 0 = horizontal; FRONT: -pi/2 = fully up, +pi/2 = fully down;
-# REAR: +pi/2 = fully up, -pi/2 = fully down. State 0 (neutral) is the Algorithm-1
-# initial state. Values are heuristic per-robot tuning, overridable via ``templates``.
+# Flipper-angle templates (Eq. 9's a_temp), transcribed verbatim from the author's own
+# deployed config (src/control/configs/marv_flipper_controller_config.yaml:23-30 in
+# silverjoda/augmented_robot_trackers, cloned at /home/cnuc/upstream_refs/azayev2022) —
+# see the module docstring's "Alignment with the author's own code" section for the
+# sign-convention cross-check and the NEUTRAL front joint-limit clamp. Order
+# [front-left, front-right, rear-left, rear-right]; angle 0 = horizontal; this repo's
+# convention (CLAUDE.md): FRONT -pi/2=fully up/+pi/2=fully down, REAR +pi/2=fully
+# up/-pi/2=fully down. Key order matches his state_list exactly (state 0, "neutral",
+# is the Algorithm-1 initial state).
 DEFAULT_TEMPLATES: dict[str, tuple[float, float, float, float]] = {
-    "neutral": (-0.4, -0.4, 0.4, 0.4),  # all flippers slightly raised (travel)
-    "ascending_front": (-1.0, -1.0, -0.2, -0.2),  # front raised onto obstacle, rear pushing
-    "ascending_rear": (0.2, 0.2, -1.0, -1.0),  # front pressing the top, rear extended down
-    "stairs_up": (-0.6, -0.6, -0.3, -0.3),  # long support polygon along ascending slope
-    "descending_front": (0.9, 0.9, 0.3, 0.3),  # front reaching down over the edge
-    "descending_rear": (-0.2, -0.2, -0.8, -0.8),  # rear down holding the upper edge
-    "stairs_down": (0.6, 0.6, -0.4, -0.4),  # long support polygon along descending slope
+    "neutral": (-1.57, -1.57, 1.5, 1.5),  # his [-2,-2,1.5,1.5]; front clamped to this engine's joint_limits
+    "ascending_front": (-0.4, -0.4, 0.0, 0.0),
+    "up_stairs": (0.1, 0.1, -0.1, -0.1),
+    "ascending_rear": (0.1, 0.1, -0.6, -0.6),
+    "descending_front": (0.35, 0.35, -0.7, -0.7),
+    "down_stairs": (0.0, 0.0, 0.05, 0.05),
+    "descending_rear": (-0.3, -0.3, 0.4, 0.4),
 }
 
-# Escape-maneuver overlay per unit stagnation (Eq. 8 magnitudes, repo sign convention):
-# defined in the paper for the ascending-rear state only — lift front (0.3), lower rear
-# (0.5); front lift = negative angle delta, rear lower = negative angle delta.
-_DEFAULT_ESCAPE_AR = (-0.3, -0.3, -0.5, -0.5)
+# Escape-maneuver overlay per unit stagnation (Eq. 8), transcribed verbatim from
+# src/control/marv_flipper_modulator.py:143-157 (his ACTUAL deployed constants, which
+# differ from the paper text's own ASCENDING_REAR worked example — see docstring).
+# front_flipper_correction is replicated across [FL, FR], rear_flipper_correction
+# across [RL, RR], exactly as his code does (shared, non-differential terms, unlike
+# the roll-stabilization overlay). States not listed here (neutral, descending_rear)
+# have zero escape overlay in his code too.
+DEFAULT_ESCAPE_DELTAS: dict[str, tuple[float, float, float, float]] = {
+    "ascending_front": (-0.2, -0.2, 0.2, 0.2),
+    "up_stairs": (0.10, 0.10, -0.20, -0.20),
+    "ascending_rear": (0.5, 0.5, -0.7, -0.7),
+    "descending_front": (0.4, 0.4, -0.5, -0.5),
+    "down_stairs": (0.10, 0.10, -0.20, -0.20),
+}
+
+# Sparse state-transition topology (his DSM's actual per-state output arity), from
+# src/envs/marv_dataset_flipper_env.py:33-39 / src/control/marv_flipper_controller.py:53-59
+# (state_transition_dict, identical in both). Each entry lists the states reachable
+# FROM the key state (always includes itself, the "stay" self-loop). Applied as a
+# -inf-logit mask on the gate's softmax (see _SoftStateMachineGate) when the 7
+# canonical state names are in use and restrict_topology=True (default).
+DEFAULT_TRANSITION_TOPOLOGY: dict[str, list[str]] = {
+    "neutral": ["neutral", "ascending_front", "descending_front"],
+    "ascending_front": ["ascending_front", "neutral", "up_stairs", "ascending_rear"],
+    "up_stairs": ["up_stairs", "ascending_rear"],
+    "ascending_rear": ["ascending_rear", "neutral"],
+    "descending_front": ["descending_front", "neutral", "down_stairs", "descending_rear"],
+    "down_stairs": ["down_stairs", "descending_rear"],
+    "descending_rear": ["descending_rear", "neutral"],
+}
 
 
 class _HandCodedPrimitives(nn.Module):
@@ -169,9 +330,12 @@ class _HandCodedPrimitives(nn.Module):
         self.register_buffer("theta_offset", flipper_angle_offset.float())
         self.register_buffer("theta_low", flipper_angle_offset.float())
         self.register_buffer("theta_high", flipper_angle_offset.float() + flipper_angle_scale.float())
-        # Eq. 7 sign pattern in repo convention: per-side push-down = (-stab, +stab) for
-        # (left, right) groups; angle delta per unit push-down = +1 front / -1 rear.
-        # [FL, FR, RL, RR] -> side (-1,+1,-1,+1) * down-direction (+1,+1,-1,-1).
+        # Eq. 7 sign pattern: independently re-derived from the author's ACTUAL code
+        # (src/control/marv_flipper_modulator.py:130-138 in augmented_robot_trackers),
+        # which pairs (FL, RR) with one sign and (FR, RL) with the opposite -- a
+        # diagonal grouping, NOT the simple "left group [FL,RL] / right group [FR,RR]"
+        # the paper's prose (Eq. 7) describes. This tensor already matched his code
+        # exactly before this alignment pass (only roll_kp/roll_kd were unsourced).
         self.register_buffer("stab_signs", torch.tensor([-1.0, 1.0, 1.0, -1.0]))
         assert sum(p.numel() for p in self.parameters()) == 0, "primitive local policies must have no learnable parameters (Sec III)"
 
@@ -208,16 +372,28 @@ class _SoftStateMachineGate(nn.Module):
     K per-state transition networks ``mu_i`` (separate parameters phi_i, as in the
     paper) map the encoded observation to a distribution over next states;
     ``forward`` returns ``p_next = sum_i p[..., i] * softmax(mu_i(enc) / T)``.
+
+    ``transition_mask`` (optional ``[K, K]`` bool, row i = states reachable from i)
+    reproduces the author's SPARSE per-state output arity (his ``DSM`` gives each
+    source state's network only as many outputs as it has allowed transitions,
+    ``src/policies/policies.py:216-240`` in ``augmented_robot_trackers`` — see the
+    module docstring). Masking disallowed entries to ``-inf`` before the softmax is
+    the same distribution family as never having those output units in the first
+    place, just parameterized densely for implementation simplicity. ``None``
+    (default when the topology can't be resolved) keeps the fully-connected gate.
     """
 
-    def __init__(self, enc_dim: int, n_states: int, gate_mlp_opts: dict, temperature: float):
+    def __init__(self, enc_dim: int, n_states: int, gate_mlp_opts: dict, temperature: float, transition_mask: torch.Tensor | None = None):
         super().__init__()
         self.n_states = n_states
         self.temperature = temperature
         self.transition_mlps = nn.ModuleList(MLP(in_dim=enc_dim, out_dim=n_states, **gate_mlp_opts) for _ in range(n_states))
+        self.register_buffer("transition_mask", transition_mask.bool() if transition_mask is not None else None)
 
     def forward(self, enc: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         logits = torch.stack([m(enc) for m in self.transition_mlps], dim=-2)  # [..., K (cond. state i), K (next state)]
+        if self.transition_mask is not None:
+            logits = logits.masked_fill(~self.transition_mask, float("-inf"))
         trans = torch.softmax(logits / self.temperature, dim=-1)
         return (p.unsqueeze(-1) * trans).sum(dim=-2)  # Eq. 6: [..., K]
 
@@ -328,7 +504,18 @@ class StateMachinePolicyConfig(PolicyConfig):
             convention [FL, FR, RL, RR]; front -pi/2=up, rear +pi/2=up). Overrides
             ``n_states``.
         escape_deltas: optional [K][4] escape-maneuver angle overlay per unit
-            stagnation (Eq. 8). Default: zeros except the ascending-rear default state.
+            stagnation (Eq. 8). Default: ``DEFAULT_ESCAPE_DELTAS`` (author's code
+            values for 5 of 7 states; zero for neutral/descending_rear, matching his).
+        restrict_topology: mask the gate's softmax to the author's sparse
+            state-transition graph (``DEFAULT_TRANSITION_TOPOLOGY``, his
+            ``state_transition_dict``) whenever the 7 canonical state names are in
+            use and ``transition_topology`` is not given explicitly. ``False``
+            restores the fully-connected gate this module used before this
+            alignment pass. Falls back to fully-connected (with a warning) if the
+            state names don't match the canonical set and no explicit
+            ``transition_topology`` is given.
+        transition_topology: optional explicit ``{state_name: [reachable states]}``
+            adjacency (overrides the ``DEFAULT_TRANSITION_TOPOLOGY`` lookup).
         temperature: gate softmax temperature.
         hard_inference: argmax-state primitive at eval time (Algorithm 1). Training
             mode always soft-blends so gradients flow.
@@ -351,6 +538,9 @@ class StateMachinePolicyConfig(PolicyConfig):
             (LocalStateVector: index 2; scale defaults to the env's ``max_dist`` when
             available, else 1.0). None disables escape maneuvers.
         roll_kp / roll_kd: Eq. 7 PD gains (rad target offset per rad roll / rad/s).
+            Defaults 1.4/0.0 are the author's own deployed values
+            (``marv_flipper_modulator_config.yaml``; his D-term is effectively
+            disabled in the shipped config).
         flipper_kp: P-gain converting target-angle error to velocity command (1/s).
         track_velocity: constant forward track command (m/s; the paper's HFC controls
             flippers only).
@@ -368,6 +558,8 @@ class StateMachinePolicyConfig(PolicyConfig):
     n_states: int = 7
     templates: list[list[float]] | None = None
     escape_deltas: list[list[float]] | None = None
+    restrict_topology: bool = True
+    transition_topology: dict[str, list[str]] | None = None
     temperature: float = 1.0
     hard_inference: bool = True
     action_std: float = 0.3
@@ -382,8 +574,8 @@ class StateMachinePolicyConfig(PolicyConfig):
     roll_rate_scale: float = math.pi
     vx_idx: int | None = 2
     vx_scale: float | None = None
-    roll_kp: float = 0.5
-    roll_kd: float = 0.1
+    roll_kp: float = 1.4
+    roll_kd: float = 0.0
     flipper_kp: float = 3.0
     track_velocity: float = 0.4
     track_dim_values: list[float] | None = None
@@ -408,9 +600,38 @@ class StateMachinePolicyConfig(PolicyConfig):
                 raise ValueError(f"escape_deltas shape {tuple(escape.shape)} must match templates shape {tuple(templates.shape)}")
         else:
             escape = torch.zeros_like(templates)
-            if "ascending_rear" in names:  # Eq. 8 is defined for the ascending-rear state
-                escape[names.index("ascending_rear")] = torch.tensor(_DEFAULT_ESCAPE_AR)
+            for i, name in enumerate(names):
+                if name in DEFAULT_ESCAPE_DELTAS:  # Eq. 8, author's code values (see docstring)
+                    escape[i] = torch.tensor(DEFAULT_ESCAPE_DELTAS[name])
         return templates, escape, names[:k]
+
+    def _build_transition_mask(self, state_names: list[str]) -> torch.Tensor | None:
+        """Sparse-topology mask for the gate's softmax (author's state_transition_dict).
+
+        Returns ``None`` (fully-connected gate, this module's pre-alignment behavior)
+        when disabled, or when the state names don't match a resolvable topology.
+        """
+        if not self.restrict_topology:
+            return None
+        topology = self.transition_topology
+        if topology is None:
+            if set(state_names) == set(DEFAULT_TRANSITION_TOPOLOGY):
+                topology = DEFAULT_TRANSITION_TOPOLOGY
+            else:
+                self.logger.warning(
+                    f"restrict_topology=True but state names {state_names} do not match the author's "
+                    f"canonical 7-state set {list(DEFAULT_TRANSITION_TOPOLOGY)} and no explicit "
+                    "transition_topology was given -- falling back to a fully-connected gate."
+                )
+                return None
+        n = len(state_names)
+        mask = torch.zeros(n, n, dtype=torch.bool)
+        for i, name in enumerate(state_names):
+            allowed = topology.get(name, state_names)  # unresolved state name -> fully-connected row
+            for j, other in enumerate(state_names):
+                if other in allowed:
+                    mask[i, j] = True
+        return mask
 
     def _resolve_angle_affine(self, env: Env) -> tuple[torch.Tensor, torch.Tensor]:
         """obs -> radians affine for the flipper angles: theta = obs * scale + offset."""
@@ -475,7 +696,8 @@ class StateMachinePolicyConfig(PolicyConfig):
             track_velocity=self.track_velocity,
             track_dim_values=self.track_dim_values,
         )
-        gate = _SoftStateMachineGate(encoder.output_dim, n_states, self.gate_mlp_opts, self.temperature)
+        transition_mask = self._build_transition_mask(state_names)
+        gate = _SoftStateMachineGate(encoder.output_dim, n_states, self.gate_mlp_opts, self.temperature, transition_mask=transition_mask)
         hfc_module = _HFCActorModule(
             gate=gate,
             primitives=primitives,
@@ -537,6 +759,7 @@ class StateMachinePolicyConfig(PolicyConfig):
         self.logger.info(
             f"Azayev HFC (RL adaptation): K={n_states} hand-coded primitives {state_names} "
             f"({n_primitive} learnable params — must be 0), SDSM transition gate {n_gate:,} params, "
+            f"topology={'sparse (author DSM)' if transition_mask is not None else 'fully-connected'}, "
             f"encoder {n_encoder:,}, value head {n_value:,}. temp={self.temperature}, "
             f"hard_inference={self.hard_inference} (Alg. 1 argmax at eval). Train with ClipPPOLoss."
         )

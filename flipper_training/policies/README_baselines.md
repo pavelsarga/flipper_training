@@ -33,8 +33,8 @@ concurrently-running agent at the time this table was last verified — see
 
 | Baseline (paper) | Policy module · class | Trainer entry point | Config path | Status |
 |---|---|---|---|---|
-| Azayev & Zimmermann, RA-L 2022 (soft state-machine / HFC) | `state_machine_policy.StateMachinePolicyConfig` | native `flipper_training/experiments/ppo/train.py` (`ClipPPOLoss`) | `configs/baselines/azayev.yaml` | **full** — loads + trains + evals end-to-end, re-verified with a fresh `--local` run on 2026-07-10 (which also found+fixed a real `device: cuda` → `cpu` bug — see the config's own "RE-VERIFIED 2026-07" header note and "Status notes" below) |
-| Mitriakov et al., IEEE RA Mag. 2021 (staircase negotiation) | `mlp_policy.MLPPolicyConfig` (swap to `gru_policy.GRUPolicyConfig` for the recurrent variant) | native `flipper_training/experiments/ppo/train.py` (`ClipPPOLoss`) | `configs/baselines/mitriakov.yaml` | **adaptation** — see the file's header comment for the exact per-term mapping to the paper's Eq. 1-6 (cross-checked against the actual Mitriakov_2021.pdf text on 2026-07-10, not just re-read from this file); loads + trains + evals end-to-end, re-verified 2026-07-10 (same `device` fix as azayev.yaml) |
+| Azayev & Zimmermann, RA-L 2022 (soft state-machine / HFC) | `state_machine_policy.StateMachinePolicyConfig` | native `flipper_training/experiments/ppo/train.py` (`ClipPPOLoss`) | `configs/baselines/azayev.yaml` | **full** — loads + trains + evals end-to-end, re-verified with a fresh `--local` run on 2026-07-10 (which also found+fixed a real `device: cuda` → `cpu` bug — see the config's own "RE-VERIFIED 2026-07" header note and "Status notes" below). **2026-07-13**: architecture, primitives, and constants aligned with the author's own code (`silverjoda/augmented_robot_trackers`, cloned at `/home/cnuc/upstream_refs/azayev2022`; file:line refs in the module docstring's "Alignment with the author's own code" section and in "Status notes" below); training remains PPO — the paper AND the author's own code train the gate by supervised imitation on human demonstrations, which don't exist in this repo, a documented decision, not an oversight. |
+| Mitriakov et al., IEEE RA Mag. 2021 / IEEE RA Mag. 2022 (staircase negotiation + open-source framework) | `mlp_policy.MLPPolicyConfig` (swap to `gru_policy.GRUPolicyConfig` for the recurrent variant) + `rl_rewards/mitriakov_reward.MitriakovStaircaseReward` | native `flipper_training/experiments/ppo/train.py` (`ClipPPOLoss`) | `configs/baselines/mitriakov.yaml` | **code-verified mapping against gwaxG/robot_ws (authors' framework)** — 2026-07-13 pass cloned and read the authors' own released code (`/home/cnuc/upstream_refs/mitriakov2022_robot_ws`: `gym-training/`, `monitor/`, `safety/`, `simulation/`, `backend/`, `plugins/`), not just the papers, and found the real reward/observation logic lives server-side in ROS nodes the gym env only RPCs into (`monitor_app.py`/`guidance.py`/`safety.py`), a genuine per-code-line reward derivation the papers alone gloss over — see the config's header comment for the full file:line mapping table and `rl_rewards/mitriakov_reward.py`'s module docstring for the reward transcription + itemized remaining-gap list; loads + trains + evals end-to-end, re-verified with fresh smoke runs this pass (see "Status notes" below) |
 | AT-D3QN, Pan et al. 2023 | `d3qn_policy.D3QNPolicyConfig` (`incremental=True` + `fig5_topology=True` for the paper's action set + network) + `observations/pan_terrain.PanTerrainState` + `rl_rewards/pan_reward.PanReward` | native `flipper_training/experiments/dqn/train.py` (Double DQN) | `configs/baselines/at_d3qn_full.yaml` | **full** — INDEPENDENTLY RE-VERIFIED 2026-07-10 (a prior table revision had this as self-reported only). Re-derived the sign/frame conventions from scratch (matched the original claims); found+fixed a real bug in `pan_reward.py`'s candidate-angle geometry (Fig. 4's angle was in the wrong reference frame — see "Status notes" below); fixed `device: cuda` → `cpu` (this host's sm_61 eGPU crashes on the flipper_venv's PyTorch build, confirmed by actually running it — same root cause as azayev/mitriakov); fixed a wrong `cwd` in the config's own header comment; re-ran the end-to-end smoke test after each fix. **Re-re-verified 2026-07-12** (fresh, independent pass — Table 2/Eq. 1-10/Fig. 5 re-derived directly from the PDFs incl. reading Figs. 3/4/5 as page images, not re-trusting the prior pass's text): found+fixed a real bug in `d3qn_policy.py`'s incremental action bridge — the front-pair delta was applied straight to the raw engine velocity with no paper-vs-raw sign correction, silently INVERTING the front flipper's response to `i=+1`/`i=-1` (confirmed empirically: before the fix, selecting `i=+1` measurably moved `theta_f1` *down*; the rear pair was unaffected, since MARV's raw/paper sign happens to already agree there) — see `BASELINE_AUDIT.md`'s "ROUND 4 continued" section for the full empirical before/after. Fresh end-to-end smoke run after the fix: exit 0, finite/reasonable loss. |
 | ICM-D3QN, Pan et al. 2023 | AT-D3QN's config/network + `icm.ICM` (`use_icm: true`, `icm_opts.separate_encoder: true` for the paper's own Fig. 7 raw-state encoder) | native `flipper_training/experiments/dqn/train.py` | `configs/baselines/icm_d3qn_full.yaml` | **full** — INDEPENDENTLY RE-VERIFIED 2026-07-10, same pass and shared fixes as AT-D3QN above (`pan_reward.py`/`device`/header-comment); ICM's own Fig. 7 encoder dimension math (18/19/20-wide layers) was independently recomputed against the paper's figure and matches what's built. **Re-re-verified 2026-07-12** alongside AT-D3QN above (shares `d3qn_policy.py`'s incremental bridge, so the same front-pair sign bug affected this config too — same fix); Fig. 7's `18->32->64->10` / `19->32->10` / `20->32->9` layer widths independently re-confirmed by reading the actual figure image (not text alone) and by reading `MLP`'s `num_hidden` semantics in `policies/__init__.py` directly rather than assuming them. Fresh end-to-end smoke run after the fix: exit 0, finite loss, intrinsic reward (`icm_r`) positive and non-degenerate across all iterations. |
 | Pecka et al., IROS 2016 (safety-constrained flipper control) | `pecka_policy.PeckaLinearPolicyConfig` + `observations/robot_state_with_terrain_lookahead.LocalStateVectorWithTerrainHeightAhead` | native `flipper_training/experiments/creps/train.py` (context-free Constrained REPS, gradient-free — no TorchRL loss) | `configs/baselines/pecka_full.yaml` | **full** — independently re-verified 2026-07-10 (separate pass from the one that built it, see "Status notes"): fresh `--local` runs confirm the full 6-parameter `phi(s)=[pitch,height_ahead,1]` engages (`phi(s) dim=3 ... omega dim=6` in the startup log, not the 4-param fallback), the 4-param fallback itself works both when deliberately requested and when misconfigured (out-of-range `extra_feature_idx` logs a warning and falls back rather than crashing), and both Sec III safety clauses are independently load-bearing (forcing `max_tilt`/`max_impact_accel` low alone each drives `mean_safety`→0.0/`certified_safe=False`; both relaxed → `mean_safety=1.0`). `device: cpu` (already fixed from `cuda:0` — same sm_61 issue as azayev/mitriakov below). Re-re-verified 2026-07-12 (third, independent pass): fresh end-to-end runs today reproduce all of the above unchanged (see "Status notes") plus a documented, worked-around `/tmp` debug-plot permission gotcha in the shared `heightmaps/pallets.py` (environment-level, not a Pecka defect) |
@@ -236,7 +236,80 @@ schema and verified to load, train a few iterations, and evaluate end-to-end aga
 `experiments/ppo/train.py` (previously it was written against the unrelated FTR-compat
 config schema — a different bug from the `policy_opts.state_mlp_opts` leftover once
 flagged here, though that leftover field, from an older learned-action-head design that
-predates `StateMachinePolicyConfig`, is also gone now). D3QN deploy-compliant
+predates `StateMachinePolicyConfig`, is also gone now).
+
+**2026-07-13, author's-code alignment pass**: this repo's Azayev baseline previously
+guessed most of its numeric constants and some of its architecture (the paper's Eq. 6-10
+are symbolic, no numbers). This pass cloned the author's own ROS1 stack, `silverjoda/
+augmented_robot_trackers` (silverjoda = Teymur Azayev), read-only at
+`/home/cnuc/upstream_refs/azayev2022` (same CTU MARV/TRADR robot family as this project —
+confirmed by its `src/utilities/marv_sim_translator.py`), and replaced every constant that
+transfers with his actual deployed values, citing `file:line` for each (also in the module
+docstring's own "Alignment with the author's own code" section, which is the canonical
+source — this paragraph summarizes it). Old value -> new value, all in
+`state_machine_policy.py` unless noted:
+* **State count/order/names (K=7)**: unchanged at K=7, but reordered/renamed from this
+  repo's own `neutral, ascending_front, ascending_rear, stairs_up, descending_front,
+  descending_rear, stairs_down` to the author's exact
+  `neutral, ascending_front, up_stairs, ascending_rear, descending_front, down_stairs,
+  descending_rear` (`marv_dataset_flipper_env.py:9-15` / `marv_flipper_controller.py:33-39`).
+* **Flipper-angle templates** (`DEFAULT_TEMPLATES`, `[FL,FR,RL,RR]` rad): all 7 replaced
+  with `marv_flipper_controller_config.yaml:23-30`'s verbatim values, e.g. `neutral`
+  `(-0.4,-0.4,0.4,0.4)` -> `(-1.57,-1.57,1.5,1.5)` (his `[-2,-2,1.5,1.5]`, front clamped to
+  this engine's `[-1.57,1.57]` joint limit), `descending_front` `(0.9,0.9,0.3,0.3)` ->
+  `(0.35,0.35,-0.7,-0.7)`, `descending_rear` `(-0.2,-0.2,-0.8,-0.8)` -> `(-0.3,-0.3,0.4,0.4)`
+  — see the module docstring for the full table and the documented sign-convention
+  assumption (qualitatively cross-checked against Fig. 1 for 5/7 states; DESCENDING_REAR's
+  sign is flagged as unresolved without his URDF).
+* **PD roll-stabilization gains (Eq. 7)**: `roll_kp` 0.5 -> 1.4, `roll_kd` 0.1 -> 0.0
+  (`marv_flipper_modulator_config.yaml:25-26`, unsourced guesses before). The per-flipper
+  sign pattern (`stab_signs=[-1,+1,+1,-1]`) needed NO change — independently re-derived
+  from `marv_flipper_modulator.py:130-138` and found to already match his code's actual
+  (diagonal FL/RR-vs-FR/RL) grouping, not the paper prose's simpler left/right framing.
+* **Escape-maneuver constants (Eq. 8)**: previously only `ascending_rear` had a non-zero
+  escape overlay, an unsourced guess `(-0.3,-0.3,-0.5,-0.5)`. His actual deployed code
+  (`marv_flipper_modulator.py:143-157`) has escape terms for 5 of 7 states, with different
+  numbers than even the paper's own worked Eq. 8 example — `ascending_rear` is now
+  `(0.5,0.5,-0.7,-0.7)` (his code; the paper text itself says `(-0.3,-0.3,0.5,0.5)`, which
+  disagree in both sign and magnitude — code wins per this task's own precedence rule),
+  plus newly-added non-zero overlays for `ascending_front`, `up_stairs`,
+  `descending_front`, `down_stairs` (`DEFAULT_ESCAPE_DELTAS`).
+* **SDSM transition-gate architecture**: `configs/baselines/azayev.yaml`'s
+  `gate_mlp_opts` changed from `{num_hidden: 2, hidden_dim: 64, layernorm: false}` (Tanh
+  default activation, unsourced) to `{num_hidden: 1, hidden_dim: 64, layernorm: false,
+  activation: torch.nn.LeakyReLU}`, matching his `MiniMLP`
+  (`src/policies/policies.py:89-101`) exactly (one hidden layer, width 64, leaky-ReLU).
+  Additionally, his `DSM` (`:216-240`) gives each state a SPARSE per-state output arity
+  (his `state_transition_dict`) rather than a dense K-to-K gate; this is now reproduced as
+  a `-inf`-logit softmax mask (`DEFAULT_TRANSITION_TOPOLOGY`, new `restrict_topology`
+  config flag, default `True`) rather than changing each per-state net's output width, for
+  implementation simplicity — the two are the same distribution family.
+* **NOT transferred** (documented gaps, not oversights): (1) the Eq. 10 observation
+  feature vector — his gate reads 9 numbers built from cropping a local point cloud into
+  7 named boxes and taking robust height statistics
+  (`marv_feature_processor.py:230-256`/`marv_feature_processor_config.yaml:10-16`, exact
+  box extents recorded in the module docstring); this repo's gate instead reads the
+  shared `LocalStateVector` encoder output, because no Observation class here crops a
+  local heightmap patch into per-flipper boxes the way his ROS point-cloud pipeline
+  does — building one is a new Observation type, out of scope for a constants-alignment
+  pass. (2) the stagnation-feature (`st`) construction itself is a persistent hysteresis
+  integrator in his code (`marv_feature_processor.py:552-560`, +0.10/-0.05 per tick,
+  thresholds at 0.04/0.15 m/s, reset on state change) vs. this repo's stateless
+  `1 - vx/track_velocity` ratio — replicating his integrator would need a new persistent
+  recurrent-carry key, a real architectural addition rather than a constant swap.
+
+Verified after the changes: `py_compile` on `state_machine_policy.py`; a construct-test
+against a real `Env` (`configs/baselines/azayev.yaml`, `num_robots=4`, `device=cpu`)
+confirming the startup log now reads `K=7 hand-coded primitives ['neutral',
+'ascending_front', 'up_stairs', 'ascending_rear', 'descending_front', 'down_stairs',
+'descending_rear'] (0 learnable params...) topology=sparse (author DSM)`; a dedicated
+deploy-contract test (bare `wrapper.get_policy_operator()(td)` call, no trainer) that the
+output `action` has the right shape (`[4, 8]`), is finite, in-bounds, and that the
+recurrent `p` carry still sums to 1 and produces a clean argmax at eval; and a fresh
+end-to-end smoke train via the README's own documented tiny-override CLI recipe against
+`configs/baselines/azayev.yaml` (exit 0, finite eval reward, no NaNs/crashes).
+
+D3QN deploy-compliant
 (continuous action), trains with real Double DQN (`DQNLoss(double_dqn=True)` — the trainer previously omitted
 the flag and silently ran vanilla DQN + target net), and now offers the paper's incremental 9-action
 paired-delta scheme alongside the original absolute per-flipper-bin table (`incremental=True`, see
@@ -917,3 +990,93 @@ already folded into the "UPDATE (2026-07-12...)" note above.
   independent check above reproduced the prior passes' findings exactly rather than
   surfacing anything to fix. This paragraph is itself the "fix, or confirm none needed"
   the task asked for.
+
+**2026-07-13 pass (Mitriakov: adaptation -> CODE-VERIFIED, separate agent instance, scope:
+Mitriakov only).** Every prior pass above cross-checked `mitriakov.yaml`'s header against
+`Mitriakov_2021.pdf`'s Eq. 1-6 PROSE — none had opened the authors' own released code. This
+pass cloned it (`/home/cnuc/upstream_refs/mitriakov2022_robot_ws`, gwaxG/robot_ws) and
+`/home/cnuc/upstream_refs/mitriakov2022_robot_simu` (UI, not otherwise touched) and read it
+directly — `gym-training/`, `monitor/`, `safety/`, `simulation/scripts/env_generation/`,
+`backend/scripts/learning_scripts/`, `plugins/flipper_control/`,
+`nifti_robot_description/urdf/`. Findings that change what the config header says vs. every
+prior (paper-only) pass above:
+* **The reward/observation logic does not live in `gym-training/` at all.**
+  `TrainingEnv.step()` (training_env.py:322-329) is a thin ROS-service RPC client; the real
+  bookkeeping is server-side in the `monitor` node (`monitor_app.py`, `guidance.py`) and a
+  separate `safety` node (`safety.py`). No prior pass's "re-read the paper" methodology could
+  have surfaced this — it required following the ROS service graph.
+* **Observation is NOT literally the paper's Eq. 2 "step-edge (x,y)" vector** — the shipped
+  code's `get_transformed_state()` (training_env.py:203-237) builds robot-config fields +
+  MEAN-DEPTH beam features (`perception/internal/beam_features/core.go`) + pitch (appended
+  UNCONDITIONALLY, not "deliberately excluded" as every prior pass's paper-reading concluded —
+  only roll is conditional). This is a genuine correction to every prior pass's Eq. 2 reading,
+  not just a rephrasing.
+* **Staircase generation parameters, exact**: `simulation/scripts/env_generation/
+  representation.py::StairFloor.dimensions` gives n in [1,7], tread length in [0.35,0.52]m,
+  riser height in [0.12,0.22]m (`sample_uniform`) plus a separate Gaussian-curriculum sampler
+  (`sample_gaussian`) and a fixed hardest-corner `"eval"` mode — no prior pass had these
+  concrete numbers; `mitriakov.yaml`'s previous `min_step_height=0.15,max_step_height=0.4,
+  min_steps=3,max_steps=8` (borrowed from an unrelated proven FTR config, per that config's own
+  honest header) is now replaced with the code's real `[0.12,0.22]`/`[1,7]` (floored to `[2,7]`
+  — see the config's own comment for the concrete `StairCrossing`-crash this floor fixes,
+  found by actually running a multi-reset smoke test, not by reading code alone).
+* **Algorithm/hyperparameters, exact**: `backend/scripts/learning_scripts/policies.py::
+  Learner.__init__` builds `PPO(policy, env, verbose=1, tensorboard_log=...)` with ZERO
+  hyperparameter overrides (pure SB3 defaults) — and the shipped JSON configs'
+  `ppo_cliprange`/`ppo_ent_coef` fields are dead code, never read by the PPO branch (only
+  SAC's fields are wired in). More importantly: the framework paper (Mitriakov_2022.pdf Sec.
+  4.4) states their own staircase experiments actually trained SAC, not PPO ("We employ SAC
+  mostly with its original hyperparameters..."), confirmed by both shipped JSON configs
+  defaulting `"alg": "SAC"`. No prior pass surfaced either fact (both require reading the
+  actual training-invocation code and the framework paper, not just the method paper). Kept
+  PPO (matches the 2021 paper's own explicit algorithmic argument, and PPO is fully
+  implemented in their code), but re-set every transferable hyperparameter to the real SB3
+  default (gamma 0.999->0.99, entropy_coef 0.02->0.0, critic_coef 1.0->0.5, loss_critic_type
+  smooth_l1->l2, AdamW->Adam, split actor/critic lr's (0.00048/0.0023, an unrelated
+  hyperparameter-search leftover)->single 3e-4, LinearLR decay->constant, n_epochs 5->10) —
+  previously these were carried over verbatim from an unrelated FTR config, per that config's
+  own honest disclosure; now traceable to a concrete, real source.
+* **New reward module**: `rl_rewards/mitriakov_reward.py`'s `MitriakovStaircaseReward`
+  replaces `PotentialGoalWithPenaltiesConfigurable` as this baseline's reward — transcribes
+  the monitor's monotonic best-distance-ever progress term and flat tip-over penalty exactly
+  (pure bookkeeping over quantities every `Reward` already receives, no new physics), and
+  makes the stability penalty genuinely PHASE-CONDITIONAL (ascent-only / descent-only, gated
+  on the terrain's own `step_indices`) where the old reward applied both roll and pitch(-rate)
+  penalties unconditionally every step. The penalty SIGNAL itself (|roll| / |pitch rate|) is
+  an unchanged, explicitly-disclosed stand-in for their TF-marker-based COG/IMU signals — see
+  that module's docstring "REMAINING GAP" section for the itemized list of what is and isn't
+  transcribed, and why. A real bug was found and fixed while writing this module: an early
+  version reassigned `self._max_dist = torch.where(...)` inside `__call__` (run under the
+  collector's `torch.inference_mode()`), which rebinds the buffer to a fresh "inference
+  tensor"; a subsequent `reset()` call (outside that context, on a real env reset) then raised
+  `RuntimeError: Inplace update to inference tensor outside InferenceMode is not allowed` — not
+  caught by a 1-step/no-reset smoke test, only by a longer multi-iteration run that actually
+  exercises a mid-rollout reset. Fixed to match `pan_reward.py`'s established in-place
+  masked-assignment pattern (`buf[mask] = value`, never reassigning the attribute).
+* **Verification actually run**: `MitriakovStaircaseReward` imports cleanly
+  (`dataclasses.fields()` inspected directly); a short smoke run (`num_robots=4,
+  total_frames=64`, `-m flipper_training.experiments.ppo.train --local
+  configs/baselines/mitriakov.yaml`, absolute path — the CLAUDE.md-documented relative
+  `configs/baselines/...` 404s from `src/flipper_training`, confirmed by reproducing the
+  `FileNotFoundError` before using the absolute path) completed exit 0 before the reset bug
+  above was found (single reset only, at env construction); after the fix, a longer run
+  (`num_robots=8, total_frames=1600, max_eval_steps=40`, enough to force several real
+  mid-rollout resets) completed exit 0 with finite, sane numbers throughout
+  (`eval/mean_step_reward` between -0.20 and +0.24 across 7 logged iterations,
+  `eval/min_step_reward` bottoming at the reward's own `failed_reward=-1.0` scale, never
+  NaN/Inf; 2-sample final eval: mean -0.092, max 0.615, min -3.439 — the large negative min is
+  `vecnorm_on_reward`-scaled tip-over penalties stacking, not a bug), producing real
+  `policy_final.pth`/`vecnorm_final.pth` (`runs/ppo/mitriakov_verifier_smoke_longer_
+  2026-07-13_21-39-56_955549`). Both configs' `objective_opts.max_feasible_pitch/roll` set to
+  the literal `pi/2` (`1.5707963267948966`) rather than the previous `1.5` approximation, and
+  `min_steps` bumped 1->2 for the `StairCrossing`-crash reason above — both are the only
+  numeric departures from a literal code transcription in the whole file, and both are
+  disclosed inline at the point they're set, not buried only here.
+* **Not touched**: `mitriakov2022_robot_simu` (the UI repo) — read only far enough to confirm
+  it has no env/reward logic of its own (it is a visualization/control frontend); neither
+  upstream repo was modified (read-only clones, per task instruction). Azayev and the four
+  `*_full.yaml` baselines above are unchanged, out of this pass's scope.
+* **Table + status note updated**: Mitriakov's master-table row changed from **adaptation** to
+  **code-verified mapping against gwaxG/robot_ws (authors' framework)**, per this task's own
+  instruction, with the row's own text naming the new reward module and pointing at this
+  paragraph and the config's header for the full mapping table.
