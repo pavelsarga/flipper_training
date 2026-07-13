@@ -85,9 +85,9 @@ pass, with its source ``file:line``:
   his raw sign convention matches this repo's documented one (front: -pi/2=up,
   +pi/2=down; rear: +pi/2=up, -pi/2=down, per this package's own CLAUDE.md) — cross-
   checked qualitatively against Fig. 1's per-state descriptions (e.g. NEUTRAL folds
-  both ends toward their "up" limit; ASCENDING_REAR presses the front down onto the
+  both ends toward their "up" limit; ASCENDING_REAR (NOTE: Fig. 1 arguably draws the AR front flipper folded UP/retracted, not pressed down -- verifier finding 2026-07-13; the numeric template is transcribed from his config regardless) was previously justified as pressing the front down onto the
   obstacle top while extending the rear down to reach it) and found consistent for
-  5 of 7 states; DESCENDING_REAR's sign is the one state where the qualitative check
+  at most ~4 of 7 states on an honest reading (Fig. 1 is stylized/non-metric; an independent render-and-inspect pass found AR and DESCENDING_FRONT visually ambiguous too); DESCENDING_REAR's sign is the state where the qualitative check most clearly
   is inconclusive (documented here rather than silently assumed). No URDF for his
   robot was available in the cloned repo to derive the mapping analytically. His
   ``NEUTRAL`` front value (``-2`` rad) exceeds this engine's joint limit
@@ -226,7 +226,15 @@ RAW_OBS_STASH_KEY = "hfc_raw_obs"
 # is the Algorithm-1 initial state).
 DEFAULT_TEMPLATES: dict[str, tuple[float, float, float, float]] = {
     "neutral": (-1.57, -1.57, 1.5, 1.5),  # his [-2,-2,1.5,1.5]; front clamped to this engine's joint_limits
-    "ascending_front": (-0.4, -0.4, 0.0, 0.0),
+    # VERIFIER CORRECTION (2026-07-13): the author repo ships TWO values for this
+    # state's front template: marv_flipper_controller_config.yaml:25 says -0.4 and
+    # marv_flipper_modulator_config.yaml:9 says -0.5. Tracing the runtime shows the
+    # CONTROLLER node only publishes the DSM state name; the MODULATOR node is what
+    # actually combines template + PD roll-stab + escape into the flipper command --
+    # so -0.5 (the modulator's value) is what the real system acts on, and it also
+    # keeps the template co-sourced with the PD/escape constants taken from the same
+    # node. An earlier revision used -0.4 from the controller-node file.
+    "ascending_front": (-0.5, -0.5, 0.0, 0.0),
     "up_stairs": (0.1, 0.1, -0.1, -0.1),
     "ascending_rear": (0.1, 0.1, -0.6, -0.6),
     "descending_front": (0.35, 0.35, -0.7, -0.7),

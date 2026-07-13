@@ -17,12 +17,23 @@ monitor/scripts/monitor_app/monitor_app.py
     reached so far this episode AND cumulative progress is still ``< 1.0``: reward +=
     ``(closest_distance_before - dist) / maximum_distance``, progress += the same increment
     (lines 237-239). ``maximum_distance`` is the odom-goal distance measured once, at rollout
-    start (``callback_start_rollout``, line 89-91). This is a MONOTONIC "best-distance-ever"
-    shaping, not a symmetric potential: moving away from the goal is never penalized -- only
-    failing to beat your own best distance forfeits reward on that tick. This is a materially
+    start (``callback_start_rollout``, line 89-91).
+
+    SEMANTICS -- CORRECTED after independent verification (2026-07-13): upstream is
+    ONE-STEP-LOOKBACK, POSITIVE-ONLY progress shaping. ``callback_odometry`` pays
+    ``max(0, closest_distance - dist) / maximum_distance`` and then, in its
+    ``else`` branch, UNCONDITIONALLY overwrites ``closest_distance = dist`` on
+    every non-terminal tick -- ``closest_distance`` is therefore just the
+    PREVIOUS tick's distance, not a historical minimum. Consequences faithfully
+    reproduced here: moving away from the goal is never penalized (positive-only),
+    and backtrack-then-retrace is RE-rewarded for re-covered ground (the
+    mechanism is exploitable; that is the authors' code, so we keep it).
+    An earlier revision of this class implemented a strict running minimum
+    (rewarding only new best distances) and described upstream as monotonic
+    "best-distance-ever" shaping -- both wrong; fixed. It remains a materially
     different formula from this repo's own ``PotentialGoal*`` family (telescoping
-    ``gamma*phi(s')-phi(s)`` shaping, which DOES reward/penalize every delta symmetrically) --
-    the reason this needed its own class rather than reusing an existing factory.
+    ``gamma*phi(s')-phi(s)`` shaping, which rewards/penalizes every delta
+    symmetrically) -- the reason this needed its own class.
   - ``callback_odometry`` (250-273): tip-over detection -- ``|roll| > pi/2`` or ``|pitch| > pi/2``
     (the accident-message strings conflate roll/pitch with "front/rear" vs "left/right" tipping,
     but the numeric thresholds are unambiguous). Sets ``done=True``.
@@ -40,7 +51,7 @@ monitor/scripts/monitor_app/guidance.py
     a run, NO penalty is subtracted at all (used purely to observe the raw penalty scale); K is
     then fixed as ``1 / mean(episode penalty sums over those 30 episodes)`` and used for the
     remainder of the run (``update``, line 77-82). This calibration scheme is inherently
-    SEQUENTIAL / single-environment (``backend/scripts/learning_scripts/policies.py:32`` wraps
+    SEQUENTIAL / single-environment (``backend/scripts/learning_scripts/stables3_launch.py`` (Learner; an earlier revision mis-cited policies.py) wraps
     exactly ONE ``TrainingEnv`` in a ``DummyVecEnv``) -- it has no defined analogue for a 256-way
     *vectorized* batch of parallel episodes (per-robot calibration vs. one calibration pooled
     across the whole batch is a modeling choice their code never had to make, since it never ran
@@ -219,11 +230,20 @@ class MitriakovStaircaseReward(Reward):
             self._max_dist[uninitialized] = init_dist[uninitialized]
             self._closest_dist[uninitialized] = prev_dist[uninitialized]
 
-        improved = curr_dist < self._closest_dist
+        # VERIFIED-EXACT semantics (audit correction, 2026-07-13): upstream
+        # monitor_app.py:227-249 rewards max(0, prev_closest - dist)/max_dist and
+        # then overwrites closest_distance = dist UNCONDITIONALLY on every
+        # non-terminal tick (the `else: closest_distance = dist` branch) -- it is
+        # ONE-STEP-LOOKBACK positive-only progress shaping, NOT a running
+        # historical minimum. A previous revision of this file implemented a
+        # strict running min (only updating on improvement), which is a stricter,
+        # different formula: it makes re-advancing over backtracked ground
+        # unrewarded, whereas the authors' code re-rewards it. We reproduce the
+        # authors' literal mechanism here, exploitability and all.
         diff = (self._closest_dist - curr_dist).clamp_min(0.0)
         still_climbing = self._progress < 1.0
-        progress_increment = torch.where(improved & still_climbing, diff / self._max_dist, torch.zeros_like(diff))
-        self._closest_dist[improved] = curr_dist[improved]
+        progress_increment = torch.where(still_climbing, diff / self._max_dist, torch.zeros_like(diff))
+        self._closest_dist[:] = curr_dist  # unconditional, per upstream's else-branch
         self._progress += progress_increment
         self._progress.clamp_(0.0, 1.0)
 
