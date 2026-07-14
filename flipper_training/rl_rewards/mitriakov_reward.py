@@ -154,8 +154,17 @@ class MitriakovStaircaseReward(Reward):
     goal_distance_shift: float = 0.3
     ascent_stability_coef: float = 0.8
     descent_stability_coef: float = 0.4
+    # "code" (default) = the authors' RELEASED semantics: one-step-lookback positive-only
+    # progress (re-rewards re-advancing over backtracked ground -- farmable by oscillation,
+    # see the VERIFIED-EXACT note in step()). "paper" = the PAPER's Eq. 3 reading: progress
+    # against the best (lowest) goal distance reached so far this episode -- a monotone
+    # ratchet that pays each meter of approach at most once (non-farmable). The two variants
+    # are trained/evaluated as separate baselines (mitriakov.yaml vs mitriakov_paper.yaml).
+    semantics: str = "code"
 
     def __post_init__(self):
+        if self.semantics not in ("code", "paper"):
+            raise ValueError(f"semantics must be 'code' or 'paper', got {self.semantics!r}")
         n = self.env.n_robots
         device = self.env.device
         # Sentinels: max_dist < 0 means "not yet initialized this episode" (set on reset,
@@ -243,7 +252,12 @@ class MitriakovStaircaseReward(Reward):
         diff = (self._closest_dist - curr_dist).clamp_min(0.0)
         still_climbing = self._progress < 1.0
         progress_increment = torch.where(still_climbing, diff / self._max_dist, torch.zeros_like(diff))
-        self._closest_dist[:] = curr_dist  # unconditional, per upstream's else-branch
+        if self.semantics == "paper":
+            # Eq.-3 reading: monotone best-distance ratchet -- only update the baseline on
+            # improvement, so backtracked ground is never re-rewarded
+            self._closest_dist[:] = torch.minimum(self._closest_dist, curr_dist)
+        else:
+            self._closest_dist[:] = curr_dist  # unconditional, per upstream's else-branch
         self._progress += progress_increment
         self._progress.clamp_(0.0, 1.0)
 

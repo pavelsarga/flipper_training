@@ -59,12 +59,25 @@ from flipper_training.policies import MLP
 from .pan_terrain import sample_terrain_points_relative
 from . import Observation, ObservationEncoder
 
-__all__ = ["ElevationBoxFeatures", "ElevationBoxFeaturesEncoder", "AUTHOR_BOXES", "robust_box_stats"]
+__all__ = ["ElevationBoxFeatures", "ElevationBoxFeaturesEncoder", "AUTHOR_BOXES", "AUTHOR_BOXES_PAPER", "robust_box_stats"]
 
 # the author's deployed boxes, verbatim from marv_feature_processor_config.yaml
 AUTHOR_BOXES: dict[str, tuple[float, float, float, float, float, float]] = {
     "front_low": (0.35, 0.7, -0.35, 0.35, -0.3, 0.4),
     "rear_low": (-0.4, 0.0, -0.35, 0.35, -0.2, 0.3),
+}
+
+# the PAPER's Eq.-10 / Fig.-5 per-flipper boxes (same config file, fl/fr/rl/rr_flipper_feat_bnd)
+# -- computed by his feature processor but NEVER consumed by the deployed network
+# (AUTHOR_CODE_FINDINGS.md #2.2). Provided for the azayev_paper.yaml variant, which trains the
+# gate on the input the PAPER describes instead of the one the released system ran.
+# Intensity note: his flipper boxes normalize by n_max_intensity_flipper=42 = exactly the
+# 7x6 cells of a 0.35x0.30 m footprint at his 5 cm map resolution -- coverage fraction again.
+AUTHOR_BOXES_PAPER: dict[str, tuple[float, float, float, float, float, float]] = {
+    "fl_flipper": (0.35, 0.7, 0.05, 0.35, -0.3, 0.4),
+    "fr_flipper": (0.35, 0.7, -0.35, -0.05, -0.3, 0.4),
+    "rl_flipper": (-0.4, 0.0, 0.05, 0.35, -0.3, 0.4),
+    "rr_flipper": (-0.4, 0.0, -0.35, -0.05, -0.3, 0.4),
 }
 
 
@@ -84,7 +97,7 @@ def _masked_median(vals: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return torch.where(k > 0, med, torch.zeros_like(med))
 
 
-def robust_box_stats(z_rel: torch.Tensor, z_lo: float, z_hi: float, m_extreme: int = 10) -> torch.Tensor:
+def robust_box_stats(z_rel: torch.Tensor, z_lo: float, z_hi: float, m_extreme: int = 10, norm_cells: int | None = None) -> torch.Tensor:
     """``get_pc_feat`` on heightmap cells: (B, N) robot-relative cell heights of one box
     footprint -> (B, 4) ``[median, median-of-m-lowest, median-of-m-highest, coverage]``.
 
@@ -104,7 +117,12 @@ def robust_box_stats(z_rel: torch.Tensor, z_lo: float, z_hi: float, m_extreme: i
     low_mask = idx < m
     min_bnd = _masked_median(asc, low_mask & torch.isfinite(asc))
     max_bnd = _masked_median(dsc, low_mask & torch.isfinite(dsc))
-    coverage = mask.float().sum(dim=-1) / z_rel.shape[-1]
+    # intensity: in-window cells / normalizer. The author normalizes by a FIXED constant
+    # (n_max_intensity=100 / n_max_intensity_flipper=42) rather than the true footprint cell
+    # count, so boxes with more cells (rear_low: 112, rear flipper strips: 48) saturate at 1
+    # BEFORE full coverage -- pass norm_cells to reproduce that exactly; None = pure coverage.
+    denom = float(norm_cells) if norm_cells is not None else float(z_rel.shape[-1])
+    coverage = mask.float().sum(dim=-1) / denom
     return torch.stack([avg, min_bnd, max_bnd, coverage.clamp(max=1.0)], dim=-1)
 
 
@@ -137,6 +155,7 @@ class ElevationBoxFeatures(Observation):
         default_factory=lambda: dict(AUTHOR_BOXES))
     cell_size: float = 0.05
     m_extreme: int = 10
+    intensity_norm_cells: int | None = None  # author constants: 100 (pooled) / 42 (per-flipper)
 
     def __post_init__(self):
         if self.apply_noise:
@@ -170,7 +189,7 @@ class ElevationBoxFeatures(Observation):
         feats = []
         for name, (lx, ly, z_lo, z_hi) in self._box_grids.items():
             z_rel = sample_terrain_points_relative(self.env, curr_state, lx, ly)  # (B, N)
-            feats.append(robust_box_stats(z_rel, z_lo, z_hi, self.m_extreme))
+            feats.append(robust_box_stats(z_rel, z_lo, z_hi, self.m_extreme, self.intensity_norm_cells))
         obs = torch.cat(feats, dim=-1).to(self.env.out_dtype)
         if self.apply_noise:
             obs = obs + torch.randn_like(obs) * self.noise_scale.view(1, -1)
@@ -197,7 +216,7 @@ class ElevationBoxFeatures(Observation):
             z = torch.nn.functional.grid_sample(
                 hm.unsqueeze(0).unsqueeze(0), grid, mode="bilinear", padding_mode="border", align_corners=True
             ).view(1, -1)  # (1, N) robot-relative heights at the box cell centers
-            feats.append(robust_box_stats(z, z_lo, z_hi, self.m_extreme))
+            feats.append(robust_box_stats(z, z_lo, z_hi, self.m_extreme, self.intensity_norm_cells))
         return torch.cat(feats, dim=-1).to(self.env.out_dtype)
 
     @property
