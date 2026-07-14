@@ -177,7 +177,15 @@ What was **NOT** transferred, and why:
   out of scope for this alignment pass. The exact extents above are recorded here
   so a future pass can build ``ElevationBoxFeatures`` (or similar) against this
   repo's heightmap grid and wire it as ``obs_key`` without re-deriving Eq. 10 from
-  scratch.
+  scratch. Code-vs-paper audit note (2026-07-14): the gap is SMALLER than the
+  paper implies — the paper's Eq. 1 / Fig. 5 four per-flipper feature vectors are
+  computed by his feature processor but NEVER consumed by the deployed classifier
+  (``src/control/marv_flipper_controller.py:169-206`` reads only pitch + the two
+  pooled full-width boxes). His deployed gate, like ours, sees proprioception plus
+  coarse pooled terrain statistics, not per-flipper terrain channels — so this
+  repo's ``LocalStateVector``-based gate input deviates from his DEPLOYED system
+  mainly by the two pooled elevation boxes, not by four missing per-flipper
+  channels. See ``AUTHOR_CODE_FINDINGS.md`` §2.2.
 * **Stagnation-feature construction** (the ``st`` fed into Eq. 8, as opposed to
   Eq. 8's linear escape mapping itself, which IS transferred above). His ``st`` is
   a persistent integrator, not an instantaneous ratio:
@@ -416,6 +424,19 @@ class _HFCActorModule(TensorDictModuleBase):
     the propagated distribution to ``("next", "recurrent_state_p")`` (collector
     carry-over, GRUModule convention) and a detached copy to ``"state_probs"`` for
     logging/analysis.
+
+    Detach-through-time note (code-vs-paper audit, 2026-07-14): the carried ``p``
+    is detached before being written to ``("next", "recurrent_state_p")`` below —
+    gradients flow into the gate only within a single step's Eq.-6 blend, never
+    across timesteps. The paper claims the SDSM's advantage is backpropagation
+    "through time", but the author's own deployed training code detaches the state
+    distribution at every step too (``augmented_robot_trackers``
+    ``src/policies/policies.py:242-258``, ``calculate_next_state_diff``, his
+    comment: "Detach here for no gradient propagation through time"; the
+    non-detached variant is dead code). So this implementation matches the
+    AUTHOR'S CODE exactly; under PPO's flattened minibatches a non-detached carry
+    could not propagate across collector steps anyway, so no flag is offered —
+    see ``AUTHOR_CODE_FINDINGS.md`` §2.2.
     """
 
     def __init__(
@@ -485,6 +506,7 @@ class _HFCActorModule(TensorDictModuleBase):
         tensordict.set("loc", torch.atanh(normalized))
         tensordict.set("scale", self.log_std.exp().expand(*batch_shape, -1))
         tensordict.set("state_probs", p_next.detach())
+        # detached carry — matches the author's own per-step .detach() (see class docstring)
         tensordict.set(("next", RECURRENT_KEY), p_next.detach())
         return tensordict
 
