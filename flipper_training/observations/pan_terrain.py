@@ -359,6 +359,21 @@ class PanTerrainState(Observation):
         theta_r = -torch.asin(sin_p).view(1, 1)  # positive = nose-UP (paper convention)
         return torch.cat([h, theta_f1, theta_f2, theta_r], dim=-1).to(self.env.out_dtype)
 
+    def viz_geometry(self) -> dict:
+        """Read-only introspection for deployment visualization (plain Python floats/ints
+        only -- no torch tensors, no ROS): the Eq.-1 bin layout this instance samples.
+        Consumed by the ROS deploy node's debug-marker publisher (``ros2/obs_viz.py``) to
+        render the 15-bin terrain profile along the robot heading. Adds NO new math; bin
+        order matches the leading ``n_heights`` entries of ``__call__`` /
+        ``from_realistic_world`` output (followed by theta_f1, theta_f2, theta_R).
+        """
+        return {
+            "bin_centers": [float(c) for c in self.bin_centers.detach().cpu().tolist()],  # local-frame x offsets (m)
+            "bin_width": float(self.bin_width),
+            "y_window": float(self.y_window),
+            "n_heights": int(self.n_heights),
+        }
+
     @property
     def dim(self) -> int:
         return self.n_heights + 3

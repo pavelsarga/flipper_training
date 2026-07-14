@@ -61,6 +61,25 @@ class PPOPolicyInferenceModule:
             self.logger.info(f"Loaded VecNorm weights from {vecnorm_weights_path}")
         self.actor_operator.eval()
         self.env.eval()
+        # --- deployment observability (read-only; consumed by ros2/obs_viz.py) ---
+        # The deploy node sets capture_debug_obs=True when its debug_viz parameter is on;
+        # infer_action then stashes, per observation-factory name, BOTH the raw
+        # from_realistic_world output (physical units, pre-VecNorm) and the post-transform
+        # value the actor actually consumed. Pure observation of already-computed inputs:
+        # no observation math is altered.
+        self.capture_debug_obs: bool = False
+        self.last_obs: dict[str, np.ndarray] | None = None  # post-transform (VecNorm etc.), keyed by factory name
+        self.last_obs_raw: dict[str, np.ndarray] | None = None  # raw from_realistic_world outputs, keyed by factory name
+
+    @property
+    def observation_factories(self) -> list:
+        """The live Observation instances the loaded policy was built with (read-only).
+
+        Lets the deploy node introspect policy-specific geometry (e.g.
+        ``ElevationBoxFeatures.viz_geometry()`` box extents, ``PanTerrainState`` bin
+        centers) to render exactly what the policy is fed.
+        """
+        return list(self.world_interface_env.observations)
 
     def infer_action(self, **kwargs) -> np.ndarray:
         """
@@ -83,6 +102,28 @@ class PPOPolicyInferenceModule:
             world_td.set("step_count", torch.zeros([1], dtype=torch.long, device=self.device))  # some envs need step_count
             env_td = self.env.step(world_td)
             true_action_td = self.actor_operator(env_td["next"])
+
+            if self.capture_debug_obs:
+                # Stash what the policy was fed this tick (see __init__). Raw values are
+                # re-derived with the SAME deterministic from_realistic_world calls the env
+                # step just ran (single robot, tiny tensors -- negligible cost) so the env
+                # itself stays untouched; post-transform values are read straight out of
+                # the stepped tensordict. Never allowed to break inference.
+                obs_post: dict[str, np.ndarray] = {}
+                obs_raw: dict[str, np.ndarray] = {}
+                nxt = env_td["next"]
+                for o in self.world_interface_env.observations:
+                    v = nxt.get(o.name, None)
+                    if isinstance(v, torch.Tensor):
+                        obs_post[o.name] = v.squeeze(0).detach().cpu().numpy().astype(np.float32)  # astype copies
+                    try:
+                        r = o.from_realistic_world(world_td)
+                        if isinstance(r, torch.Tensor):
+                            obs_raw[o.name] = r.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                    except Exception:  # noqa: S110 -- viz stash must never break control
+                        pass
+                self.last_obs = obs_post
+                self.last_obs_raw = obs_raw
 
         # stash recurrent carries the actor declares as ("next", <key>) outputs (GRUModule
         # convention, also used by the HFC state machine) so the deploy node can feed them

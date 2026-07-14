@@ -13,12 +13,23 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, PointCloud2, PointField, Imu
 from geometry_msgs.msg import PoseStamped, Twist
-from std_msgs.msg import Float64, MultiArrayDimension, MultiArrayLayout, Float32MultiArray
+from std_msgs.msg import Float64, MultiArrayDimension, MultiArrayLayout, Float32MultiArray, String
+from visualization_msgs.msg import MarkerArray
 from grid_map_msgs.msg import GridMap
 import struct
 
 import torch
 from scipy.spatial.transform import Rotation
+
+from flipper_training.ros2.heightmap_align import align_heightmap_to_robot
+
+# Observation-visualization helper (MarkerArray/JSON builders). Package import when
+# flipper_training is on PYTHONPATH (run_flipper_policy_sim.sh), plain import when this
+# file is executed as a bare script from its own directory.
+try:
+    from flipper_training.ros2 import obs_viz
+except ImportError:
+    import obs_viz
 
 
 class FlipperPolicyNode(Node):
@@ -43,7 +54,14 @@ class FlipperPolicyNode(Node):
         self.declare_parameter("heightmap_layer", "elevation")  # Layer name in GridMap
         self.declare_parameter("flipper_velocity_scale", 1.0)  # Scale factor for flipper velocities
         self.declare_parameter("publish_debug_cloud", True)  # Publish heightmap as point cloud for debugging
+        self.declare_parameter("debug_viz", True)  # Publish per-observation RViz markers + JSON (/policy_obs_markers, /policy_obs_debug)
         self.declare_parameter("latent_control", float("nan"))  # LatentControlParameter obs command; NaN = unset
+        # Deployment-input alignment (bug found 2026-07-14, see ros2/heightmap_align.py):
+        # the observation factories expect a robot-local YAW-ALIGNED, robot-RELATIVE-height
+        # map; elevation_mapping delivers world-axis-aligned absolute heights. Both fixes
+        # default ON; the flags exist only to reproduce the old (buggy) behavior for A/B.
+        self.declare_parameter("heightmap_align_yaw", True)
+        self.declare_parameter("heightmap_relative_z", True)
 
         # Get parameters
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
@@ -55,6 +73,7 @@ class FlipperPolicyNode(Node):
         self.heightmap_layer = self.get_parameter("heightmap_layer").get_parameter_value().string_value
         self.flipper_velocity_scale = self.get_parameter("flipper_velocity_scale").get_parameter_value().double_value
         self.publish_debug_cloud = self.get_parameter("publish_debug_cloud").get_parameter_value().bool_value
+        self.debug_viz = self.get_parameter("debug_viz").get_parameter_value().bool_value
 
         if not config_path or not policy_weights_path:
             self.get_logger().error("config_path and policy_weights_path parameters are required!")
@@ -83,6 +102,14 @@ class FlipperPolicyNode(Node):
                 device=device,
             )
         self.get_logger().info("Policy loaded successfully")
+
+        # Ask the inference module to stash, per observation-factory name, the raw
+        # from_realistic_world outputs + the post-VecNorm values the actor consumed
+        # (native PPOPolicyInferenceModule only; the FTR module has no factory list)
+        if self.debug_viz and hasattr(self.policy, "capture_debug_obs"):
+            self.policy.capture_debug_obs = True
+            names = [type(o).__name__ for o in self.policy.observation_factories]
+            self.get_logger().info(f"debug_viz on: capturing observations from factories {names}")
 
         # State storage
         self.current_odom: Odometry | None = None
@@ -130,6 +157,11 @@ class FlipperPolicyNode(Node):
         # Debug visualization publishers
         self.heightmap_cloud_pub = self.create_publisher(PointCloud2, "/policy_heightmap_debug", 10)
         self.heightmap_gridmap_pub = self.create_publisher(GridMap, "/policy_heightmap", 10)
+        # Per-observation visualization (gated by debug_viz): markers rendering each
+        # factory's derived observation (Azayev boxes, Pan bins, heightmap patch, goal
+        # arrow) + a JSON dump of the flat observation vectors per factory name
+        self.obs_markers_pub = self.create_publisher(MarkerArray, "/policy_obs_markers", 10) if self.debug_viz else None
+        self.obs_json_pub = self.create_publisher(String, "/policy_obs_debug", 10) if self.debug_viz else None
 
         # Current flipper positions (for integrating velocity commands)
         self.flipper_positions = {
@@ -535,6 +567,21 @@ class FlipperPolicyNode(Node):
             return
         xd_local, omega_local = velocities
 
+        # Align the world-frame accumulated heightmap to the robot's local frame
+        # (yaw rotation + robot-relative heights) — the convention every observation
+        # factory's from_realistic_world defines (see heightmap_align.py docstring).
+        policy_heightmap = self.current_heightmap
+        if self.current_odom is not None and self.heightmap_extent is not None:
+            oq = self.current_odom.pose.pose.orientation
+            oyaw = Rotation.from_quat([oq.x, oq.y, oq.z, oq.w]).as_euler("xyz")[2]
+            align_yaw = self.get_parameter("heightmap_align_yaw").get_parameter_value().bool_value
+            rel_z = self.get_parameter("heightmap_relative_z").get_parameter_value().bool_value
+            policy_heightmap = align_heightmap_to_robot(
+                self.current_heightmap, self.heightmap_extent,
+                oyaw if align_yaw else 0.0,
+                self.current_odom.pose.pose.position.z if rel_z else 0.0,
+            )
+
         # Check required inputs
         if goal_vec_local is None:
             # No goal set - publish zero velocities to stand in place
@@ -585,7 +632,7 @@ class FlipperPolicyNode(Node):
             extra["latent_control"] = np.array([lc], dtype=np.float32)
         try:
             action = self.policy.infer_action(
-                heightmap=self.current_heightmap,
+                heightmap=policy_heightmap,
                 heightmap_extent=self.heightmap_extent,
                 goal_vec_local=goal_vec_local,
                 xd_local=xd_local,
@@ -604,6 +651,13 @@ class FlipperPolicyNode(Node):
         action = np.asarray(action, dtype=np.float64)
         # stash the RAW policy action for the next tick's prev_action key
         self._prev_action = action.astype(np.float32).copy()
+
+        # Publish what the policy was just fed (markers + JSON); never let viz break control
+        if self.debug_viz:
+            try:
+                self._publish_obs_viz(action)
+            except Exception as e:
+                self.get_logger().warn(f"Observation viz failed: {e}", throttle_duration_sec=5.0)
 
         if self._is_ftr:
             # FTR action: [v, w, fl, fr, rl, rr] — 6-D
@@ -647,6 +701,55 @@ class FlipperPolicyNode(Node):
                 throttle_duration_sec=0.5,
             )
 
+
+    def _publish_obs_viz(self, action: np.ndarray) -> None:
+        """Render the policy's just-consumed observations in RViz (MarkerArray on
+        /policy_obs_markers) and dump the flat vectors as JSON (/policy_obs_debug).
+
+        Reads only data this node/inference module already computed: the factory
+        instances + last_obs_raw/last_obs stashed by PPOPolicyInferenceModule when
+        capture_debug_obs is on (see obs_viz.py). For FTR policies (no factory list)
+        only the action/JSON part is published.
+        """
+        factories = getattr(self.policy, "observation_factories", None) or []
+        last_obs_raw = getattr(self.policy, "last_obs_raw", None)
+        last_obs = getattr(self.policy, "last_obs", None)
+        stamp = self.get_clock().now().to_msg()
+
+        if self.obs_json_pub is not None:
+            msg = String()
+            msg.data = obs_viz.build_obs_debug_json(
+                factories,
+                last_obs_raw,
+                last_obs,
+                action,
+                stamp_sec=stamp.sec + stamp.nanosec * 1e-9,
+                policy_type="ftr" if self._is_ftr else "native",
+            )
+            self.obs_json_pub.publish(msg)
+
+        if self.obs_markers_pub is None or not factories:
+            return
+        # Yaw-only world pose carrier: the terrain observations (Azayev boxes, Pan bins,
+        # heightmap patch) are defined in the zero-roll-pitch base-link frame, so they
+        # must NOT tilt with the chassis in RViz. control_callback only reaches inference
+        # with a valid goal, which requires current_odom, so odom is available here.
+        if self.current_odom is None:
+            return
+        p = self.current_odom.pose.pose.position
+        q = self.current_odom.pose.pose.orientation
+        yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.obs_markers_pub.publish(
+            obs_viz.build_obs_marker_array(
+                factories,
+                last_obs_raw,
+                stamp,
+                robot_xyz=(p.x, p.y, p.z),
+                robot_yaw=float(yaw),
+                world_frame="world",
+                base_frame="base_link",
+            )
+        )
 
     @staticmethod
     def _detect_ftr_config(config_path: str) -> bool:

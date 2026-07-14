@@ -219,6 +219,28 @@ class ElevationBoxFeatures(Observation):
             feats.append(robust_box_stats(z, z_lo, z_hi, self.m_extreme, self.intensity_norm_cells))
         return torch.cat(feats, dim=-1).to(self.env.out_dtype)
 
+    def viz_geometry(self) -> dict:
+        """Read-only introspection for deployment visualization (plain Python floats/ints
+        only -- no torch tensors, no ROS): the exact box bounds and per-box cell counts this
+        instance samples. Consumed by the ROS deploy node's debug-marker publisher
+        (``ros2/obs_viz.py``) to render the boxes at their true base-link-frame extents.
+        Adds NO new math; box order matches the 4-stat-per-box layout of ``__call__`` /
+        ``from_realistic_world`` output.
+        """
+        return {
+            "boxes": {
+                # (x_lo, x_hi, y_lo, y_hi, z_lo, z_hi) meters, zero-roll-pitch base-link frame
+                name: {
+                    "bounds": [float(b) for b in bounds],
+                    "n_cells": int(self._box_grids[name][0].numel()),
+                }
+                for name, bounds in self.boxes.items()
+            },
+            "cell_size": float(self.cell_size),
+            "m_extreme": int(self.m_extreme),
+            "intensity_norm_cells": None if self.intensity_norm_cells is None else int(self.intensity_norm_cells),
+        }
+
     @property
     def dim(self) -> int:
         return 4 * len(self.boxes)
