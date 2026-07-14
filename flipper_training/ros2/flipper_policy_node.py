@@ -577,6 +577,9 @@ class FlipperPolicyNode(Node):
         extra = {}
         if getattr(self, "_prev_action", None) is not None:
             extra["prev_action"] = self._prev_action
+        # recurrent carries (HFC state distribution, GRU/LSTM hiddens) from the last tick
+        for k, v in (getattr(self.policy, "recurrent_carry", None) or {}).items():
+            extra[k] = v
         lc = self.get_parameter("latent_control").get_parameter_value().double_value if self.has_parameter("latent_control") else float("nan")
         if not np.isnan(lc):
             extra["latent_control"] = np.array([lc], dtype=np.float32)

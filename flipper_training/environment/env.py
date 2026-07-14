@@ -297,6 +297,13 @@ class Env(EnvBase):
                 device=self.device,
                 batch_size=[1],
             )
+            # forward input keys the observation factories did not produce — this is what
+            # carries recurrent state (e.g. the HFC's recurrent_state_p, GRU/LSTM hiddens)
+            # from the deploy node back into the policy chain (live-sim-found, 2026-07-14:
+            # without this, recurrent policies silently re-initialised EVERY tick)
+            for k in tensordict.keys():
+                if k not in obs_td.keys():
+                    obs_td.set(k, tensordict.get(k))
             obs_td[Env.STATE_KEY] = PhysicsState.dummy(self.robot_cfg, device=self.device, batch_size=1).to_tensordict()
             obs_td["succeeded"] = torch.zeros((1, 1), device=self.device, dtype=torch.bool)
             obs_td["failed"] = torch.zeros((1, 1), device=self.device, dtype=torch.bool)

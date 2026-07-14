@@ -484,6 +484,11 @@ class _HFCActorModule(TensorDictModuleBase):
         batch_shape = enc.shape[:-1]
         # --- carried state distribution (recurrent state), Algorithm-1 init/reset ---
         p = tensordict.get(RECURRENT_KEY, None)
+        if p is not None and not isinstance(p, torch.Tensor):
+            # deploy path: torchrl's TensorDictPrimer only fires on reset(), which the
+            # realistic (_to_realistic_env) step never calls — the key can then arrive as a
+            # NonTensorData placeholder. Treat it as absent (live-sim-found, 2026-07-14).
+            p = None
         if p is None:
             p = self._initial_p(batch_shape, enc.device)
         else:

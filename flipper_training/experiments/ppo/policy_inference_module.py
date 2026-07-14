@@ -84,6 +84,17 @@ class PPOPolicyInferenceModule:
             env_td = self.env.step(world_td)
             true_action_td = self.actor_operator(env_td["next"])
 
+        # stash recurrent carries the actor declares as ("next", <key>) outputs (GRUModule
+        # convention, also used by the HFC state machine) so the deploy node can feed them
+        # back as plain kwargs on the next tick — without this, recurrent policies are
+        # silently stateless at deployment (live-sim-found, 2026-07-14)
+        self.recurrent_carry = {}
+        for ok in getattr(self.actor_operator, "out_keys", []):
+            if isinstance(ok, tuple) and len(ok) == 2 and ok[0] == "next":
+                v = true_action_td.get(ok, None)
+                if isinstance(v, torch.Tensor):
+                    self.recurrent_carry[ok[1]] = v.squeeze(0).cpu().numpy()
+
         return true_action_td["action"].squeeze(0).cpu().numpy()
 
 
