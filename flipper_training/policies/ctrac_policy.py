@@ -81,7 +81,7 @@ full architecture with everything turned on):
     ``state_machine_policy`` already documents for its own recurrent carry.
 
   Concretely, not hypothetically: traced ``policy_inference_module.py``'s
-  ``infer_action()`` (what ``ros2/flipper_policy_node.py``'s
+  ``infer_action()`` (what ``flipper_training/ros2/flipper_policy_node.py``'s
   ``control_callback`` calls every control tick) end to end. It builds a
   FRESH tensordict from raw kwargs each call, does ``env_td =
   self.env.step(world_td)``, then a bare ``self.actor_operator(env_td["next"])``

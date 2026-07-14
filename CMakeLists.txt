@@ -36,9 +36,9 @@ install(DIRECTORY meshes/
   DESTINATION lib/python3.10/site-packages/meshes
 )
 
-install(PROGRAMS
-    ros2/flipper_policy_node.py
-    DESTINATION lib/${PROJECT_NAME}
-)
+# (removed 2026-07-14: a second install(PROGRAMS ros2/flipper_policy_node.py) here used to
+# OVERWRITE the canonical flipper_training/ros2/flipper_policy_node.py installed above with a
+# stale divergent copy — disagreeing heightmap transpose, no prev_action/alignment support.
+# The canonical node is the single source now.)
 
 ament_package()

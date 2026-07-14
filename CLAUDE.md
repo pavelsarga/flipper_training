@@ -41,7 +41,7 @@ python -m flipper_training.experiments.ppo.train --local config.yaml num_robots=
 ## Deploying Policy for Gazebo/ROS2
 
 Key files:
-- **ROS2 node**: `ros2/flipper_policy_node.py`
+- **ROS2 node**: `flipper_training/ros2/flipper_policy_node.py`
 - **Launch file**: `ros2/flipper_policy.launch.py`
 - **Goal sender utility**: `ros2/send_goal.py`
 - **Jupyter notebook**: `notebooks/ppo_policy_inference.ipynb`
@@ -59,7 +59,7 @@ ros2 launch ros2/flipper_policy.launch.py \
     device:=cuda:0
 
 # Direct execution
-python ros2/flipper_policy_node.py --ros-args \
+python flipper_training/ros2/flipper_policy_node.py --ros-args \
     -p config_path:=/path/to/config.yaml \
     -p policy_weights_path:=/path/to/policy.pth
 
