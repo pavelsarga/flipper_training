@@ -43,6 +43,7 @@ class FlipperPolicyNode(Node):
         self.declare_parameter("heightmap_layer", "elevation")  # Layer name in GridMap
         self.declare_parameter("flipper_velocity_scale", 1.0)  # Scale factor for flipper velocities
         self.declare_parameter("publish_debug_cloud", True)  # Publish heightmap as point cloud for debugging
+        self.declare_parameter("latent_control", float("nan"))  # LatentControlParameter obs command; NaN = unset
 
         # Get parameters
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
@@ -568,7 +569,17 @@ class FlipperPolicyNode(Node):
             throttle_duration_sec=1.0,
         )
 
-        # Run policy inference
+        # Run policy inference. Extra keys beyond the classic five are consumed only by
+        # observation factories that ask for them (from_realistic_world): prev_action
+        # (PreviousAction / LocalStateVectorWithAction — the action that led to this
+        # observation, zeros on the first tick) and latent_control (LatentControlParameter,
+        # only when the ROS parameter is set).
+        extra = {}
+        if getattr(self, "_prev_action", None) is not None:
+            extra["prev_action"] = self._prev_action
+        lc = self.get_parameter("latent_control").get_parameter_value().double_value if self.has_parameter("latent_control") else float("nan")
+        if not np.isnan(lc):
+            extra["latent_control"] = np.array([lc], dtype=np.float32)
         try:
             action = self.policy.infer_action(
                 heightmap=self.current_heightmap,
@@ -578,6 +589,7 @@ class FlipperPolicyNode(Node):
                 omega_local=omega_local,
                 thetas=thetas,
                 quat=quat,
+                **extra,
             )
         except Exception as e:
             self.get_logger().error(f"Policy inference failed: {e}")
@@ -587,6 +599,8 @@ class FlipperPolicyNode(Node):
         if hasattr(action, 'cpu'):
             action = action.cpu().numpy()
         action = np.asarray(action, dtype=np.float64)
+        # stash the RAW policy action for the next tick's prev_action key
+        self._prev_action = action.astype(np.float32).copy()
 
         if self._is_ftr:
             # FTR action: [v, w, fl, fr, rl, rr] — 6-D

@@ -307,6 +307,58 @@ class PanTerrainState(Observation):
             obs = obs + noise
         return obs
 
+    def from_realistic_world(self, tensordict) -> torch.Tensor:
+        """Deployment path (``flipper_policy_node`` -> ``_to_realistic_env``): compute the SAME
+        ``[H, theta_f1, theta_f2, theta_R]`` from the node's raw tensordict instead of the
+        engine's ground-truth ``z_grid``.
+
+        Inputs (same conventions as ``heightmap.Heightmap.from_realistic_world``, which is the
+        live-sim-tested reference for consuming the node's map):
+        * ``heightmap`` (H_src, W_src) up to leading singleton dims — robot-LOCAL yaw-aligned
+          frame (X forward = rows), heights RELATIVE to the robot base. That matches Eq. 1's
+          [L] frame (yaw-only heading alignment, module docstring) and
+          ``sample_terrain_points_relative``'s chassis-relative z exactly.
+        * ``heightmap_extent`` = (x_max, y_max, x_min, y_min) in meters.
+        * ``thetas`` (num_driving_parts,) raw joint angles, engine/robot sign convention —
+          the same paper-vs-engine sign corrections as ``__call__`` apply (module docstring).
+        * ``quat`` (4,) ROS-order (x, y, z, w). ROS REP-103 pitch (asin(2(wy - zx))) is
+          positive nose-DOWN about +Y — the same convention the module docstring derives for
+          the engine's ``quaternion_to_pitch`` — so the same ``theta_R = -pitch`` flip applies.
+        """
+        hm: torch.Tensor = tensordict["heightmap"].to(self.env.device)
+        while hm.ndim > 2:
+            hm = hm.squeeze(0)
+        extent = tensordict["heightmap_extent"]
+        if isinstance(extent, torch.Tensor):
+            extent = extent.cpu().squeeze().tolist()
+        need_x = float(self.bin_centers.abs().max()) + self.bin_width / 2
+        if extent[0] < need_x or extent[1] < self.y_window or extent[2] > -need_x or extent[3] > -self.y_window:
+            raise ValueError(
+                f"Real-world heightmap extent {extent} does not cover the Eq.-1 sampling window "
+                f"(x +-{need_x:.2f} m, y +-{self.y_window:.2f} m)."
+            )
+        # dense per-bin subgrid in the local frame (same layout as sample_binned_terrain_heights)
+        dev = hm.device
+        sub_x = torch.linspace(-self.bin_width / 2, self.bin_width / 2, self.x_samples_per_bin, device=dev) if self.x_samples_per_bin > 1 else torch.zeros(1, device=dev)
+        sub_y = torch.linspace(-self.y_window, self.y_window, self.y_samples_per_bin, device=dev) if self.y_samples_per_bin > 1 else torch.zeros(1, device=dev)
+        bc = self.bin_centers.to(dev)
+        px = (bc.view(-1, 1, 1) + sub_x.view(1, -1, 1)).expand(self.n_heights, sub_x.numel(), sub_y.numel())
+        py = sub_y.view(1, 1, -1).expand_as(px)
+        # local (x, y) -> normalized grid_sample coords (heightmap.py's mapping)
+        grid_v = 2 * (px - extent[0]) / (extent[2] - extent[0]) - 1
+        grid_u = 2 * (py - extent[1]) / (extent[3] - extent[1]) - 1
+        grid = torch.stack((grid_u, grid_v), dim=-1).reshape(1, self.n_heights, -1, 2)
+        z = torch.nn.functional.grid_sample(hm.unsqueeze(0).unsqueeze(0), grid, mode="bilinear", padding_mode="border", align_corners=True)
+        h = z.view(self.n_heights, -1).mean(dim=-1).view(1, self.n_heights)  # Eq. 1 per-bin mean
+        # E (Eq. 2) with the module-docstring sign corrections
+        thetas = tensordict["thetas"].to(self.env.device).view(-1)
+        theta_f1 = -thetas[self.front_idx].mean().view(1, 1)
+        theta_f2 = thetas[self.rear_idx].mean().view(1, 1)
+        q = tensordict["quat"].to(self.env.device).view(-1)  # ROS (x, y, z, w)
+        sin_p = torch.clamp(2 * (q[3] * q[1] - q[2] * q[0]), -1.0, 1.0)
+        theta_r = -torch.asin(sin_p).view(1, 1)  # positive = nose-UP (paper convention)
+        return torch.cat([h, theta_f1, theta_f2, theta_r], dim=-1).to(self.env.out_dtype)
+
     @property
     def dim(self) -> int:
         return self.n_heights + 3

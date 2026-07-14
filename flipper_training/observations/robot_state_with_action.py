@@ -69,6 +69,37 @@ class LocalStateVectorWithAction(Observation):
             obs.add_(noise)
         return obs
 
+    def from_realistic_world(self, tensordict) -> torch.Tensor:
+        """Deployment path: same layout as ``__call__`` — ``[roll, pitch, xd_local,
+        omega_local, thetas, goal_vec_local, prev_action]`` — computed from the deploy node's
+        raw tensordict (keys per ``robot_state.LocalStateVector.from_realistic_world``, whose
+        quaternion handling and normalizations this mirrors; the ONE difference from that
+        class is kept: thetas scaled to [-1, 1] here vs [0, 1] there, matching each
+        ``__call__``). ``prev_action`` is the node-stashed previous policy action (the
+        realistic analogue of ``__call__``'s ``action`` arg); zeros on the first tick.
+        """
+        goal_vec_local = tensordict["goal_vec_local"].view(1, 3) / self.max_dist
+        xd_local = tensordict["xd_local"].view(1, 3) / self.max_dist
+        omega_local = tensordict["omega_local"].view(1, 3) / torch.pi
+        thetas = (tensordict["thetas"].view(1, -1) - self.env.robot_cfg.joint_limits[0]) / self.theta_range * 2 - 1
+        # ros sends [x, y, z, w]
+        q_ros = tensordict["quat"].view(-1, 4)
+        w, x, y, z = q_ros[:, 3], q_ros[:, 0], q_ros[:, 1], q_ros[:, 2]
+        sin_p = torch.clamp(2 * (w * y - z * x), -1.0, 1.0)
+        pitch = torch.asin(sin_p).view(1, 1) / torch.pi
+        roll = torch.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)).view(1, 1) / torch.pi
+        prev = tensordict.get("prev_action", None)
+        n_act = 2 * self.env.robot_cfg.num_driving_parts
+        if prev is None:
+            action_obs = torch.zeros((1, n_act), device=self.env.device)
+        else:
+            action_obs = prev.to(self.env.device).view(1, n_act)
+        obs = torch.cat(
+            [roll, pitch, xd_local, omega_local, thetas, goal_vec_local, action_obs],
+            dim=1,
+        ).to(self.env.out_dtype)
+        return obs
+
     @property
     def dim(self) -> int:
         """
