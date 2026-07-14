@@ -177,7 +177,13 @@ What was **NOT** transferred, and why:
   out of scope for this alignment pass. The exact extents above are recorded here
   so a future pass can build ``ElevationBoxFeatures`` (or similar) against this
   repo's heightmap grid and wire it as ``obs_key`` without re-deriving Eq. 10 from
-  scratch. Code-vs-paper audit note (2026-07-14): the gap is SMALLER than the
+  scratch. GAP CLOSED (2026-07-14, later the same day):
+  ``flipper_training.observations.elevation_boxes.ElevationBoxFeatures`` now
+  implements the author's DEPLOYED terrain input (his two pooled boxes, robust
+  median statistics, verbatim bounds) and ``configs/baselines/azayev.yaml``
+  includes it -- the gate now sees pitch (via LocalStateVector) + both boxes,
+  matching the deployed 9-D information content. The note below documents why
+  the DEPLOYED input (not Eq. 10) is the right target. Code-vs-paper audit note (2026-07-14): the gap is SMALLER than the
   paper implies — the paper's Eq. 1 / Fig. 5 four per-flipper feature vectors are
   computed by his feature processor but NEVER consumed by the deployed classifier
   (``src/control/marv_flipper_controller.py:169-206`` reads only pitch + the two

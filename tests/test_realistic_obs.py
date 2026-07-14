@@ -93,5 +93,59 @@ try:
     lcp.from_realistic_world(TensorDict({}, batch_size=[])); fails.append("latent_control: no error when unset")
 except ValueError: pass
 
-print("FAILURES:", fails if fails else "none — all 4 implementations validated")
+
+
+
+# ---------- ElevationBoxFeatures: analytic ramps + cross-path agreement ----------
+# (bilinear interpolation is EXACT on linear terrain, so expectations are analytic;
+# a step terrain would put cell values at the mercy of float rounding of grid nodes)
+from flipper_training.observations.elevation_boxes import ElevationBoxFeatures
+
+env2 = mkenv()
+env2.terrain_cfg = SimpleNamespace(max_coord=4.0)
+ebf = ElevationBoxFeatures(env=env2)
+assert ebf.dim == 8
+
+def ramp_grid(slope, D=161):
+    xs_w = torch.linspace(-4.0, 4.0, D)
+    return (slope * xs_w).view(1, 1, D).expand(1, D, D).clone()
+
+def ramp_hm(slope, Hs=161):
+    hx = torch.linspace(2.0, -2.0, Hs)
+    return (slope * hx - 0.1).view(Hs, 1).expand(Hs, Hs).clone()   # robot-relative (robot z=0.1)
+
+curr = SimpleNamespace(x=torch.tensor([[0.0, 0.0, 0.1]]), q=torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
+td_ext = torch.tensor([2.0, 2.0, -2.0, -2.0])
+
+# gentle ramp z = 0.2x: everything in-window, medians = middle-column values
+env2.terrain_cfg.z_grid = ramp_grid(0.2)
+obs_train = ebf(None, None, None, curr)
+obs_real = ebf.from_realistic_world(TensorDict({"heightmap": ramp_hm(0.2), "heightmap_extent": td_ext}, batch_size=[]))
+# front box cols x=0.375..0.675 (7): median col 0.525 -> 0.2*0.525-0.1=0.005; min col .375 -> -0.025; max col .675 -> 0.035
+exp_front = torch.tensor([0.005, -0.025, 0.035, 1.0])
+# rear box cols x=-0.375..-0.025 (8): median mean(cols 3,4)=mean(-0.145,-0.135)=-0.14; min -0.175; max -0.105
+exp_rear = torch.tensor([-0.14, -0.175, -0.105, 1.0])
+for name, o in (("train", obs_train), ("realistic", obs_real)):
+    if not torch.allclose(o[0, :4], exp_front, atol=1e-3):
+        fails.append(f"ebf {name} front_low {o[0,:4]} != {exp_front}")
+    if not torch.allclose(o[0, 4:], exp_rear, atol=1e-3):
+        fails.append(f"ebf {name} rear_low {o[0,4:]} != {exp_rear}")
+if not torch.allclose(obs_train, obs_real, atol=1e-4):
+    fails.append(f"ebf cross-path mismatch: {obs_train} vs {obs_real}")
+
+# steep ramp z = 1.0x: front-box cols above x=0.5 leave the z-window (rel > 0.4)
+# in-window cols: 0.375(0.275), 0.425(0.325), 0.475(0.375) -> coverage 3/7, median 0.325, min 0.275, max 0.375
+env2.terrain_cfg.z_grid = ramp_grid(1.0)
+o5 = ebf(None, None, None, curr)
+exp_steep = torch.tensor([0.325, 0.275, 0.375, 3/7])
+if not torch.allclose(o5[0, :4], exp_steep, atol=1e-3):
+    fails.append(f"ebf z-window filter broken: {o5[0,:4]} != {exp_steep}")
+
+# empty box -> zeros (his len(pc)==0 branch)
+env2.terrain_cfg.z_grid = torch.full((1, 161, 161), -2.0)
+o6 = ebf(None, None, None, curr)
+if o6.abs().sum() > 0:
+    fails.append(f"ebf empty-box not zeros: {o6}")
+
+print("FAILURES:", fails if fails else "none")
 sys.exit(1 if fails else 0)
