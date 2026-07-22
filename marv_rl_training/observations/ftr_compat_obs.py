@@ -15,7 +15,7 @@ additional prev_action entries (8-D in flipper_training vs 6-D in FTR):
 ──────
   968  total
 
-The encoder used is FtrCNNFlatEncoder with state_dim=23 (all non-heightmap dims).
+The encoder used is MarvRLCNNFlatEncoder with state_dim=23 (all non-heightmap dims).
 
 The observation tracks prev_action as an internal buffer.  Robots that were
 just reset (step_count == 0) have their prev_action zeroed automatically.
@@ -28,17 +28,17 @@ from dataclasses import dataclass, field
 import torch
 from torchrl.data import Unbounded
 
-from flipper_training.engine.engine_state import PhysicsState, PhysicsStateDer
-from flipper_training.observations import Observation, ObservationEncoder
-from marv_rl_training.observations.ftr_flat_obs import FtrCNNFlatEncoder
-from flipper_training.utils.environment import interpolate_grid
-from flipper_training.utils.geometry import (
+from marv_rl_training.engine.engine_state import PhysicsState, PhysicsStateDer
+from marv_rl_training.observations import Observation, ObservationEncoder
+from marv_rl_training.utils.environment import interpolate_grid
+from marv_rl_training.utils.geometry import (
     quaternion_to_roll,
     quaternion_to_pitch,
     planar_rot_from_q,
     inverse_quaternion,
     rotate_vector_by_quaternion,
 )
+from rl_modules.marv_rl.marv_rl_cnn_flat_encoder import MarvRLCNNFlatEncoder
 
 # Physical extent of the FTR perception grid (metres).
 HM_ROWS = 45        # forward/backward  (2.25 m)
@@ -205,7 +205,7 @@ class FtrCompatObservation(Observation):
 
     def get_encoder(self) -> ObservationEncoder:
         opts = dict(self.encoder_opts or {})
-        return FtrCNNFlatEncoder(
+        return MarvRLCNNFlatEncoder(
             state_dim=STATE_DIM,
             **opts,
         )

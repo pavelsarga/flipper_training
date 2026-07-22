@@ -23,10 +23,10 @@ from typing import Literal
 
 import torch
 
-from flipper_training.engine.engine_state import PhysicsState, PhysicsStateDer
-from flipper_training.rl_rewards import Reward
-from flipper_training.utils.environment import interpolate_grid
-from flipper_training.utils.geometry import (
+from marv_rl_training.engine.engine_state import PhysicsState, PhysicsStateDer
+from marv_rl_training.rl_rewards import Reward
+from marv_rl_training.utils.environment import interpolate_grid
+from marv_rl_training.utils.geometry import (
     inverse_quaternion,
     rotate_vector_by_quaternion,
     quaternion_to_roll,

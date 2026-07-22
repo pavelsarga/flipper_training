@@ -21,8 +21,10 @@ if TYPE_CHECKING:
     from gymnasium import Env as GymEnv
 
 # Key under which the flat observation is stored in TensorDicts.
-# Must match FtrFlatObservation.__class__.__name__ so the encoder TensorDictModule finds it.
-OBS_KEY = "FtrFlatObservation"
+# Must match MarvRLFlatObservation.__class__.__name__ so the encoder TensorDictModule finds it.
+# NOTE: checkpoints saved before the FtrFlatObservation -> MarvRLFlatObservation rename used
+# "FtrFlatObservation" here; mlp_policy.py's weight loader remaps that key automatically.
+OBS_KEY = "MarvRLFlatObservation"
 
 
 class FtrTorchRLEnv(EnvBase):
@@ -63,10 +65,19 @@ class FtrTorchRLEnv(EnvBase):
         self._per_env_failure: torch.Tensor | None = None
         self._per_env_explosion: torch.Tensor | None = None
 
-        # Instantiate the observation descriptor so make_transformed_env can build VecNorm keys.
-        from marv_rl_training.observations.ftr_flat_obs import FtrFlatObservation
+        # Instantiate the observation descriptor so make_transformed_env can build VecNorm keys
+        # and mlp_policy.py can build the matching encoder. Which descriptor class matches the
+        # actual per-step obs vector depends on which RLModule the underlying env is configured
+        # with (ftr_env.cfg.module_name) — see rl_modules/registry.py.
+        module_name = getattr(ftr_env.unwrapped.cfg, "module_name", "marv_rl")
+        if module_name == "pan_d3qn":
+            from rl_modules.pan_d3qn.pan_atd3qn_observation import PanATD3QNObservation
 
-        self.observations = [FtrFlatObservation(env=self, encoder_opts=encoder_opts)]
+            self.observations = [PanATD3QNObservation(env=self, encoder_opts=encoder_opts)]
+        else:
+            from rl_modules.marv_rl.marv_rl_flat_observation import MarvRLFlatObservation
+
+            self.observations = [MarvRLFlatObservation(env=self, encoder_opts=encoder_opts)]
 
         # ------------------------------------------------------------------ specs
         num_actions: int = ftr_env.unwrapped.cfg.num_actions

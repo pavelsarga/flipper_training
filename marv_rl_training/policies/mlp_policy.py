@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from copy import deepcopy
 from dataclasses import dataclass, field
-from flipper_training.environment.env import Env
+from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from tensordict.nn import TensorDictModule, TensorDictSequential
 from torchrl.modules import (
     NormalParamExtractor,
@@ -12,10 +12,10 @@ from torchrl.modules import (
     ActorCriticWrapper,
     ActorValueOperator,
 )
-from flipper_training.utils.logutils import get_terminal_logger
+from marv_rl_training.utils.logutils import get_terminal_logger
 from rich.console import Console
 from rich.table import Table
-from flipper_training.policies import PolicyConfig, EncoderCombiner, MLP
+from marv_rl_training.policies import PolicyConfig, EncoderCombiner, MLP
 
 __all__ = ["MLPPolicyConfig"]
 
@@ -23,6 +23,17 @@ __all__ = ["MLPPolicyConfig"]
 def count_parameters(module: nn.Module) -> int:
     """Counts the total number of trainable parameters in a module."""
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
+def _remap_legacy_observation_keys(state_dict: dict) -> dict:
+    """Translate checkpoint keys from renamed observation classes to their current names.
+
+    FtrFlatObservation was renamed to MarvRLFlatObservation; checkpoints saved before that
+    rename have encoder weights under "encoders.FtrFlatObservation.*". Applied unconditionally
+    on every weight load (before any caller-supplied key_remapper) so old checkpoints keep
+    loading without a manual migration step.
+    """
+    return {k.replace("encoders.FtrFlatObservation.", "encoders.MarvRLFlatObservation."): v for k, v in state_dict.items()}
 
 
 @dataclass
@@ -39,7 +50,7 @@ class MLPPolicyConfig(PolicyConfig):
     def __post_init__(self):
         self.logger = get_terminal_logger("MLPPolicyConfig")
 
-    def create(self, env: Env, **kwargs):
+    def create(self, env: FtrTorchRLEnv, **kwargs):
         # Fetch the environment data
         action_spec = env.action_spec
         encoders = {o.name: o.get_encoder() for o in env.observations}
@@ -91,6 +102,7 @@ class MLPPolicyConfig(PolicyConfig):
         # Load weights if path provided
         if weights_path := kwargs.get("weights_path", None):
             sd = torch.load(weights_path, map_location=actor_value_wrapper.device)
+            sd = _remap_legacy_observation_keys(sd)
             if key_remapper := kwargs.get("key_remapper", None):
                 sd = key_remapper(sd)
             missing_unexpected = actor_value_wrapper.load_state_dict(sd, strict=False)

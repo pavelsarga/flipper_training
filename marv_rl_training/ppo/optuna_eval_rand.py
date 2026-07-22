@@ -29,12 +29,12 @@ from omegaconf import OmegaConf
 from optuna.storages import RDBStorage
 from optuna.study import MaxTrialsCallback
 
-import flipper_training  # registers OmegaConf resolvers
+import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
-from flipper_training.experiments.ppo.common import make_transformed_env
+from marv_rl_training.ppo.common import make_transformed_env
 from marv_rl_training.ppo.train_ftr import FtrPPOConfig
-from flipper_training.utils.logutils import get_terminal_logger
-from flipper_training.utils.torch_utils import seed_all, set_device
+from marv_rl_training.utils.logutils import get_terminal_logger
+from marv_rl_training.utils.torch_utils import seed_all, set_device
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 import gymnasium

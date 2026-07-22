@@ -39,7 +39,7 @@ import torch
 import torch.nn as nn
 from tensordict.nn import TensorDictModule
 
-from flipper_training.policies import PolicyConfig
+from marv_rl_training.policies import PolicyConfig
 
 
 class _HeightmapActorModule(nn.Module):

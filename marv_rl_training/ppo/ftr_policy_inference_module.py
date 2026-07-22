@@ -29,10 +29,10 @@ from torchrl.data import Bounded
 from torchrl.envs import VecNorm
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-import flipper_training  # noqa: F401 — registers OmegaConf resolvers
+import marv_rl_training  # noqa: F401 — registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY
-from marv_rl_training.observations.ftr_flat_obs import FtrFlatObservation
-from flipper_training.utils.logutils import get_terminal_logger
+from marv_rl_training.utils.logutils import get_terminal_logger
+from rl_modules.marv_rl.marv_rl_flat_observation import MarvRLFlatObservation
 
 
 class _MinimalFtrEnv:
@@ -48,7 +48,7 @@ class _MinimalFtrEnv:
             device=device,
             dtype=torch.float32,
         )
-        self.observations = [FtrFlatObservation(env=self, encoder_opts=encoder_opts)]
+        self.observations = [MarvRLFlatObservation(env=self, encoder_opts=encoder_opts)]
 
 
 class FtrPolicyInferenceModule:

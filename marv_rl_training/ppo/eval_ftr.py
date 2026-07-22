@@ -95,9 +95,9 @@ import torch
 from omegaconf import OmegaConf
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-import flipper_training  # registers OmegaConf resolvers
+import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv, OBS_KEY
-from flipper_training.experiments.ppo.common import make_transformed_env
+from marv_rl_training.ppo.common import make_transformed_env
 from marv_rl_training.ppo.eval_data import (
     EpisodeRecord,
     PerSpotRow,
@@ -112,8 +112,8 @@ from marv_rl_training.ppo.eval_data import (
     save_eval_csvs,
 )
 from marv_rl_training.ppo.train_ftr import FtrPPOConfig
-from flipper_training.utils.logutils import get_terminal_logger
-from flipper_training.utils.torch_utils import seed_all, set_device
+from marv_rl_training.utils.logutils import get_terminal_logger
+from marv_rl_training.utils.torch_utils import seed_all, set_device
 
 import gymnasium
 
@@ -126,10 +126,10 @@ logger = get_terminal_logger("eval_ftr")
 
 
 def _remap_native_to_ftr_weights(state_dict: dict) -> dict:
-    """Remap native flipper_training encoder key names to FtrFlatObservation naming.
+    """Remap native flipper_training encoder key names to MarvRLFlatObservation naming.
 
     Native models have two separate observation encoders keyed by class name
-    (LocalStateVector, Heightmap).  FTR uses a single FtrFlatObservation with a
+    (LocalStateVector, Heightmap).  FTR uses a single MarvRLFlatObservation with a
     FtrFlipperStyleEncoder that has matching sub-modules under different names.
     Actor/critic MLP heads have identical paths and transfer without remapping.
     """
@@ -137,11 +137,11 @@ def _remap_native_to_ftr_weights(state_dict: dict) -> dict:
     for k, v in state_dict.items():
         k = k.replace(
             "encoders.LocalStateVector.mlp.mlp.",
-            "encoders.FtrFlatObservation.state_encoder.mlp.",
+            "encoders.MarvRLFlatObservation.state_encoder.mlp.",
         )
         k = k.replace(
             "encoders.Heightmap.encoder.",
-            "encoders.FtrFlatObservation.cnn.encoder.",
+            "encoders.MarvRLFlatObservation.cnn.encoder.",
         )
         remapped[k] = v
     return remapped

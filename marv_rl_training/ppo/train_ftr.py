@@ -58,11 +58,12 @@ from tqdm import tqdm
 
 import gymnasium
 
-import flipper_training  # registers OmegaConf resolvers
+import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
-from flipper_training.experiments.ppo.common import make_transformed_env
-from flipper_training.utils.logutils import RunLogger, get_terminal_logger
-from flipper_training.utils.torch_utils import seed_all, set_device
+from marv_rl_training.ppo.common import make_transformed_env
+from marv_rl_training.utils.cfg_schedulers import _make_cfg_scheduler
+from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
+from marv_rl_training.utils.torch_utils import seed_all, set_device
 
 
 
@@ -223,94 +224,6 @@ class FtrPPOConfig:
 
     log_raw_accel: bool = False
     log_raw_accel_interval: int = 50   # flush every N reward steps; 0 = only at run end
-
-
-class _BaseCfgScheduler:
-    """Base class for config attribute schedulers."""
-
-    def __init__(self, cfg, attr: str, init_value: float, start_factor: float = 1.0, end_factor: float = 0.0, total_iters: int = 1):
-        self._cfg = cfg
-        self._attr = attr
-        self._init = init_value
-        self._start_f = start_factor
-        self._end_f = end_factor
-        self._total = total_iters
-        self._step = 0
-        setattr(self._cfg, self._attr, self._init * self._start_f)
-
-    def step(self):
-        raise NotImplementedError
-
-    @property
-    def current_value(self) -> float:
-        return getattr(self._cfg, self._attr)
-
-    def state_dict(self) -> dict:
-        """Return scheduler state for checkpointing."""
-        return {"_step": self._step}
-
-    def load_state_dict(self, state_dict: dict):
-        """Restore scheduler state from checkpoint."""
-        self._step = state_dict.get("_step", 0)
-
-
-class _LinearCfgScheduler(_BaseCfgScheduler):
-    """Linearly anneals a float attribute on a config object, mirroring torch LinearLR semantics."""
-
-    def step(self):
-        self._step = min(self._step + 1, self._total)
-        factor = self._start_f + (self._end_f - self._start_f) * self._step / self._total
-        setattr(self._cfg, self._attr, self._init * factor)
-
-
-class _ExponentialCfgScheduler(_BaseCfgScheduler):
-    """Exponentially anneals a float attribute.
-
-    Factor decays as: start_factor * (end_factor / start_factor)^(step / total_iters)
-    Example: start_factor=1.0, end_factor=0.1, total_iters=1000
-    - step 0: factor = 1.0
-    - step 500: factor ≈ 0.316
-    - step 1000: factor = 0.1
-    """
-
-    def step(self):
-        self._step = min(self._step + 1, self._total)
-        # Exponential decay: avoid log(0) by clamping
-        if self._end_f <= 0 or self._start_f <= 0:
-            raise ValueError("Exponential scheduler requires start_factor and end_factor > 0")
-        # factor = start_f * (end_f / start_f)^(step / total)
-        exponent = self._step / self._total
-        factor = self._start_f * ((self._end_f / self._start_f) ** exponent)
-        setattr(self._cfg, self._attr, self._init * factor)
-
-
-def _make_cfg_scheduler(cfg, attr: str, init_value: float, sched_dict: dict, total_iters: int) -> _BaseCfgScheduler | None:
-    """Factory to create appropriate scheduler based on config dict.
-
-    Args:
-        cfg: Config object to mutate
-        attr: Attribute name to annealing
-        init_value: Initial value before scheduling
-        sched_dict: Dict with keys: type (linear/exponential), start_factor, end_factor, total_iters (optional)
-        total_iters: Default total iterations if not in sched_dict
-
-    Returns:
-        Scheduler instance or None if sched_dict is None
-    """
-    if sched_dict is None:
-        return None
-
-    sched_type = sched_dict.get("type", "linear").lower()
-    start_f = sched_dict.get("start_factor", 1.0)
-    end_f = sched_dict.get("end_factor", 0.0)
-    total_i = sched_dict.get("total_iters", total_iters)
-
-    if sched_type == "linear":
-        return _LinearCfgScheduler(cfg, attr, init_value, start_factor=start_f, end_factor=end_f, total_iters=total_i)
-    elif sched_type == "exponential":
-        return _ExponentialCfgScheduler(cfg, attr, init_value, start_factor=start_f, end_factor=end_f, total_iters=total_i)
-    else:
-        raise ValueError(f"Unknown scheduler type: {sched_type}. Choose from: linear, exponential")
 
 
 # ============================================================
@@ -1034,7 +947,7 @@ if __name__ == "__main__":
 
     if args.play is not None:
         # Visualisation-only: build env + policy, run forever in deterministic mode
-        from flipper_training.experiments.ppo.common import make_transformed_env
+        from marv_rl_training.ppo.common import make_transformed_env
         from torchrl.envs.utils import ExplorationType, set_exploration_type
 
         env = FtrTorchRLEnv(

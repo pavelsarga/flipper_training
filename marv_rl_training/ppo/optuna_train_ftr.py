@@ -29,10 +29,10 @@ from omegaconf import OmegaConf
 from optuna.storages import RDBStorage
 from optuna.study import MaxTrialsCallback
 
-import flipper_training  # registers OmegaConf resolvers
-from flipper_training import ROOT
+import marv_rl_training  # registers OmegaConf resolvers
+from marv_rl_training import ROOT
 from marv_rl_training.ppo.train_ftr import FtrPPOConfig, FtrPPOTrainer
-from flipper_training.utils.logutils import get_terminal_logger
+from marv_rl_training.utils.logutils import get_terminal_logger
 
 import gymnasium
 
