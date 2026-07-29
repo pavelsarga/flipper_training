@@ -70,10 +70,26 @@ class FtrTorchRLEnv(EnvBase):
         # actual per-step obs vector depends on which RLModule the underlying env is configured
         # with (ftr_env.cfg.module_name) — see rl_modules/registry.py.
         module_name = getattr(ftr_env.unwrapped.cfg, "module_name", "marv_rl")
-        if module_name == "pan_d3qn":
-            from rl_modules.pan_d3qn.pan_atd3qn_observation import PanATD3QNObservation
+        if module_name == "atd3qn":
+            from rl_modules.atd3qn.atd3qn_observation import ATD3QNObservation
 
-            self.observations = [PanATD3QNObservation(env=self, encoder_opts=encoder_opts)]
+            self.observations = [ATD3QNObservation(env=self, encoder_opts=encoder_opts)]
+        elif module_name == "icmd3qn":
+            from rl_modules.icmd3qn.icmd3qn_observation import ICMD3QNObservation
+
+            self.observations = [ICMD3QNObservation(env=self, encoder_opts=encoder_opts)]
+        elif module_name == "hfc":
+            from rl_modules.hfc.hfc_observation import HFCObservation
+
+            self.observations = [HFCObservation(env=self, encoder_opts=encoder_opts)]
+        elif module_name == "mitriakov":
+            from rl_modules.mitriakov.mitriakov_observation import MitriakovObservation
+
+            self.observations = [MitriakovObservation(env=self, encoder_opts=encoder_opts)]
+        elif module_name == "creps":
+            from rl_modules.creps.creps_observation import CREPSObservation
+
+            self.observations = [CREPSObservation(env=self, encoder_opts=encoder_opts)]
         else:
             from rl_modules.marv_rl.marv_rl_flat_observation import MarvRLFlatObservation
 
@@ -272,6 +288,10 @@ class FtrTorchRLEnv(EnvBase):
         self._per_env_failure.zero_()
         self._per_env_explosion.zero_()
         return result
+
+    def disable_per_env_tracking(self) -> None:
+        """Deactivate per-robot episode counters so regular training steps skip the bookkeeping."""
+        self._per_env_tracking = False
 
     def _set_seed(self, seed: int | None) -> None:
         pass  # FTR environments do not support external seeding via this API

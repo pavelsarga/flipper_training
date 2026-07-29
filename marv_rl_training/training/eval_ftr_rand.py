@@ -45,14 +45,15 @@ parser.add_argument(
          "Enables per-robot tracking via a manual step loop. If omitted, prints only (fast path).",
 )
 parser.add_argument(
-    "--num_env_types", type=int, default=16,
-    help="Number of distinct env types cycling across robots (default: 16 for cur_mixed).",
+    "--num_env_types", type=int, default=None,
+    help="Number of distinct env types cycling across robots. Default: looked up from the "
+         "terrain's registered layout (env_type_registry.py); 16 if the terrain is unregistered.",
 )
 parser.add_argument(
     "--env_names_yaml", type=str, default=None,
     metavar="YAML",
-    help="Path to YAML file mapping env-type index → name (list or dict). "
-         "Defaults to env_00…env_15.",
+    help="Path to YAML file mapping env-type index → name (list or dict), overriding the "
+         "terrain's registered default names.",
 )
 parser.add_argument(
     "--eval_id", type=str, default=None,
@@ -75,9 +76,11 @@ from omegaconf import OmegaConf
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 import marv_rl_training  # registers OmegaConf resolvers
-from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv, OBS_KEY
-from marv_rl_training.ppo.common import make_transformed_env
-from marv_rl_training.ppo.eval_data import (
+from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
+from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_type_registry import default_num_depth_cols, default_num_env_types
+from marv_rl_training.training.terrain_assets import write_terrain_manifest
+from marv_rl_training.training.eval_data import (
     EpisodeRecord,
     PerSpotRow,
     SummaryRow,
@@ -85,12 +88,12 @@ from marv_rl_training.ppo.eval_data import (
     _compute_obs_stats,
     aggregate_per_env,
     aggregate_per_spot,
-    env_type_depth_col_from_target,
     load_env_type_names,
     make_eval_id,
+    run_tracked_rollout,
     save_eval_csvs,
 )
-from marv_rl_training.ppo.train_ftr import FtrPPOConfig
+from marv_rl_training.training.train_ftr import FtrPPOConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
 
@@ -211,143 +214,6 @@ def _run_single_rollout(env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor,
     return results
 
 
-def _run_single_rollout_tracked(
-    env,
-    ftr_torchrl_env: FtrTorchRLEnv,
-    ftr_gym_env,
-    actor,
-    max_steps: int,
-    repeat: int,
-    eval_id: str,
-    policy_label: str,
-    terrain: str,
-    num_env_types: int,
-    env_type_names: list[str],
-    num_depth_cols: int = 10,
-) -> tuple[dict[str, float], list[EpisodeRecord]]:
-    """Manual step loop that records per-robot episode data for CSV export."""
-    device = ftr_torchrl_env.device
-    num_envs = ftr_torchrl_env.batch_size[0]
-    unwrapped = ftr_gym_env.unwrapped
-
-    robot_rewards = torch.zeros(num_envs, device=device)
-    robot_steps   = torch.zeros(num_envs, dtype=torch.long, device=device)
-    robot_ep_idx  = [0] * num_envs
-
-    obs_dim: int = ftr_torchrl_env.observations[0].dim
-    _obs_sum    = torch.zeros(obs_dim, device=device)
-    _obs_sq_sum = torch.zeros(obs_dim, device=device)
-    _obs_min    = torch.full((obs_dim,), float("inf"),  device=device)
-    _obs_max    = torch.full((obs_dim,), float("-inf"), device=device)
-    _obs_count  = 0
-
-    episode_records: list[EpisodeRecord] = []
-
-    total_step_reward_gpu = torch.zeros(1, device=device)
-    n_steps = 0
-
-    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
-        td = env.reset()
-        for _ in range(max_steps):
-            obs  = td[OBS_KEY].detach()
-            flat = obs.reshape(-1, obs_dim)
-            _obs_sum    += flat.sum(0)
-            _obs_sq_sum += flat.pow(2).sum(0)
-            _obs_min     = torch.minimum(_obs_min, flat.min(0).values)
-            _obs_max     = torch.maximum(_obs_max, flat.max(0).values)
-            _obs_count  += flat.shape[0]
-
-            # Snapshot positions before step: IsaacLab resets terminated robots
-            # inside env.step(), so reading positions after step gives the new
-            # start position rather than the terminal position.
-            _pos_snap = unwrapped.positions.clone()
-            _tgt_snap = unwrapped.target_positions.clone()
-
-            td = actor(td)
-            td = env.step(td)
-
-            rewards = td["next", "reward"].squeeze(-1)
-            dones   = td["next", "done"].squeeze(-1)
-
-            robot_rewards += rewards
-            robot_steps   += 1
-
-            total_step_reward_gpu += rewards.mean()  # accumulate on GPU, no sync per step
-            n_steps += 1
-
-            if dones.any():
-                per_env    = ftr_torchrl_env.pop_per_env_termination()
-                done_mask  = dones.cpu()
-                done_idx   = done_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
-                positions  = _pos_snap.cpu()
-                target_pos = _tgt_snap.cpu()
-                rew_cpu    = robot_rewards.cpu()
-                steps_cpu  = robot_steps.cpu()
-
-                for i in done_idx:
-                    counts = per_env.get(i, {})
-                    if counts.get("successes", 0) > 0:
-                        outcome = "success"
-                    elif counts.get("explosions", 0) > 0:
-                        outcome = "explosion"
-                    elif counts.get("failures", 0) > 0:
-                        outcome = "failure"
-                    else:
-                        outcome = "truncated"
-
-                    dist = float((target_pos[i, :2] - positions[i, :2]).norm().item())
-                    env_type_idx, depth_col = env_type_depth_col_from_target(
-                        float(target_pos[i, 0]), float(target_pos[i, 1]),
-                        num_env_types, num_depth_cols,
-                    )
-                    episode_records.append(EpisodeRecord(
-                        eval_id=eval_id,
-                        policy=policy_label,
-                        terrain=terrain,
-                        repeat=repeat,
-                        robot_idx=i,
-                        env_type_idx=env_type_idx,
-                        env_type_name=env_type_names[env_type_idx],
-                        depth_col=depth_col,
-                        episode_idx=robot_ep_idx[i],
-                        outcome=outcome,
-                        steps=int(steps_cpu[i].item()),
-                        cumulative_reward=float(rew_cpu[i].item()),
-                        dist_to_goal_final=dist,
-                    ))
-                    robot_rewards[i] = 0.0
-                    robot_steps[i]   = 0
-                    robot_ep_idx[i] += 1
-
-            if dones.all():
-                break
-            td = td["next"]
-
-    obs_stats: dict[str, float] = {}
-    if _obs_count > 0:
-        mean_gpu = _obs_sum / _obs_count
-        var  = (_obs_sq_sum / _obs_count - mean_gpu ** 2).clamp(min=0)
-        mean = mean_gpu.cpu()
-        std  = var.sqrt().cpu()
-        mn   = _obs_min.cpu()
-        mx   = _obs_max.cpu()
-        for name, s, e in _OBS_SLICES:
-            obs_stats[f"observations/{name}_mean"] = mean[s:e].mean().item()
-            obs_stats[f"observations/{name}_std"]  = std[s:e].mean().item()
-            obs_stats[f"observations/{name}_min"]  = mn[s:e].min().item()
-            obs_stats[f"observations/{name}_max"]  = mx[s:e].max().item()
-
-    results: dict[str, float] = {
-        "eval/mean_step_reward": total_step_reward_gpu.item() / max(n_steps, 1),
-        "eval/rollout_steps":    float(n_steps),
-    }
-    results.update(obs_stats)
-    term_info = ftr_torchrl_env.pop_termination_info()
-    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
-    results.update(ftr_torchrl_env.pop_reward_info())
-    return results, episode_records
-
-
 def _print_results(results: dict[str, float], header: str) -> None:
     print(f"\n{'=' * 60}")
     print(header)
@@ -373,7 +239,7 @@ def run_eval_rand(
     plot_heightmap: bool = False,
     plot_interval: int = 1,
     output_dir: "Path | None" = None,
-    num_env_types: int = 16,
+    num_env_types: "int | None" = None,
     env_names_yaml: "str | None" = None,
     eval_id: "str | None" = None,
 ) -> dict[str, float]:
@@ -410,13 +276,22 @@ def run_eval_rand(
     # CSV-output settings
     _output_dir = Path(output_dir) if output_dir else None
     _eval_id    = eval_id or make_eval_id()
-    _env_names  = load_env_type_names(env_names_yaml, num_env_types)
     _terrain    = cfg.terrain
+    num_env_types = num_env_types if num_env_types is not None else default_num_env_types(_terrain)
+    _env_names  = load_env_type_names(_terrain, env_names_yaml, num_env_types)
+    _depth_cols = default_num_depth_cols(_terrain)
     _policy_lbl = "random"
 
     if _output_dir:
         ftr_torchrl_env.enable_per_env_tracking()
         logger.info(f"Per-env tracking enabled → CSV output: {_output_dir}  eval_id={_eval_id}")
+        # Record the terrain (and copy its gen_config / preview plot) before the
+        # first rollout, so the results are self-describing even if eval crashes.
+        write_terrain_manifest(
+            _output_dir, _eval_id, _terrain, _env_names, _depth_cols, policy=_policy_lbl,
+        )
+        logger.info(f"Terrain '{_terrain}': {num_env_types} env types x {_depth_cols} depth cols "
+                    f"→ assets copied to {_output_dir}/terrain")
 
     all_results: list[dict[str, float]] = []
 
@@ -431,7 +306,7 @@ def run_eval_rand(
             )
             episode_records: list[EpisodeRecord] = []
         elif _output_dir:
-            results, episode_records = _run_single_rollout_tracked(
+            results, episode_records = run_tracked_rollout(
                 env, ftr_torchrl_env, ftr_gym_env, actor, max_steps,
                 repeat=r + 1,
                 eval_id=_eval_id,
@@ -479,7 +354,7 @@ def run_eval_rand(
             per_spot_rows = aggregate_per_spot(
                 episode_records=episode_records,
                 env_type_names=_env_names,
-                num_depth_cols=10,
+                num_depth_cols=_depth_cols,
                 eval_id=_eval_id,
                 policy=_policy_lbl,
                 terrain=_terrain,

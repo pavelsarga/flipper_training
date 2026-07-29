@@ -11,7 +11,7 @@ from marv_rl_training.utils.logutils import LocalRunReader, WandbRunReader
 
 if TYPE_CHECKING:
     from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
-    from marv_rl_training.ppo.train_ftr import FtrPPOConfig
+    from marv_rl_training.training.train_ftr import FtrPPOConfig
 
 
 def make_transformed_env(env: "FtrTorchRLEnv", train_config: "FtrPPOConfig", policy_transforms: list[Transform]) -> tuple[TransformedEnv, VecNorm]:

@@ -31,8 +31,8 @@ from optuna.study import MaxTrialsCallback
 
 import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
-from marv_rl_training.ppo.common import make_transformed_env
-from marv_rl_training.ppo.train_ftr import FtrPPOConfig
+from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.train_ftr import FtrPPOConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
 from torchrl.envs.utils import ExplorationType, set_exploration_type

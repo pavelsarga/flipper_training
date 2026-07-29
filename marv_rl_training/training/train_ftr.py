@@ -60,7 +60,15 @@ import gymnasium
 
 import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
-from marv_rl_training.ppo.common import make_transformed_env
+from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_type_registry import default_num_env_types
+from marv_rl_training.training.eval_data import (
+    aggregate_per_env,
+    aggregate_per_spot,
+    load_env_type_names,
+    run_tracked_rollout,
+    save_per_spot_csv,
+)
 from marv_rl_training.utils.cfg_schedulers import _make_cfg_scheduler
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
@@ -191,6 +199,12 @@ class FtrPPOConfig:
     ftr_obs_encoder_opts: dict[str, Any]
     save_weights_every: int = 0  # 0 = same as eval_and_save_every
     max_eval_steps: int = 0  # 0 = auto: 2 × max_episode_length derived from sim_dt
+    # Per-env-type breakdown of mid-training eval success rate — logged to wandb under the
+    # "eval_per_env" category. Per-(env-type, depth-col) "spot" breakdown is written to a
+    # local CSV only (eval_per_spot.csv in the run directory), never sent to wandb.
+    # None = looked up from the terrain's registered layout (env_type_registry.py).
+    eval_num_env_types: int | None = None
+    eval_env_names_yaml: str | None = None
     use_wandb: bool = False
     use_tensorboard: bool = False
     policy_weights_path: str | None = None
@@ -246,6 +260,9 @@ class FtrPPOTrainer:
             use_tensorboard=self.config.use_tensorboard,
             step_metric_name="collected_frames",
         )
+        self._eval_num_env_types = self.config.eval_num_env_types or default_num_env_types(self.config.terrain)
+        self._eval_env_type_names = load_env_type_names(self.config.terrain, self.config.eval_env_names_yaml, self._eval_num_env_types)
+        self._eval_per_spot_csv = self.run_logger.logpath / "eval_per_spot.csv"
         if self.optuna_trial is not None:
             self.optuna_trial.set_user_attr("logpath", str(self.run_logger.logpath))
         self.term_logger = get_terminal_logger("ftr_ppo_train")
@@ -654,7 +671,8 @@ class FtrPPOTrainer:
                 "action/w_mean":  actions[:, 1].mean().item(),
                 "action/w_std":   actions[:, 1].std().item(),
             }
-            flipper_names = ["fl", "fr", "rl", "rr"]
+            flipper_num = self.ftr_torchrl_env.ftr_env.unwrapped.flipper_num
+            flipper_names = ["fl", "fr", "rl", "rr"] if flipper_num == 4 else ["front", "rear"]
             for fi, fname in enumerate(flipper_names):
                 action_log[f"action/flipper_{fname}_mean"] = actions[:, 2 + fi].mean().item()
                 action_log[f"action/flipper_{fname}_std"]  = actions[:, 2 + fi].std().item()
@@ -772,23 +790,15 @@ class FtrPPOTrainer:
         self.env.eval()
         self.actor_operator.eval()
         max_eval_steps = self.config.max_eval_steps or (self.ftr_torchrl_env.ftr_env.unwrapped.max_episode_length * 2)
-        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
-            eval_rollout = self.env.rollout(
-                max_eval_steps,
-                self.actor_operator,
-                break_when_all_done=True,
-                auto_reset=True,
-            )
-        results = {
-            "eval/mean_step_reward": eval_rollout["next", "reward"].mean().item(),
-            "eval/max_step_reward": eval_rollout["next", "reward"].max().item(),
-            "eval/min_step_reward": eval_rollout["next", "reward"].min().item(),
-            "eval/pct_terminated": eval_rollout["next", "terminated"].float().mean().item(),
-            "eval/pct_truncated": eval_rollout["next", "truncated"].float().mean().item(),
-        }
-        del eval_rollout
-        results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in self.ftr_torchrl_env.pop_termination_info().items()})
-        _eval_reward_info = self.ftr_torchrl_env.pop_reward_info()
+        self.ftr_torchrl_env.enable_per_env_tracking()
+        results, episode_records = run_tracked_rollout(
+            self.env, self.ftr_torchrl_env, self.ftr_torchrl_env.ftr_env, self.actor_operator, max_eval_steps,
+            num_env_types=self._eval_num_env_types,
+            env_type_names=self._eval_env_type_names,
+            terrain=self.config.terrain,
+        )
+        self.ftr_torchrl_env.disable_per_env_tracking()
+        _eval_reward_info = {k: results.pop(k) for k in list(results) if k.startswith("rew/") or k.startswith("shock/")}
         _shock_keys = (
             "shock/accel_magnitude", "shock/shock_normalised",
             "shock/accel_p90", "shock/accel_p95", "shock/accel_p99",
@@ -797,6 +807,22 @@ class FtrPPOTrainer:
         for _shock_key in _shock_keys:
             if _shock_key in _eval_reward_info:
                 results[f"eval/{_shock_key.split('/', 1)[1]}"] = _eval_reward_info[_shock_key]
+
+        if episode_records:
+            per_env_rows = aggregate_per_env(
+                episode_records=episode_records, env_type_names=self._eval_env_type_names,
+                eval_id="train", policy=self.run_logger.run_name, terrain=self.config.terrain,
+                repeat=1, obs_stats=results,
+            )
+            for row in per_env_rows:
+                results[f"eval_per_env/{row.env_type_name}_success_rate"] = row.success_rate
+
+            per_spot_rows = aggregate_per_spot(
+                episode_records=episode_records, env_type_names=self._eval_env_type_names,
+                num_depth_cols=10, eval_id="train", policy=self.run_logger.run_name,
+                terrain=self.config.terrain, repeat=1,
+            )
+            save_per_spot_csv(self._eval_per_spot_csv, per_spot_rows)
         return results
 
     def _post_training_evaluation(self) -> dict[str, float]:
@@ -947,7 +973,7 @@ if __name__ == "__main__":
 
     if args.play is not None:
         # Visualisation-only: build env + policy, run forever in deterministic mode
-        from marv_rl_training.ppo.common import make_transformed_env
+        from marv_rl_training.training.common import make_transformed_env
         from torchrl.envs.utils import ExplorationType, set_exploration_type
 
         env = FtrTorchRLEnv(

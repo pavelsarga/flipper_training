@@ -60,12 +60,20 @@ import gymnasium
 
 import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
-from marv_rl_training.ppo.common import make_transformed_env
-from marv_rl_training.utils.cfg_schedulers import _LinearCfgScheduler, _make_cfg_scheduler
+from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_type_registry import default_num_env_types
+from marv_rl_training.training.eval_data import (
+    aggregate_per_env,
+    aggregate_per_spot,
+    load_env_type_names,
+    run_tracked_rollout,
+    save_per_spot_csv,
+)
+from marv_rl_training.utils.cfg_schedulers import _LinearCfgScheduler
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
 
-from rl_modules.pan_d3qn.pan_atd3qn_policy import PanATD3QNPolicy
+from rl_modules.atd3qn.atd3qn_policy import ATD3QNPolicy
 
 
 # ============================================================
@@ -116,23 +124,27 @@ class FtrD3QNConfig:
     scheduler: type
     scheduler_opts: dict[str, Any]
     data_collector_opts: dict[str, Any]
-    policy_opts: dict[str, Any]         # PanATD3QNPolicy kwargs (track_vel, hm_hidden, hm_out, fusion_hidden, ...)
+    policy_opts: dict[str, Any]         # ATD3QNPolicy kwargs (track_vel, hm_hidden, hm_out, fusion_hidden, ...)
     vecnorm_opts: dict[str, Any]
     vecnorm_on_reward: bool
     ftr_obs_encoder_opts: dict[str, Any]
     save_weights_every: int = 0  # 0 = same as eval_and_save_every
     max_eval_steps: int = 0  # 0 = auto: 2 x max_episode_length derived from sim_dt
+    # Per-env-type breakdown of mid-training eval success rate — logged to wandb under the
+    # "eval_per_env" category. Per-(env-type, depth-col) "spot" breakdown is written to a
+    # local CSV only (eval_per_spot.csv in the run directory), never sent to wandb.
+    # None = looked up from the terrain's registered layout (env_type_registry.py).
+    eval_num_env_types: int | None = None
+    eval_env_names_yaml: str | None = None
     use_wandb: bool = False
     use_tensorboard: bool = False
     policy_weights_path: str | None = None
     vecnorm_weights_path: str | None = None
     extra_env_transforms: list = field(default_factory=list)
     # Env config overrides applied via setattr before env creation.
-    # Must include `module_name: pan_d3qn` so FtrEnv computes Pan's 19-D obs/reward
-    # (see rl_modules/registry.py) and FtrTorchRLEnv picks the matching PanATD3QNObservation.
+    # Must include `module_name: atd3qn` so FtrEnv computes ATD3QN's 19-D obs/reward
+    # (see rl_modules/registry.py) and FtrTorchRLEnv picks the matching ATD3QNObservation.
     env_cfg_overrides: dict = field(default_factory=dict)
-    step_penalty_scheduler: dict | None = None
-    action_bonus_coef_scheduler: dict | None = None
     # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
     sim_dt: float = 1 / 400
     decimation: int = 5
@@ -157,11 +169,11 @@ class FtrD3QNConfig:
 class FtrD3QNTrainer:
     """Off-policy Double-Dueling DQN (AT-D3QN, Pan et al. 2023) trainer for FTR-Benchmark.
 
-    Structurally mirrors FtrPPOTrainer (same env setup, RunLogger, crash-recovery,
-    step_penalty/action_bonus schedulers — via the shared marv_rl_training.utils.cfg_schedulers
-    module) but swaps the on-policy GAE/ClipPPOLoss training loop for a replay buffer +
-    target network + epsilon-greedy TD loop, since D3QN is off-policy value-based rather
-    than actor-critic.
+    Structurally mirrors FtrPPOTrainer (same env setup, RunLogger, crash-recovery) but
+    swaps the on-policy GAE/ClipPPOLoss training loop for a replay buffer + target network
+    + epsilon-greedy TD loop, since D3QN is off-policy value-based rather than actor-critic.
+    No step_penalty/action_bonus schedulers here: neither is read by
+    ATD3QNModule.get_reward_components() at all.
     """
 
     def __init__(self, raw_config: "DictConfig", ftr_gym_env: gymnasium.Env, optuna_trial=None):
@@ -177,6 +189,9 @@ class FtrD3QNTrainer:
             use_tensorboard=self.config.use_tensorboard,
             step_metric_name="collected_frames",
         )
+        self._eval_num_env_types = self.config.eval_num_env_types or default_num_env_types(self.config.terrain)
+        self._eval_env_type_names = load_env_type_names(self.config.terrain, self.config.eval_env_names_yaml, self._eval_num_env_types)
+        self._eval_per_spot_csv = self.run_logger.logpath / "eval_per_spot.csv"
         if self.optuna_trial is not None:
             self.optuna_trial.set_user_attr("logpath", str(self.run_logger.logpath))
         self.term_logger = get_terminal_logger("ftr_d3qn_train")
@@ -192,7 +207,7 @@ class FtrD3QNTrainer:
         self.env = self.ftr_torchrl_env
 
         # ---- policy (Q-network + epsilon-greedy action decode) ----
-        self.policy = PanATD3QNPolicy(epsilon=self.config.epsilon_start, **self.config.policy_opts).to(self.device)
+        self.policy = ATD3QNPolicy(epsilon=self.config.epsilon_start, **self.config.policy_opts).to(self.device)
         if self.config.policy_weights_path is not None:
             self.policy.q_network.load_state_dict(
                 torch.load(self.config.policy_weights_path, map_location=self.device), strict=False
@@ -251,26 +266,6 @@ class FtrD3QNTrainer:
             end_factor=(self.config.epsilon_end / self.config.epsilon_start) if self.config.epsilon_start > 0 else 0.0,
             total_iters=self.config.epsilon_decay_iters or _total_iters,
         )
-
-        # ---- step_penalty scheduler ----
-        _sp_init = self.config.env_cfg_overrides.get("step_penalty")
-        _sp_sched = self.config.step_penalty_scheduler
-        if _sp_sched is not None and _sp_init is not None:
-            self.step_penalty_scheduler = _make_cfg_scheduler(
-                self.ftr_torchrl_env.ftr_env.unwrapped.cfg, "step_penalty", _sp_init, _sp_sched, _total_iters,
-            )
-        else:
-            self.step_penalty_scheduler = None
-
-        # ---- action_bonus_coef scheduler ----
-        _abc_init = self.config.env_cfg_overrides.get("action_bonus_coef")
-        _abc_sched = self.config.action_bonus_coef_scheduler
-        if _abc_sched is not None and _abc_init is not None:
-            self.action_bonus_scheduler = _make_cfg_scheduler(
-                self.ftr_torchrl_env.ftr_env.unwrapped.cfg, "action_bonus_coef", _abc_init, _abc_sched, _total_iters,
-            )
-        else:
-            self.action_bonus_scheduler = None
 
         self._grad_steps = 0
         self.term_logger.info("Initialized FtrD3QNTrainer.")
@@ -333,10 +328,6 @@ class FtrD3QNTrainer:
             "epsilon_scheduler_state_dict": self.epsilon_scheduler.state_dict(),
             "grad_steps": self._grad_steps,
         }
-        if self.step_penalty_scheduler is not None:
-            checkpoint["step_penalty_scheduler_state_dict"] = self.step_penalty_scheduler.state_dict()
-        if self.action_bonus_scheduler is not None:
-            checkpoint["action_bonus_scheduler_state_dict"] = self.action_bonus_scheduler.state_dict()
         self.run_logger.save_weights(checkpoint, "training_state")
 
     def _load_training_checkpoint(self):
@@ -358,10 +349,6 @@ class FtrD3QNTrainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             if "epsilon_scheduler_state_dict" in checkpoint:
                 self.epsilon_scheduler.load_state_dict(checkpoint["epsilon_scheduler_state_dict"])
-            if "step_penalty_scheduler_state_dict" in checkpoint and self.step_penalty_scheduler is not None:
-                self.step_penalty_scheduler.load_state_dict(checkpoint["step_penalty_scheduler_state_dict"])
-            if "action_bonus_scheduler_state_dict" in checkpoint and self.action_bonus_scheduler is not None:
-                self.action_bonus_scheduler.load_state_dict(checkpoint["action_bonus_scheduler_state_dict"])
             self._grad_steps = checkpoint.get("grad_steps", 0)
             self.term_logger.info(
                 f"Loaded training checkpoint: resuming from iteration {checkpoint['iteration']}, "
@@ -531,12 +518,6 @@ class FtrD3QNTrainer:
 
             self.scheduler.step()
             self.epsilon_scheduler.step()
-            if self.step_penalty_scheduler is not None:
-                self.step_penalty_scheduler.step()
-            _sp_current = self.step_penalty_scheduler.current_value if self.step_penalty_scheduler is not None else self.config.env_cfg_overrides.get("step_penalty")
-            if self.action_bonus_scheduler is not None:
-                self.action_bonus_scheduler.step()
-            _abc_current = self.action_bonus_scheduler.current_value if self.action_bonus_scheduler is not None else self.config.env_cfg_overrides.get("action_bonus_coef")
 
             log = {
                 **action_log,
@@ -546,8 +527,6 @@ class FtrD3QNTrainer:
                 "train/mean_reward": rollout_mean_reward,
                 "train/epsilon": self.policy.epsilon,
                 "train/replay_buffer_size": len(self.replay_buffer),
-                "train/step_penalty": _sp_current if _sp_current is not None else 0.0,
-                "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
                 **{f"train/{g.get('name', 'q_network')}_lr": g["lr"] for g in self.optim.param_groups},
                 "explosions/dirty_transitions": n_dirty,
                 **{f"train/{k}": v for k, v in update_log.items()},
@@ -594,25 +573,33 @@ class FtrD3QNTrainer:
 
     def _get_eval_rollout_results(self) -> dict[str, float]:
         self.env.eval()
-        self.policy.eval()  # disables epsilon-greedy exploration (see PanATD3QNPolicy.forward)
+        self.policy.eval()  # disables epsilon-greedy exploration (see ATD3QNPolicy.forward)
         max_eval_steps = self.config.max_eval_steps or (self.ftr_torchrl_env.ftr_env.unwrapped.max_episode_length * 2)
-        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
-            eval_rollout = self.env.rollout(
-                max_eval_steps,
-                self.policy_operator,
-                break_when_all_done=True,
-                auto_reset=True,
+        self.ftr_torchrl_env.enable_per_env_tracking()
+        results, episode_records = run_tracked_rollout(
+            self.env, self.ftr_torchrl_env, self.ftr_torchrl_env.ftr_env, self.policy_operator, max_eval_steps,
+            num_env_types=self._eval_num_env_types,
+            env_type_names=self._eval_env_type_names,
+            terrain=self.config.terrain,
+        )
+        self.ftr_torchrl_env.disable_per_env_tracking()
+        self._eval_reward_info = {k: results.pop(k) for k in list(results) if k.startswith("rew/") or k.startswith("shock/")}
+
+        if episode_records:
+            per_env_rows = aggregate_per_env(
+                episode_records=episode_records, env_type_names=self._eval_env_type_names,
+                eval_id="train", policy=self.run_logger.run_name, terrain=self.config.terrain,
+                repeat=1, obs_stats=results,
             )
-        results = {
-            "eval/mean_step_reward": eval_rollout["next", "reward"].mean().item(),
-            "eval/max_step_reward": eval_rollout["next", "reward"].max().item(),
-            "eval/min_step_reward": eval_rollout["next", "reward"].min().item(),
-            "eval/pct_terminated": eval_rollout["next", "terminated"].float().mean().item(),
-            "eval/pct_truncated": eval_rollout["next", "truncated"].float().mean().item(),
-        }
-        del eval_rollout
-        results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in self.ftr_torchrl_env.pop_termination_info().items()})
-        self._eval_reward_info = self.ftr_torchrl_env.pop_reward_info()
+            for row in per_env_rows:
+                results[f"eval_per_env/{row.env_type_name}_success_rate"] = row.success_rate
+
+            per_spot_rows = aggregate_per_spot(
+                episode_records=episode_records, env_type_names=self._eval_env_type_names,
+                num_depth_cols=10, eval_id="train", policy=self.run_logger.run_name,
+                terrain=self.config.terrain, repeat=1,
+            )
+            save_per_spot_csv(self._eval_per_spot_csv, per_spot_rows)
         return results
 
     def _post_training_evaluation(self) -> dict[str, float]:
@@ -720,8 +707,8 @@ if __name__ == "__main__":
     env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
     env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
 
-    # Must set module_name: pan_d3qn here (via env_cfg_overrides in the yaml) so FtrEnv
-    # routes observations/rewards through PanD3QNModule instead of the default marv_rl one.
+    # Must set module_name: atd3qn here (via env_cfg_overrides in the yaml) so FtrEnv
+    # routes observations/rewards through ATD3QNModule instead of the default marv_rl one.
     for k, v in (_cfg.env_cfg_overrides or {}).items():
         setattr(env_cfg, k, v)
 
@@ -734,7 +721,7 @@ if __name__ == "__main__":
             device=_cfg.device,
             shock_scale=_cfg.env_cfg_overrides.get("shock_scale"),
         )
-        policy = PanATD3QNPolicy(epsilon=0.0, **_cfg.policy_opts).to(_cfg.device)
+        policy = ATD3QNPolicy(epsilon=0.0, **_cfg.policy_opts).to(_cfg.device)
         policy.q_network.load_state_dict(torch.load(_cfg.policy_weights_path, map_location=_cfg.device), strict=False)
         policy_operator = TensorDictModule(policy, in_keys=[OBS_KEY], out_keys=["action", "action_idx"])
         env, vecnorm = make_transformed_env(env, _cfg, policy_transforms=[])
