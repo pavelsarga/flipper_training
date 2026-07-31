@@ -90,6 +90,10 @@ class FtrTorchRLEnv(EnvBase):
             from rl_modules.creps.creps_observation import CREPSObservation
 
             self.observations = [CREPSObservation(env=self, encoder_opts=encoder_opts)]
+        elif module_name == "ctrac":
+            from rl_modules.ctrac.ctrac_observation import CTRACObservation
+
+            self.observations = [CTRACObservation(env=self, encoder_opts=encoder_opts)]
         else:
             from rl_modules.marv_rl.marv_rl_flat_observation import MarvRLFlatObservation
 

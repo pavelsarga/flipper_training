@@ -70,6 +70,15 @@ class CurMixedLayout:
     Rows 0-14 are cur_mixed.usd's obstacle rows (Y ≈ 23.3 … -21.5); row 15 is a
     separate flat_patch.usd placed adjacent to cur_mixed's +X edge (X≈28-34),
     hence the special-cased flat-patch branch below instead of a uniform grid.
+
+    Note both axes count DOWN (env type rises as Y falls, depth col as X falls).
+    That is not arbitrary: config/cur_mixed.yaml sets xformOp:orient to
+    [0, 0, 0, 1.0], which terrain.py applies as Gf.Quatd(w=0, xyz=(0,0,1)) — a 180
+    degree rotation about Z. These constants were measured against the terrain as
+    actually loaded, so they already absorb that rotation and report the obstacle
+    the robot is physically on. cur_mixed's .map is consistent with the same
+    (rotated) frame, so its heightmap observations line up too. Don't "fix" that
+    orient without re-measuring these numbers.
     """
 
     env_type_names: list[str] = field(default_factory=lambda: [
