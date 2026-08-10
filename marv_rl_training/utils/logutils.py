@@ -227,7 +227,12 @@ class RunLogger:
         self.log_queue.put((step, row))
 
     def _write_row(self, row: dict[str, Any], step: int):
-        for topic, names in groupby(row.items(), key=lambda x: x[0].rsplit("/", maxsplit=1)[0]):
+        # groupby only merges CONSECUTIVE same-key items, so a row whose same-topic keys
+        # aren't contiguous (e.g. run_tracked_rollout returns eval/* then observations/*
+        # then more eval/*) would emit several half-populated rows per step for that topic.
+        # Sorting by topic first is stable, so column order within a topic is unchanged.
+        topic_of = lambda kv: kv[0].rsplit("/", maxsplit=1)[0]  # noqa: E731
+        for topic, names in groupby(sorted(row.items(), key=topic_of), key=topic_of):
             topic_row = dict(names)
             writer = self.writers.get(topic, None) or self._init_logfile(topic, topic_row)
             # Handle new fields not in original fieldnames by extending the writer

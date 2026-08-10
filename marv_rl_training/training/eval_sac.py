@@ -235,6 +235,25 @@ if __name__ == "__main__":
     env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
     env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
     env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
+
+    # Scale down GPU PhysX buffers for small env counts (e.g. local eval on laptop GPUs) —
+    # mirrors eval_ftr.py's own scaling exactly. FTR_SIM_CFG's defaults are sized for 4096
+    # envs on server GPUs; requesting that scale of PhysX GPU buffers on an 8 GB laptop
+    # card is what was actually causing "Failed to create simulation view: no active
+    # physics scene found" locally — confirmed by direct comparison against eval_ftr.py,
+    # which already has this scaling and works fine locally at small env counts, while
+    # eval_sac.py (missing it entirely) failed even at num_envs=4. Not a ContactSensor,
+    # terrain, or SAC-specific issue — this scaling was simply never carried over from
+    # eval_ftr.py's reference pattern into any of the ctrac scripts.
+    if _cfg.num_robots <= 64:
+        env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
+        env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
+        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
+        env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
+        env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
+    elif _cfg.num_robots > 512:
+        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
+
     for k, v in (_cfg.env_cfg_overrides or {}).items():
         setattr(env_cfg, k, v)
 

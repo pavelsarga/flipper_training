@@ -24,6 +24,18 @@ from rl_modules.ctrac.ctrac_observation import CONTACT_POINTS_OFFSET, CONTACT_PR
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 _log = logging.getLogger("pretrain_ctrac_cvae")
 
+# See collect_ctrac_dataset.py's copy of this: the SLURM .sbatch does `cd $WS` on the host,
+# but $WS doesn't exist inside the apptainer container (only the /ws bind does), so cwd is
+# not a reliable base for relative config paths. Resolve them against the workspace root
+# instead, which is /ws in the container and the checkout root locally.
+_WS_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _resolve_ws_path(p: str) -> Path:
+    """Absolute paths pass through; relative ones resolve against the workspace root."""
+    path = Path(p)
+    return path if path.is_absolute() else _WS_ROOT / path
+
 
 @dataclass
 class CTRACCVAEPretrainConfig:
@@ -31,11 +43,18 @@ class CTRACCVAEPretrainConfig:
     comment: str
     seed: int
     device: str
-    dataset_path: str
+    dataset_path: str        # a directory of shard_*.pt files (collect_ctrac_dataset.py's
+                              # output_path), or a single legacy .pt file
     output_path: str
     total_steps: int
     batch_size: int
     history_len: int
+    # Caps how many transitions get loaded into RAM at once, regardless of how large the
+    # collected dataset on disk is — shards beyond this budget are proportionally
+    # subsampled rather than dropped, so the loaded set still spans the whole collection
+    # run (not just the first few shards). None = load everything (fine for small/legacy
+    # single-file datasets, risky for a large sharded collection run).
+    max_dataset_rows: "int | None" = 2_000_000
     latent_dim: int = 32
     encoder_hidden: tuple = (512, 256, 128)
     decoder_hidden: tuple = (128, 256, 128)
@@ -58,12 +77,92 @@ def _load_raw_config(config_path: str, cli_overrides: list[str]):
     return parsed
 
 
+def _load_dataset(dataset_path: str, max_rows: "int | None"):
+    """Loads either a directory of collect_ctrac_dataset.py shard_*.pt files or a single
+    legacy .pt file. If max_rows is set and the on-disk total exceeds it, each shard is
+    proportionally subsampled (not just the first N shards) so the loaded set still spans
+    the whole collection run rather than only its earliest episodes.
+
+    Two passes over the shards, BOTH using torch.load(..., mmap=True): a memory-mapped
+    load only pages in the bytes actually touched, so Pass 1 (reading .shape[0] to size
+    things) costs next to nothing regardless of how big any individual shard file is —
+    this matters because two prior fixes at this OOM (accumulate-then-cat, then a
+    pre-allocated-but-still-fully-materialized reload) both still assumed shard sizes in
+    the ~1 GB range; if the dataset on disk doesn't actually match that assumption (e.g. a
+    collection run from before shard_size_steps/log_every_n_steps existed, one giant
+    single-file "shard"), a plain torch.load() of even ONE such file can OOM outright
+    before this function logs anything. Pass 2 copies each shard's (possibly subsampled)
+    rows into a PRE-ALLOCATED destination tensor sized to the final row count — with mmap,
+    only the copied bytes get paged in, so peak RAM is bounded by max_rows (the
+    destination) plus whatever fraction of the current shard is actually being copied,
+    not by shard size at all.
+    """
+    p = _resolve_ws_path(dataset_path)
+    if p.is_dir():
+        shard_paths = sorted(p.glob("shard_*.pt"))
+        if not shard_paths:
+            raise FileNotFoundError(f"No shard_*.pt files found in {p}")
+    else:
+        shard_paths = [p]
+    _log.info(f"Found {len(shard_paths)} shard file(s) under {dataset_path}.")
+
+    # Pass 1: shard sizes only (mmap — doesn't materialize tensor data).
+    shard_sizes = []
+    for i, sp in enumerate(shard_paths):
+        n_rows = torch.load(sp, map_location="cpu", mmap=True)["obs"].shape[0]
+        shard_sizes.append(n_rows)
+        _log.info(f"  shard {i + 1}/{len(shard_paths)} ({sp.name}): {n_rows} rows")
+    total_rows = sum(shard_sizes)
+
+    if max_rows is not None and total_rows > max_rows:
+        keep_fraction = max_rows / total_rows
+        keep_counts = [max(1, round(n * keep_fraction)) for n in shard_sizes]
+        _log.info(f"Dataset has {total_rows} transitions across {len(shard_paths)} shards; "
+                  f"subsampling to ~{sum(keep_counts)} (keep_fraction={keep_fraction:.4f}).")
+    else:
+        keep_counts = shard_sizes
+
+    final_n = sum(keep_counts)
+    first_shard = torch.load(shard_paths[0], map_location="cpu", mmap=True)
+    obs_history_shape, obs_history_dtype = first_shard["obs_history"].shape[1:], first_shard["obs_history"].dtype
+    obs_shape, obs_dtype = first_shard["obs"].shape[1:], first_shard["obs"].dtype
+    next_obs_shape, next_obs_dtype = first_shard["next_obs"].shape[1:], first_shard["next_obs"].dtype
+    del first_shard
+
+    row_bytes = (torch.Size(obs_history_shape).numel() * obs_history_dtype.itemsize
+                 + torch.Size(obs_shape).numel() * obs_dtype.itemsize
+                 + torch.Size(next_obs_shape).numel() * next_obs_dtype.itemsize)
+    _log.info(f"Allocating destination tensors for {final_n} rows (~{final_n * row_bytes / 1e9:.2f} GB).")
+
+    obs_history_out = torch.empty(final_n, *obs_history_shape, dtype=obs_history_dtype)
+    obs_out = torch.empty(final_n, *obs_shape, dtype=obs_dtype)
+    next_obs_out = torch.empty(final_n, *next_obs_shape, dtype=next_obs_dtype)
+
+    # Pass 2: reload each shard (mmap'd, one at a time), copy its (subsampled) rows in.
+    cursor = 0
+    for i, (sp, n_rows, keep_n) in enumerate(zip(shard_paths, shard_sizes, keep_counts)):
+        shard = torch.load(sp, map_location="cpu", mmap=True)
+        if keep_n < n_rows:
+            idx = torch.randperm(n_rows)[:keep_n]
+            obs_history_out[cursor:cursor + keep_n] = shard["obs_history"][idx]
+            obs_out[cursor:cursor + keep_n] = shard["obs"][idx]
+            next_obs_out[cursor:cursor + keep_n] = shard["next_obs"][idx]
+        else:
+            obs_history_out[cursor:cursor + keep_n] = shard["obs_history"]
+            obs_out[cursor:cursor + keep_n] = shard["obs"]
+            next_obs_out[cursor:cursor + keep_n] = shard["next_obs"]
+        cursor += keep_n
+        del shard
+        _log.info(f"  loaded shard {i + 1}/{len(shard_paths)} ({cursor}/{final_n} rows so far)")
+
+    return obs_history_out, obs_out, next_obs_out
+
+
 def train(cfg: CTRACCVAEPretrainConfig) -> None:
     torch.manual_seed(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu")
 
-    dataset = torch.load(cfg.dataset_path, map_location="cpu")
-    obs_history, obs, next_obs = dataset["obs_history"], dataset["obs"], dataset["next_obs"]
+    obs_history, obs, next_obs = _load_dataset(cfg.dataset_path, cfg.max_dataset_rows)
     n = obs.shape[0]
     _log.info(f"Loaded {n} transitions from {cfg.dataset_path}")
 
@@ -74,7 +173,7 @@ def train(cfg: CTRACCVAEPretrainConfig) -> None:
     ).to(device)
     optim = cfg.optimizer(cvae.parameters(), **(cfg.optimizer_opts or {}))
 
-    out_path = Path(cfg.output_path)
+    out_path = _resolve_ws_path(cfg.output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     pbar = tqdm(range(cfg.total_steps), desc="C-VAE pretraining", unit="step")

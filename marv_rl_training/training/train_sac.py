@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 
 import torch
 from omegaconf import OmegaConf
-from torchrl.data import LazyTensorStorage, RandomSampler, TensorDictReplayBuffer
+from torchrl.data import LazyMemmapStorage, RandomSampler, TensorDictReplayBuffer
 from torchrl.collectors import SyncDataCollector
 from torchrl.objectives import SACLoss, SoftUpdate, ValueEstimators
 from tqdm import tqdm
@@ -136,7 +136,10 @@ class FtrSACConfig:
     data_collector_opts: dict[str, Any] = field(default_factory=dict)
     policy_opts: dict[str, Any] = field(default_factory=dict)   # CTRACPolicyConfig kwargs
     vecnorm_opts: dict[str, Any] = field(default_factory=dict)
-    vecnorm_on_reward: bool = True
+    # Default False, unlike the PPO/D3QN trainers: SAC's actor loss is alpha*log_pi - Q with
+    # alpha fixed at the paper's 1.5, so normalising the reward rescales Q out from under a
+    # constant alpha and the entropy term takes over (see marv_config_ctrac.yaml's comment).
+    vecnorm_on_reward: bool = False
     ftr_obs_encoder_opts: dict[str, Any] = field(default_factory=dict)
 
     save_weights_every: int = 0
@@ -281,8 +284,32 @@ class FtrSACTrainer:
             self.env, self.policy_operator, frames_per_batch=iteration_size,
             total_frames=self.config.total_frames, **self.config.data_collector_opts, device=self.device,
         )
+        # LazyMemmapStorage (disk-backed, OS page cache) instead of LazyTensorStorage
+        # (fully RAM-resident) — a CTRAC transition is unusually heavy vs. every other
+        # module's replay buffer in this project: the packed observation (1227-dim,
+        # dominated by the 960-cell privileged heightmap) is stored TWICE per transition
+        # (obs + next_obs) plus an (8, 251) obs_history array needed so the C-VAE can be
+        # trained on replayed, temporally-correct history windows (see CTRACActorNet's
+        # docstring) — roughly 17.9 KB/transition. At replay_buffer_capacity's full size
+        # that's tens of GB held entirely in RAM with LazyTensorStorage, which OOM-killed a
+        # real training run (confirmed: throughput degraded steadily from ~1200 to ~500
+        # frames/s over 37 minutes before the kill, the classic memory-growth/thrashing
+        # signature, dying right around when the buffer neared capacity) — D3QN/PPO's
+        # much smaller, single-obs, no-history transitions never hit this at the same
+        # nominal capacity, which is why replay_buffer_capacity was copied from those
+        # configs without anyone (including this) reconsidering the per-transition size.
         self.replay_buffer = TensorDictReplayBuffer(
-            storage=LazyTensorStorage(max_size=self.config.replay_buffer_capacity, ndim=1, device="cpu"),
+            storage=LazyMemmapStorage(
+                max_size=self.config.replay_buffer_capacity, ndim=1,
+                scratch_dir=str(self.run_logger.logpath / "replay_buffer"),
+                # train_ctrac.sbatch's respawn loop re-invokes this script fresh after a
+                # crash, reusing the same attempt/logpath — existsok=True so a scratch dir
+                # left over from the killed attempt doesn't itself crash the respawn
+                # (the replay buffer restarting empty after a respawn is expected/fine,
+                # same as this project's other off-policy trainers never persisting it
+                # across crash-restarts either).
+                existsok=True,
+            ),
             sampler=RandomSampler(), batch_size=self.config.batch_size,
         )
 
@@ -460,11 +487,18 @@ class FtrSACTrainer:
             if self.cvae_scheduler is not None:
                 self.cvae_scheduler.step()
 
+            # Key order matters: RunLogger._write_row groups a row's keys by topic (the
+            # prefix before the last "/") via itertools.groupby, which only merges
+            # CONSECUTIVE same-topic keys rather than sorting first. Putting
+            # "explosions/dirty_transitions" between the two "train/*" runs below would
+            # split them into two non-adjacent groups -> two half-populated rows per step
+            # in train.csv (same underlying bug fixed in _get_eval_rollout_results for
+            # eval.csv) — all "train/*" keys must stay contiguous.
             log = {
                 **action_log,
                 **self.ftr_torchrl_env.pop_reward_info(), **self.ftr_torchrl_env.pop_termination_info(), **self.ftr_torchrl_env.pop_state_stats(),
-                "train/mean_reward": rollout_mean_reward, "train/replay_buffer_size": len(self.replay_buffer),
                 "explosions/dirty_transitions": n_dirty,
+                "train/mean_reward": rollout_mean_reward, "train/replay_buffer_size": len(self.replay_buffer),
                 **{f"train/{k}": v for k, v in sac_log.items()}, **{f"train/{k}": v for k, v in cvae_log.items()},
             }
 
@@ -515,7 +549,18 @@ class FtrSACTrainer:
             num_env_types=self._eval_num_env_types, env_type_names=self._eval_env_type_names, terrain=self.config.terrain,
         )
         self.ftr_torchrl_env.disable_per_env_tracking()
-        results = {k: v for k, v in results.items()}
+        # RunLogger._write_row groups a logged row's keys by topic (the prefix before the
+        # last "/") using itertools.groupby, which only merges CONSECUTIVE same-topic
+        # keys — it does not sort first. run_tracked_rollout's returned dict interleaves
+        # "rew/"/"shock/" keys between two separate runs of "eval/" keys, which splits a
+        # single eval step into two non-adjacent groupby groups -> two half-populated CSV
+        # rows for the same collected_frames value (confirmed against a real run's
+        # eval.csv: eval/mean_step_reward etc. on one row, eval/success_rate etc. on the
+        # next). train_d3qn.py's own _get_eval_rollout_results already pops these same
+        # keys out for exactly this reason — replicated here (this project's other
+        # trainers keep them, but self._eval_reward_info was never actually consumed
+        # anywhere in this trainer either, matching D3QN's own usage).
+        self._eval_reward_info = {k: results.pop(k) for k in list(results) if k.startswith("rew/") or k.startswith("shock/")}
 
         if episode_records:
             per_env_rows = aggregate_per_env(
@@ -622,6 +667,21 @@ if __name__ == "__main__":
     env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
     env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
     env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
+
+    # Scale down GPU PhysX buffers for small env counts (e.g. local debug runs on laptop
+    # GPUs) — mirrors eval_ftr.py's own scaling exactly, never carried over into this file
+    # originally. FTR_SIM_CFG's defaults are sized for 4096 envs on server GPUs; this is
+    # what actually caused local ctrac runs to fail scene creation regardless of env count
+    # or ContactSensor/terrain settings (confirmed by direct comparison against
+    # eval_ftr.py, which already scales these and works locally).
+    if _cfg.num_robots <= 64:
+        env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
+        env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
+        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
+        env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
+        env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
+    elif _cfg.num_robots > 512:
+        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
 
     # Must set module_name: ctrac here (via env_cfg_overrides in the yaml) so FtrEnv routes
     # observations/rewards through CTRACModule and attaches the ContactSensor (ftr_env.py).
