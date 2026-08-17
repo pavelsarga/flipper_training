@@ -4,7 +4,8 @@ No Isaac Sim required at runtime — the 966-D observation is assembled from raw
 data following CrossingEnv._get_observations() exactly.
 
 Observation layout (966-D):
-  [0:945]   heightmap (45×21, mean-centred; resampled if input size differs)
+  [0:945]   heightmap (45×21, centred on the robot's own ground reference
+            robot_z - track_wheel_radius; resampled if input size differs)
   [945:947] roll, pitch (÷π)
   [947:950] linear velocity in robot frame (÷hmap_diag ≈ 2.483 m)
   [950:953] angular velocity in robot frame (÷π)
@@ -104,8 +105,17 @@ class FtrPolicyInferenceModule:
 
         self.cfg = OmegaConf.load(config_path)
 
+        # FtrEnvCfg.flipper_pos_max_deg's real default is 90.0 (ftr_env.py) — none of the
+        # deployed marv_rl configs override it, so this must match, not the generic 60.0
+        # some other observation classes (e.g. ftr_compat_obs.py) default to.
         self.joint_limit = float(
-            np.deg2rad(self.cfg.env_cfg_overrides.get("flipper_pos_max_deg", 60.0))
+            np.deg2rad(self.cfg.env_cfg_overrides.get("flipper_pos_max_deg", 90.0))
+        )
+        # Robot's ground-reference offset for heightmap centering — see _build_obs().
+        # render_radius default (0.1165) matches ftr_env.py's robot_render_config default;
+        # none of the deployed configs override it.
+        self.track_wheel_radius = float(
+            self.cfg.env_cfg_overrides.get("render_radius", 0.1165)
         )
         self.num_actions = num_actions
 
@@ -153,15 +163,20 @@ class FtrPolicyInferenceModule:
         omega_local: np.ndarray,
         thetas: np.ndarray,
         quat: np.ndarray,
+        robot_z: float,
     ) -> torch.Tensor:
         """Assemble the 966-D FTR observation from raw sensor values."""
         import cv2
 
-        # Heightmap: resample to 45×21 if needed, then mean-centre
+        # Heightmap: resample to 45×21 if needed, then centre on the robot's own ground
+        # reference (robot_z - track_wheel_radius) — matches training's
+        # calc_scanned_height_maps exactly (marv_rl_module.py), NOT the local patch's own
+        # mean (which is a different quantity whenever the patch's local terrain mean
+        # differs from the robot's actual height, e.g. while climbing).
         hm = heightmap.astype(np.float32)
         if hm.shape != (self._HM_ROWS, self._HM_COLS):
             hm = cv2.resize(hm, (self._HM_COLS, self._HM_ROWS), interpolation=cv2.INTER_LINEAR)
-        hm_flat = (hm - hm.mean()).flatten()  # [945]
+        hm_flat = (hm - (robot_z - self.track_wheel_radius)).flatten()  # [945]
 
         # Roll, pitch from ROS quaternion convention (x, y, z, w)
         qx, qy, qz, qw = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
@@ -190,6 +205,7 @@ class FtrPolicyInferenceModule:
         omega_local: np.ndarray,
         thetas: np.ndarray,
         quat: np.ndarray,
+        robot_z: float = 0.0,
     ) -> np.ndarray:
         """Run one inference step.
 
@@ -202,11 +218,13 @@ class FtrPolicyInferenceModule:
             omega_local: (3,) angular velocity in robot frame (rad/s).
             thetas: (4,) flipper joint angles [FL, FR, RL, RR] in radians.
             quat: (4,) orientation quaternion in ROS convention [x, y, z, w].
+            robot_z: Robot base height in the elevation map's frame (m) — used to centre
+                the heightmap the same way training does (robot_z - track_wheel_radius).
 
         Returns:
             (6,) float32 array [v, w, fl, fr, rl, rr] — raw policy output in [-1, 1].
         """
-        obs = self._build_obs(heightmap, goal_vec_local, xd_local, omega_local, thetas, quat)
+        obs = self._build_obs(heightmap, goal_vec_local, xd_local, omega_local, thetas, quat, robot_z)
         td = TensorDict({OBS_KEY: obs}, batch_size=[1], device=self.device)
         td = self.vecnorm(td)
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():

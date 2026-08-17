@@ -71,13 +71,35 @@ class FlipperPolicyNode(Node):
             self.get_logger().error("config_path and policy_weights_path parameters are required!")
             raise ValueError("Missing required parameters")
 
-        # Auto-detect FTR vs native policy from config contents
-        self._is_ftr = self._detect_ftr_config(config_path)
-        self.get_logger().info(
-            f"Loading {'FTR' if self._is_ftr else 'native'} policy from {config_path}"
-        )
+        # Dispatch by env_cfg_overrides.module_name — authoritative and present in every
+        # FTR-family config, unlike the old _detect_ftr_config() heuristic (task/
+        # ftr_obs_encoder_opts presence), which is true for ALL FTR configs regardless of
+        # actual policy family and mis-routed atd3qn/icmd3qn/creps into the PPO path.
+        module_name = self._detect_module_name(config_path)
+        if module_name in ("marv_rl", "hfc"):
+            # hfc is a distinct module from hfcil (the separately-trained IL classifier,
+            # deployed via marv_flipper_eval's dedicated hfcil_policy_node.py) — hfc is a
+            # PPO-trained actor (HFCActionDecoder bakes in Eq. 7/8/9's composite action
+            # already) and loads through the same generic FtrPolicyInferenceModule path
+            # as marv_rl, via its own policy_config in config.yaml.
+            self._kind = "ppo_ftr"
+        elif module_name in ("atd3qn", "icmd3qn"):
+            self._kind = "d3qn"
+        elif module_name == "creps":
+            self._kind = "creps"
+        elif module_name in ("mitriakov", "ctrac"):
+            raise RuntimeError(
+                f"policy module '{module_name}' is not supported by this node — mitriakov "
+                "needs step-edge perception never implemented here, and ctrac has no "
+                "trained checkpoint yet."
+            )
+        else:
+            self._kind = "native"
+        # Backward-compat flag some helper methods still branch on.
+        self._is_ftr = self._kind == "ppo_ftr"
+        self.get_logger().info(f"Loading '{self._kind}' policy (module_name={module_name!r}) from {config_path}")
 
-        if self._is_ftr:
+        if self._kind == "ppo_ftr":
             from marv_rl_training.training.ftr_policy_inference_module import FtrPolicyInferenceModule
             from omegaconf import OmegaConf
             _ftr_cfg = OmegaConf.load(config_path)
@@ -88,6 +110,20 @@ class FlipperPolicyNode(Node):
                 config_path=config_path,
                 policy_weights_path=policy_weights_path,
                 vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
+                device=device,
+            )
+        elif self._kind == "d3qn":
+            from marv_rl_training.training.d3qn_policy_inference_module import D3QNPolicyInferenceModule
+            self.policy = D3QNPolicyInferenceModule(
+                config_path=config_path,
+                policy_weights_path=policy_weights_path,
+                device=device,
+            )
+        elif self._kind == "creps":
+            from marv_rl_training.training.creps_policy_inference_module import CREPSPolicyInferenceModule
+            self.policy = CREPSPolicyInferenceModule(
+                config_path=config_path,
+                policy_weights_path=policy_weights_path,
                 device=device,
             )
         else:
@@ -146,6 +182,15 @@ class FlipperPolicyNode(Node):
             "front_right": self.create_publisher(Float64, "/flippers_cmd_pos_rel/front_right", 10),
             "rear_left": self.create_publisher(Float64, "/flippers_cmd_pos_rel/rear_left", 10),
             "rear_right": self.create_publisher(Float64, "/flippers_cmd_pos_rel/rear_right", 10),
+        }
+        # D3QN/CREPS policies output ABSOLUTE radian joint targets — same topic naming
+        # hfcil_state_pose_driver.py/hfcil_policy_node.py (marv_flipper_eval) already
+        # publish to successfully.
+        self.flipper_pos_pubs = {
+            "front_left": self.create_publisher(Float64, "/flippers_cmd_pos/front_left", 10),
+            "front_right": self.create_publisher(Float64, "/flippers_cmd_pos/front_right", 10),
+            "rear_left": self.create_publisher(Float64, "/flippers_cmd_pos/rear_left", 10),
+            "rear_right": self.create_publisher(Float64, "/flippers_cmd_pos/rear_right", 10),
         }
 
         # Debug visualization publishers
@@ -555,9 +600,17 @@ class FlipperPolicyNode(Node):
 
         # Gather inputs (may be None)
         thetas = self.get_flipper_angles()
+        quat = self.get_orientation_quat()
+
+        # D3QN/CREPS don't use a goal vector at all (constant forward speed, no steering)
+        # — drive them from a dedicated, unconditional branch instead of the goal-gated
+        # PPO/native flow below.
+        if self._kind in ("d3qn", "creps"):
+            self._control_callback_no_goal(thetas, quat)
+            return
+
         goal_vec_local = self.get_goal_vector_local()
         velocities = self.get_velocities_local()
-        quat = self.get_orientation_quat()
 
         # Log extracted features for debugging
         self.get_logger().info(
@@ -622,6 +675,7 @@ class FlipperPolicyNode(Node):
                 omega_local=omega_local,
                 thetas=thetas,
                 quat=quat,
+                robot_z=float(self.current_odom.pose.pose.position.z) if self.current_odom is not None else 0.0,
             )
         except Exception as e:
             self.get_logger().error(f"Policy inference failed: {e}")
@@ -696,6 +750,50 @@ class FlipperPolicyNode(Node):
             )
 
 
+    def _control_callback_no_goal(self, thetas: np.ndarray | None, quat: np.ndarray | None) -> None:
+        """D3QN/CREPS control path: no goal vector, constant forward speed, absolute
+        radian joint targets published to /flippers_cmd_pos/*."""
+        if thetas is None or self.current_odom is None:
+            return
+        robot_z = float(self.current_odom.pose.pose.position.z)
+
+        try:
+            action = self.policy.infer_action(
+                heightmap=self.current_heightmap,
+                robot_z=robot_z,
+                thetas=thetas,
+                quat=quat,
+            )
+        except Exception as e:
+            self.get_logger().error(f"Policy inference failed: {e}")
+            return
+
+        if hasattr(action, "cpu"):
+            action = action.cpu().numpy()
+        action = np.asarray(action, dtype=np.float64)
+
+        debug_msg = Float32MultiArray()
+        debug_msg.data = action.astype(np.float32).tolist()
+        self.action_debug_pub.publish(debug_msg)
+        self._publish_heightmap_image(self.current_heightmap)
+
+        twist = Twist()
+        twist.linear.x = float(action[0])
+        twist.angular.z = 0.0 if self.disable_turning else float(action[1])
+        self.cmd_vel_pub.publish(twist)
+
+        flipper_keys = ["front_left", "front_right", "rear_left", "rear_right"]
+        for i, key in enumerate(flipper_keys):
+            msg = Float64()
+            msg.data = float(action[2 + i])
+            self.flipper_pos_pubs[key].publish(msg)
+
+        self.get_logger().info(
+            f"CMD ({self._kind}): vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) "
+            f"flipper_pos=[{action[2]:.2f}, {action[3]:.2f}, {action[4]:.2f}, {action[5]:.2f}] rad",
+            throttle_duration_sec=0.5,
+        )
+
     def _publish_heightmap_image(self, hmap: np.ndarray) -> None:
         if hmap is None or hmap.size == 0:
             return
@@ -716,14 +814,14 @@ class FlipperPolicyNode(Node):
         self.heightmap_img_pub.publish(msg)
 
     @staticmethod
-    def _detect_ftr_config(config_path: str) -> bool:
-        """Return True if config_path is an FTR training config (train_ftr.py)."""
+    def _detect_module_name(config_path: str) -> str | None:
+        """Return env_cfg_overrides.module_name, or None (native/non-FTR config)."""
         try:
             from omegaconf import OmegaConf
             cfg = OmegaConf.load(config_path)
-            return "ftr_obs_encoder_opts" in cfg or "task" in cfg
+            return cfg.get("env_cfg_overrides", {}).get("module_name")
         except Exception:
-            return False
+            return None
 
 
 def main(args=None):
