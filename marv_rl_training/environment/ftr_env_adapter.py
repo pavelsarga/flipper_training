@@ -78,7 +78,7 @@ class FtrTorchRLEnv(EnvBase):
             from rl_modules.icmd3qn.icmd3qn_observation import ICMD3QNObservation
 
             self.observations = [ICMD3QNObservation(env=self, encoder_opts=encoder_opts)]
-        elif module_name == "hfc":
+        elif module_name in ("hfc", "hfcil"):
             from rl_modules.hfc.hfc_observation import HFCObservation
 
             self.observations = [HFCObservation(env=self, encoder_opts=encoder_opts)]
