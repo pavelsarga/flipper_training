@@ -760,6 +760,7 @@ class FlipperPolicyNode(Node):
         try:
             action = self.policy.infer_action(
                 heightmap=self.current_heightmap,
+                heightmap_extent=self.heightmap_extent,
                 robot_z=robot_z,
                 thetas=thetas,
                 quat=quat,

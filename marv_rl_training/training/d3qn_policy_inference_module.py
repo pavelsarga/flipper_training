@@ -154,16 +154,17 @@ class D3QNPolicyInferenceModule:
             f"rear=[{np.rad2deg(self.rear_low):.1f},{np.rad2deg(self.rear_high):.1f}]deg, step={np.rad2deg(self.step_rad):.1f}deg"
         )
 
+        # Debug/viz snapshot for callers with an RViz-style debug view (e.g.
+        # marv_flipper_control_research's flipper_policy_node, which draws
+        # /policy_heightmap_extent + highlights /policy_heightmap_image from this) --
+        # this module owns the crop, so it's the only place that can record it.
+        self.last_policy_heightmap: np.ndarray | None = None
+
     def reset(self):
         pass  # stateless — every tick re-derives the target from the live measured angle
 
-    def _terrain_bands(self, heightmap: np.ndarray, robot_z: float) -> np.ndarray:
-        import cv2
-
-        hm = heightmap.astype(np.float32)
-        if hm.shape != (self._HM_ROWS, self._HM_COLS):
-            hm = cv2.resize(hm, (self._HM_COLS, self._HM_ROWS), interpolation=cv2.INTER_LINEAR)
-        hm = hm - (robot_z - self.track_wheel_radius)
+    def _terrain_bands(self, heightmap_45x21: np.ndarray, robot_z: float) -> np.ndarray:
+        hm = heightmap_45x21 - (robot_z - self.track_wheel_radius)
         # row-grouped mean over full width -> (15,)
         return hm.reshape(self._HM_DIM, 3, self._HM_COLS).mean(axis=(1, 2)).astype(np.float32)
 
@@ -173,9 +174,14 @@ class D3QNPolicyInferenceModule:
         thetas: np.ndarray,
         robot_z: float = 0.0,
         quat: np.ndarray | None = None,
-        **_ignored,  # accepts/ignores goal_vec_local, xd_local, omega_local, heightmap_extent
+        heightmap_extent=None,
+        **_ignored,  # accepts/ignores goal_vec_local, xd_local, omega_local
     ) -> np.ndarray:
-        bands = self._terrain_bands(heightmap, robot_z)
+        from marv_rl_training.training.ftr_heightmap_window import ftr_heightmap_window
+
+        hm = ftr_heightmap_window(heightmap, heightmap_extent)
+        self.last_policy_heightmap = hm
+        bands = self._terrain_bands(hm, robot_z)
 
         # FTR logical [front, rear] convention: thetas*[-1,-1,1,1], indices [0, 2].
         thetas = np.asarray(thetas, dtype=np.float32)

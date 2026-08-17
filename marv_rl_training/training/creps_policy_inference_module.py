@@ -21,10 +21,13 @@ low=-high=-pi/2 degenerates to target = pi/2 * clamp(raw, -1, 1)) — absolute r
 joint targets, fanned out [front,front,rear,rear] (sync_flipper_control).
 """
 
+import math
+
 import numpy as np
 from pathlib import Path
 from omegaconf import OmegaConf
 
+from marv_rl_training.training.ftr_heightmap_window import HM_ROWS, HM_COLS, HM_RES, ftr_heightmap_window
 from marv_rl_training.utils.logutils import get_terminal_logger
 
 
@@ -45,9 +48,6 @@ class CREPSPolicyInferenceModule:
         # action: (6,) float32 [v, w, fl, fr, rl, rr] — v is the fixed forward speed,
         # w=0, fl=fr/rl=rr are ABSOLUTE radian joint targets.
     """
-
-    _HM_ROWS = 45
-    _HM_COLS = 21
 
     def __init__(
         self,
@@ -74,9 +74,15 @@ class CREPSPolicyInferenceModule:
         self.front_low, self.front_high = -np.deg2rad(front_up), np.deg2rad(front_down)
         self.rear_low, self.rear_high = -np.deg2rad(back_down), np.deg2rad(back_up)
 
-        # height_ahead_row default (18) matches rl_modules/creps/creps_module.yaml;
-        # not exposed via env_cfg_overrides, so hardcode the deployed value.
-        self.height_ahead_row = 18
+        # height_ahead_row default (5) matches rl_modules/creps/creps_module.yaml;
+        # not exposed via env_cfg_overrides, so hardcode the deployed value. Row 5 =
+        # front flipper tip's flat-pose reach (0.6375m, from marv_sim.urdf) + the
+        # paper's 0.20m margin ahead of base_link -- matching "~20cm in front of the
+        # robot BODY" measured past what actually extends furthest forward (the
+        # flippers), not the chassis or the axle -- see creps_module.yaml's comment
+        # for the full derivation/history (this constant was 18, then 13, before
+        # settling on 5).
+        self.height_ahead_row = 5
 
         ckpt = np.load(str(policy_weights_path), allow_pickle=True) if str(policy_weights_path).endswith(".npy") else None
         if ckpt is None:
@@ -91,6 +97,13 @@ class CREPSPolicyInferenceModule:
             f"CREPSPolicyInferenceModule ready — omega={self.omega.tolist()}, "
             f"fixed_forward_vel={self.fixed_forward_vel}"
         )
+        # Debug/viz snapshot for callers with an RViz-style debug view (e.g.
+        # marv_flipper_control_research's flipper_policy_node, which draws
+        # /policy_heightmap_extent + /creps_debug_markers from these). None until
+        # the first successful infer_action() call.
+        self.last_policy_heightmap: np.ndarray | None = None
+        self.last_diag: dict | None = None
+        self._tick = 0  # throttles the diagnostic log below
 
     def reset(self):
         pass  # stateless
@@ -100,14 +113,12 @@ class CREPSPolicyInferenceModule:
         heightmap: np.ndarray,
         robot_z: float = 0.0,
         quat: np.ndarray | None = None,
+        heightmap_extent=None,
         **_ignored,
     ) -> np.ndarray:
-        import cv2
-
-        hm = heightmap.astype(np.float32)
-        if hm.shape != (self._HM_ROWS, self._HM_COLS):
-            hm = cv2.resize(hm, (self._HM_COLS, self._HM_ROWS), interpolation=cv2.INTER_LINEAR)
-        col = self._HM_COLS // 2
+        hm = ftr_heightmap_window(heightmap, heightmap_extent)
+        self.last_policy_heightmap = hm
+        col = HM_COLS // 2
         ground_ahead = float(hm[self.height_ahead_row, col])
         height_ahead = ground_ahead - (robot_z - self.track_wheel_radius)
 
@@ -126,4 +137,22 @@ class CREPSPolicyInferenceModule:
 
         fl = fr = float(front_target)
         rl = rr = float(rear_target)
+
+        # x_ahead: along-track distance (m, base_link frame) of the ONE cell CREPS
+        # actually reads -- row 0 = +1.10m front, center row 22 = robot, 0.05m/cell.
+        self.last_diag = {
+            "row": self.height_ahead_row, "col": col,
+            "x_ahead": float((HM_ROWS // 2 - self.height_ahead_row) * HM_RES),
+            "ground_ahead": ground_ahead, "height_ahead": height_ahead, "pitch": float(pitch),
+            "front_raw": float(front_raw), "rear_raw": float(rear_raw),
+            "front_target_rad": float(front_target), "rear_target_rad": float(rear_target),
+        }
+        self._tick += 1
+        if self._tick % 10 == 0:
+            self.logger.info(
+                f"CREPS diag: pitch={math.degrees(pitch):.1f}deg height_ahead={height_ahead:.3f}m "
+                f"-> front_raw={front_raw:.2f} rear_raw={rear_raw:.2f} (clip to [-1,1] before mapping) "
+                f"target_deg=[front={math.degrees(front_target):.1f}, rear={math.degrees(rear_target):.1f}]"
+            )
+
         return np.array([self.fixed_forward_vel, 0.0, fl, fr, rl, rr], dtype=np.float32)
