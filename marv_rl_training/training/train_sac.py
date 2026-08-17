@@ -467,6 +467,19 @@ class FtrSACTrainer:
                 "action/rear_left_mean": actions[:, 4].mean().item(), "action/rear_right_mean": actions[:, 5].mean().item(),
             }
 
+            # SACLoss evaluates the actor on the "next" sub-tensordict to build the target
+            # action, and _CTRACActorTDModule feeds whatever "obs_history" it finds there to
+            # the C-VAE. Only the root carries one (the actor wrote it at collection time),
+            # so without this the target action's z would come from CTRACObsHistory's
+            # constant-frame fallback — the same defect the root key fixes for the online
+            # action. The next window is exactly the current one shifted by one frame with
+            # next_obs's partial slice appended, so it is computed here rather than stored
+            # again (which would add another (H, 251) array per transition to an already
+            # heavy replay entry).
+            hist = flat["obs_history"]
+            next_partial = flat[("next", OBS_KEY)][..., :PARTIAL_DIM].unsqueeze(-2)
+            flat.set(("next", "obs_history"), torch.cat([hist[..., 1:, :], next_partial], dim=-2))
+
             self.replay_buffer.extend(flat)
             del tensordict_data, flat
             if "cuda" in str(self.device):

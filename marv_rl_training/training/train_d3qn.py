@@ -267,6 +267,9 @@ class FtrD3QNTrainer:
             total_iters=self.config.epsilon_decay_iters or _total_iters,
         )
 
+        # ---- resume optimizer / schedulers / counters (needs all of the above to exist) ----
+        self._restore_training_state()
+
         self._grad_steps = 0
         self.term_logger.info("Initialized FtrD3QNTrainer.")
 
@@ -312,12 +315,24 @@ class FtrD3QNTrainer:
 
             self.crash_checkpoint = True
             self.term_logger.warning(f"Resuming from {checkpoint_source} checkpoint — training may have inconsistent metrics.")
-            resume_iteration, resume_frames = self._load_training_checkpoint()
+        # Optimizer, LR scheduler and epsilon schedule do not exist yet — see _restore_training_state.
+        self.resume_iteration = None
+        self.resume_frames = None
+
+    def _restore_training_state(self):
+        """Restore optimizer / LR / epsilon schedule state and the frame counters.
+
+        Must run after the optimizer and both schedulers exist; calling it from
+        `_check_and_load_crash_checkpoint` raised an AttributeError that the broad except in
+        `_load_training_checkpoint` downgraded to a warning, so every respawn restarted the LR and
+        epsilon schedules from scratch.
+        """
+        if not self.crash_checkpoint:
+            return
+        resume_iteration, resume_frames = self._load_training_checkpoint()
+        if resume_iteration is not None:
             self.resume_iteration = resume_iteration
             self.resume_frames = resume_frames
-        else:
-            self.resume_iteration = None
-            self.resume_frames = None
 
     def _save_training_checkpoint(self, iteration: int, total_collected_frames: int):
         checkpoint = {
@@ -441,7 +456,10 @@ class FtrD3QNTrainer:
         resume_iteration = getattr(self, "resume_iteration", None)
         resume_frames = getattr(self, "resume_frames", None)
         iter_offset = resume_iteration if resume_iteration is not None else 0
-        pbar = tqdm(total=self.config.total_frames, desc="FTR D3QN Training", unit="frames", leave=False)
+        # On a respawn the counter carries on from the checkpoint while the collector only collects
+        # what is left, so the bar spans resumed + remaining rather than the config's total_frames.
+        _pbar_total = self.config.total_frames + (resume_frames or 0)
+        pbar = tqdm(total=_pbar_total, desc="FTR D3QN Training", unit="frames", leave=False)
         if resume_frames is not None:
             pbar.update(resume_frames)
             self.term_logger.info(f"Resuming training — progress bar starting at {resume_frames} frames (iter_offset={iter_offset})")

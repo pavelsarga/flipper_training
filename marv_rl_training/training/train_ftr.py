@@ -377,6 +377,9 @@ class FtrPPOTrainer:
         else:
             self.action_bonus_scheduler = None
 
+        # ---- resume optimizer / schedulers / counters (needs all of the above to exist) ----
+        self._restore_training_state()
+
         self.term_logger.info("Initialized FtrPPOTrainer.")
 
     def _check_and_load_crash_checkpoint(self):
@@ -435,17 +438,27 @@ class FtrPPOTrainer:
             self.term_logger.warning(
                 f"Resuming from {checkpoint_source} checkpoint — training may have inconsistent metrics."
             )
-            # Try to load training state (optimizer, schedulers, iteration count)
-            resume_iteration, resume_frames = self._load_training_checkpoint()
-            if resume_iteration is not None:
-                self.resume_iteration = resume_iteration
-                self.resume_frames = resume_frames
-            else:
-                self.resume_iteration = None
-                self.resume_frames = None
-        else:
-            self.resume_iteration = None
-            self.resume_frames = None
+        # The optimizer and the schedulers do not exist yet at this point in __init__, so the rest of
+        # the training state is restored later, from _restore_training_state().
+        self.resume_iteration = None
+        self.resume_frames = None
+
+    def _restore_training_state(self):
+        """Restore optimizer + scheduler state and the frame/iteration counters.
+
+        Must run *after* the optimizer, the LR scheduler and the config schedulers have been built:
+        `_load_training_checkpoint` writes into all of them. Calling it from
+        `_check_and_load_crash_checkpoint` (where the policy weights are loaded) is too early — it
+        raised ``'FtrPPOTrainer' object has no attribute 'optim'``, which the broad except in
+        `_load_training_checkpoint` turned into a warning, so every respawn silently restarted the LR
+        and step-penalty schedules from their initial values and reset the frame counter to 0.
+        """
+        if not self.crash_checkpoint:
+            return
+        resume_iteration, resume_frames = self._load_training_checkpoint()
+        if resume_iteration is not None:
+            self.resume_iteration = resume_iteration
+            self.resume_frames = resume_frames
 
     def _save_training_checkpoint(self, iteration: int, total_collected_frames: int):
         """Save training state (optimizers, schedulers, frame count) for resuming."""
@@ -563,7 +576,10 @@ class FtrPPOTrainer:
         resume_iteration = getattr(self, "resume_iteration", None)
         resume_frames = getattr(self, "resume_frames", None)
         iter_offset = resume_iteration if resume_iteration is not None else 0
-        pbar = tqdm(total=self.config.total_frames, desc="FTR PPO Training", unit="frames", leave=False)
+        # On a respawn the counter carries on from the checkpoint while the collector only collects
+        # what is left, so the bar spans resumed + remaining rather than the config's total_frames.
+        _pbar_total = self.config.total_frames + (resume_frames or 0)
+        pbar = tqdm(total=_pbar_total, desc="FTR PPO Training", unit="frames", leave=False)
         if resume_frames is not None:
             pbar.update(resume_frames)
             self.term_logger.info(f"Resuming training — progress bar starting at {resume_frames} frames (iter_offset={iter_offset})")
