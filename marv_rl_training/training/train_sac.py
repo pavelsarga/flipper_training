@@ -34,6 +34,7 @@ if __name__ == "__main__":
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
+import math
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,7 +72,13 @@ from rl_modules.ctrac.ctrac_observation import (
     CONTACT_PROB_OFFSET,
     PARTIAL_DIM,
 )
-from rl_modules.ctrac.ctrac_cvae import contact_est_loss, contact_geo_loss, contact_prob_loss, vae_loss
+from rl_modules.ctrac.ctrac_cvae import (
+    contact_est_loss,
+    contact_geo_loss,
+    contact_prob_loss,
+    latent_diagnostics,
+    vae_loss,
+)
 
 
 # ============================================================
@@ -109,6 +116,14 @@ class FtrSACConfig:
     # matching how the paper reports it as a single hyperparameter rather than a target
     # entropy). Settable to auto-tune instead via fixed_alpha: false.
     alpha_init: float = 1.5
+    # Hard floor on the SAC temperature, applied after each alpha optimizer step. Insurance
+    # against the failure this trainer has hit twice: when target_entropy is unreachable from
+    # above, alpha's gradient -(log_pi + target_entropy) stays one-signed, alpha decays
+    # monotonically toward 0, and entropy regularisation silently switches itself off — the
+    # actor then optimises Q alone with no exploration pressure. Measured on run 11365624:
+    # alpha 1.486 -> 0.0248 over 28M frames, still falling, while policy entropy sat ~4.6
+    # nats above the target the whole time. 0.0 disables the floor.
+    alpha_min: float = 0.05
     fixed_alpha: bool = True
     target_entropy: "str | float" = "auto"
     alpha_optimizer_opts: dict[str, Any] = field(default_factory=lambda: {"lr": 3e-4})
@@ -118,7 +133,16 @@ class FtrSACConfig:
     # additional supervised C-VAE gradient steps (Fig. 2 caption: "1 iteration" SAC : "5
     # iterations" C-VAE contact-model refinement).
     cvae_updates_per_sac_step: int = 5
-    cvae_vae_beta: float = 1.0       # beta-VAE KL weight (paper Table: "KL divergence weight (1.0)")
+    # beta-VAE KL weight. The paper's Table says 1.0, but that value is catastrophic here:
+    # this project's reconstruction target (the PARTIAL_DIM partial-obs slice) has a natural
+    # MSE scale of ~0.08, so a KL weighted at 1.0 dominates the objective and the encoder
+    # profits by switching the latent off entirely. Confirmed on a real 22M-frame Stage II
+    # run — see vae_loss()'s docstring in ctrac_cvae.py. Paired with cvae_free_bits below.
+    cvae_vae_beta: float = 0.01
+    # Per-latent-dimension KL floor, in nats (Kingma et al. 2016 free bits). The structural
+    # guard against posterior collapse: a dimension already below the floor contributes no
+    # KL gradient, so the optimiser cannot gain by killing it. 0.0 restores old behaviour.
+    cvae_free_bits: float = 0.5
     cvae_prob_weight: float = 1.0    # L_prob's weight in L_C = L_prob + L_est + L_geo
     cvae_est_weight: float = 1.0
     cvae_geo_weight: float = 1.0
@@ -278,6 +302,15 @@ class FtrSACTrainer:
         if not self.config.fixed_alpha:
             self.alpha_optim = torch.optim.Adam([self.loss_module.log_alpha], **self.config.alpha_optimizer_opts)
 
+        # ---- resume networks + optimizers + schedules from a previous attempt ----
+        # Placed here, after the optimizers and the C-VAE scheduler (which
+        # _restore_training_state writes into) but BEFORE the collector is built: the
+        # collector captures self.policy_operator, so restoring first guarantees it starts
+        # from the resumed weights however torchrl chooses to hold that reference.
+        self.resume_iteration = None
+        self.resume_frames = None
+        self._restore_training_state()
+
         # ---- data collection ----
         iteration_size = self.config.time_steps_per_batch * self.config.num_robots
         self.collector = SyncDataCollector(
@@ -317,6 +350,112 @@ class FtrSACTrainer:
         self.term_logger.info("Initialized FtrSACTrainer.")
 
     # ------------------------------------------------------------------
+    # Crash/respawn resume
+    #
+    # Until this existed, train_sac.py WROTE policy_crash/policy_step_* checkpoints but
+    # never read any of them back, and (unlike train_ftr.py/train_d3qn.py) had no
+    # training-state checkpoint at all. Every respawn therefore restarted completely from
+    # scratch: random actor, random critic, random critic targets, fresh optimizer moments,
+    # alpha back at alpha_init, C-VAE back to the Stage I file, empty replay buffer. On
+    # SLURM job 11362192 that happened 15 times — attempt_14 alone reached 27.8M frames and
+    # threw all of it away on the next PhysX crash, while the respawn helper meanwhile
+    # decremented the remaining-frames budget as if the progress had been kept.
+    #
+    # Everything is saved and restored through loss_module rather than through
+    # policy_operator/qvalue_operator, because SACLoss.convert_to_functional() re-wraps
+    # each parameter into a new tensor object (see the optimizer comment in __init__) and
+    # loss_module's state_dict is the only one that also carries the SoftUpdate target
+    # network params and log_alpha. Restoring the two modules separately would silently
+    # leave the critic targets randomly initialised.
+    # ------------------------------------------------------------------
+    def _restore_training_state(self):
+        """Load the previous attempt's training state, if any, and set the resume counters."""
+        checkpoint = self._find_training_checkpoint()
+        if checkpoint is None:
+            return
+        try:
+            self._apply_training_checkpoint(checkpoint)
+        except Exception as e:
+            self.term_logger.error(
+                f"Failed to apply training checkpoint: {e}. Continuing from scratch — "
+                f"this attempt will NOT resume the previous one."
+            )
+            traceback.print_exception(e)
+            return
+        self.resume_iteration = checkpoint["iteration"]
+        self.resume_frames = checkpoint["total_collected_frames"]
+        self.term_logger.warning(
+            f"Resumed from training checkpoint: iteration={self.resume_iteration}, "
+            f"total_collected_frames={self.resume_frames}. Note that collected_frames and the "
+            f"policy_step_<frames> names are CUMULATIVE across attempts from here on."
+        )
+
+    def _find_training_checkpoint(self):
+        """Return the newest training_state.pth across this and previous attempt dirs."""
+        for weights_dir in self.run_logger.candidate_weight_dirs():
+            candidate = weights_dir / "training_state.pth"
+            if candidate.exists():
+                self.term_logger.info(f"Found training checkpoint: {candidate}")
+                # weights_only=False is required, not incidental: SACLoss.state_dict()
+                # contains non-tensor entries (torch.Size and None) alongside the tensors,
+                # which the weights_only unpickler rejects.
+                return torch.load(candidate, map_location=self.device, weights_only=False)
+        self.term_logger.info("No training checkpoint found — starting a fresh run.")
+        return None
+
+    def _apply_training_checkpoint(self, checkpoint: dict):
+        """Write a loaded checkpoint back into every stateful component.
+
+        Networks are restored strictly (a silent shape/key mismatch here would look exactly
+        like a run that simply learns nothing, which is expensive to diagnose); optimizer
+        and scheduler state is restored leniently, since a fresh moment buffer only costs a
+        few noisy iterations.
+        """
+        self.loss_module.load_state_dict(checkpoint["loss_module_state_dict"])
+        # self.cvae aliases the actor's C-VAE submodule, but load it explicitly too so the
+        # restore does not depend on that aliasing holding.
+        self.cvae.load_state_dict(checkpoint["cvae_state_dict"])
+        if checkpoint.get("vecnorm_state_dict"):
+            self.vecnorm.load_state_dict(checkpoint["vecnorm_state_dict"], strict=False)
+
+        for name, optim in (
+            ("actor_optim", self.actor_optim),
+            ("qvalue_optim", self.qvalue_optim),
+            ("cvae_optim", self.cvae_optim),
+            ("alpha_optim", self.alpha_optim),
+        ):
+            state = checkpoint.get(f"{name}_state_dict")
+            if optim is None or not state:
+                continue
+            try:
+                optim.load_state_dict(state)
+            except (KeyError, ValueError, RuntimeError) as e:
+                self.term_logger.warning(f"Could not restore {name} state ({e}); it restarts with fresh moments.")
+
+        if self.cvae_scheduler is not None and checkpoint.get("cvae_scheduler_state_dict"):
+            self.cvae_scheduler.load_state_dict(checkpoint["cvae_scheduler_state_dict"])
+        self._grad_steps = checkpoint.get("grad_steps", 0)
+
+    def _save_training_checkpoint(self, iteration: int, total_collected_frames: int):
+        """Persist everything needed to continue this run after a crash."""
+        checkpoint = {
+            "iteration": iteration,
+            "total_collected_frames": total_collected_frames,
+            "grad_steps": self._grad_steps,
+            "loss_module_state_dict": self.loss_module.state_dict(),
+            "cvae_state_dict": self.cvae.state_dict(),
+            "vecnorm_state_dict": self.vecnorm.state_dict(),
+            "actor_optim_state_dict": self.actor_optim.state_dict(),
+            "qvalue_optim_state_dict": self.qvalue_optim.state_dict(),
+            "cvae_optim_state_dict": self.cvae_optim.state_dict(),
+        }
+        if self.alpha_optim is not None:
+            checkpoint["alpha_optim_state_dict"] = self.alpha_optim.state_dict()
+        if self.cvae_scheduler is not None:
+            checkpoint["cvae_scheduler_state_dict"] = self.cvae_scheduler.state_dict()
+        self.run_logger.save_weights(checkpoint, "training_state")
+
+    # ------------------------------------------------------------------
     def train(self):
         try:
             self._train()
@@ -328,6 +467,13 @@ class FtrSACTrainer:
             self.term_logger.error(f"Training failed: {e}")
             traceback.print_exception(e)
             if "CUDA error" in str(e) or "CUDA out of memory" in str(e) or "CommError" in str(type(e).__name__):
+                # No checkpoint is written on this path, deliberately: the GPU context is
+                # already corrupted, so every state_dict() below would fault or hang. This
+                # is the dominant crash mode for this trainer (all 14 respawns of SLURM job
+                # 11362192 were "CUDA error: an illegal memory access" out of PhysX), which
+                # is exactly why _save_training_checkpoint also runs periodically from
+                # _train() — that periodic copy, not this handler, is what actually
+                # survives. Worst case a crash costs one save_weights_every interval.
                 self.term_logger.error(f"{type(e).__name__} detected — calling os._exit(75) to skip cleanup.")
                 import os as _os
                 _os._exit(75)
@@ -336,6 +482,9 @@ class FtrSACTrainer:
                 self.run_logger.save_weights(self.qvalue_operator.state_dict(), "qvalue_crash")
                 self.run_logger.save_weights(self.cvae.state_dict(), "cvae_crash")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_crash")
+                self._save_training_checkpoint(
+                    getattr(self, "_current_iteration", 0), getattr(self, "_current_total_frames", 0)
+                )
                 self.term_logger.info(f"Saved crash checkpoint at frames={getattr(self, '_current_total_frames', 0)}.")
             except Exception:
                 pass
@@ -359,7 +508,10 @@ class FtrSACTrainer:
 
         _z, mu, logvar, pred_points, pred_prob, pred_recon = self.cvae(obs_hist, sample=True)
 
-        loss_vae, recon_l, kl_l = vae_loss(pred_recon, target_recon, mu, logvar, beta=self.config.cvae_vae_beta)
+        loss_vae, recon_l, kl_l = vae_loss(
+            pred_recon, target_recon, mu, logvar,
+            beta=self.config.cvae_vae_beta, free_bits=self.config.cvae_free_bits,
+        )
         loss_prob = contact_prob_loss(pred_prob, target_prob)
         loss_est = contact_est_loss(pred_points, target_points, target_prob)
         loss_geo = contact_geo_loss(pred_points, target_prob, target_points.mean(dim=1), self.config.cvae_max_reach)
@@ -378,6 +530,7 @@ class FtrSACTrainer:
         return {
             "cvae_loss": loss.item(), "cvae_loss_recon": recon_l.item(), "cvae_loss_kl": kl_l.item(),
             "cvae_loss_prob": loss_prob.item(), "cvae_loss_est": loss_est.item(), "cvae_loss_geo": loss_geo.item(),
+            **latent_diagnostics(mu, logvar),
         }
 
     def _sac_update(self, batch) -> dict[str, float]:
@@ -411,6 +564,10 @@ class FtrSACTrainer:
             self.alpha_optim.zero_grad()
             alpha_loss.backward()
             self.alpha_optim.step()
+            # Clamp in log-space, where log_alpha actually lives, so the floor is exact.
+            if self.config.alpha_min > 0.0:
+                with torch.no_grad():
+                    self.loss_module.log_alpha.clamp_(min=math.log(self.config.alpha_min))
             log["loss_alpha"] = alpha_loss.item()
 
         self.target_updater.step()
@@ -423,11 +580,20 @@ class FtrSACTrainer:
         if "cuda" in str(self.device):
             torch.cuda.empty_cache()
 
-        pbar = tqdm(total=self.config.total_frames, desc="C-TRAC SAC Training", unit="frames", leave=False)
+        # Frame/iteration bookkeeping continues a resumed run rather than restarting at 0,
+        # so collected_frames stays monotonic across attempts and the respawn helper's
+        # remaining-budget arithmetic matches what was actually trained.
+        iter_offset = self.resume_iteration if self.resume_iteration is not None else 0
+        resume_frames = self.resume_frames or 0
+        pbar = tqdm(total=self.config.total_frames + resume_frames, desc="C-TRAC SAC Training", unit="frames", leave=False)
+        if resume_frames:
+            pbar.update(resume_frames)
 
         for i, tensordict_data in enumerate(self.collector):
-            total_collected_frames = (i + 1) * iteration_size
+            effective_i = i + iter_offset
+            total_collected_frames = (effective_i + 1) * iteration_size
             self._current_total_frames = total_collected_frames
+            self._current_iteration = effective_i
             pbar.update(iteration_size)
 
             self.policy_operator.train()
@@ -500,6 +666,24 @@ class FtrSACTrainer:
             if self.cvae_scheduler is not None:
                 self.cvae_scheduler.step()
 
+            # GPU memory, logged every iteration because this trainer's dominant failure
+            # mode leaves no other trace. SLURM job 11362192 died 15 times with
+            # "CUDA error: an illegal memory access" raised out of PhysX's
+            # set_dof_position_targets, with NO correlate anywhere in the training data:
+            # zero explosions, zero non-finite values, and firing at frame counts from
+            # 131k to 27.8M on an exclusively-allocated A100-40GB. A steadily rising
+            # reserved/allocated figure would point at memory pressure (the same signature
+            # that previously forced the replay buffer onto LazyMemmapStorage); a flat one
+            # rules it out and leaves a genuine PhysX/driver fault. Either way the next
+            # crash becomes diagnosable instead of silent.
+            mem_log = {}
+            if "cuda" in str(self.device):
+                mem_log = {
+                    "gpu/mem_allocated_gb": torch.cuda.memory_allocated(self.device) / 1e9,
+                    "gpu/mem_reserved_gb": torch.cuda.memory_reserved(self.device) / 1e9,
+                    "gpu/mem_max_allocated_gb": torch.cuda.max_memory_allocated(self.device) / 1e9,
+                }
+
             # Key order matters: RunLogger._write_row groups a row's keys by topic (the
             # prefix before the last "/") via itertools.groupby, which only merges
             # CONSECUTIVE same-topic keys rather than sorting first. Putting
@@ -513,15 +697,20 @@ class FtrSACTrainer:
                 "explosions/dirty_transitions": n_dirty,
                 "train/mean_reward": rollout_mean_reward, "train/replay_buffer_size": len(self.replay_buffer),
                 **{f"train/{k}": v for k, v in sac_log.items()}, **{f"train/{k}": v for k, v in cvae_log.items()},
+                # Appended last so the "train/*" block above stays contiguous (see note).
+                **mem_log,
             }
 
             save_every = self.config.save_weights_every or self.config.eval_and_save_every
-            if i % save_every == 0:
+            if effective_i % save_every == 0:
                 self.run_logger.save_weights(self.policy_operator.state_dict(), f"policy_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.qvalue_operator.state_dict(), f"qvalue_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.cvae.state_dict(), f"cvae_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
-            if i % self.config.eval_and_save_every == 0 and i > 0:
+                # Written alongside the weights, so a crash never loses more than one
+                # save_every interval of optimizer/alpha/schedule state.
+                self._save_training_checkpoint(effective_i, total_collected_frames)
+            if effective_i % self.config.eval_and_save_every == 0 and effective_i > 0:
                 try:
                     eval_log = self._get_eval_rollout_results()
                     for _ in range(self.config.eval_repeats - 1):
@@ -533,7 +722,7 @@ class FtrSACTrainer:
                     log.update(eval_log)
                     if self.optuna_trial is not None:
                         success_rate = eval_log.get("eval/success_rate", 0.0)
-                        self.optuna_trial.report(success_rate, i // self.config.eval_and_save_every)
+                        self.optuna_trial.report(success_rate, effective_i // self.config.eval_and_save_every)
                         if self.optuna_trial.should_prune():
                             raise optuna.TrialPruned()
                 except optuna.TrialPruned:

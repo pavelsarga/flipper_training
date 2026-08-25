@@ -18,7 +18,14 @@ import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from rl_modules.ctrac.ctrac_cvae import CTRACCVAE, contact_est_loss, contact_geo_loss, contact_prob_loss, vae_loss
+from rl_modules.ctrac.ctrac_cvae import (
+    CTRACCVAE,
+    contact_est_loss,
+    contact_geo_loss,
+    contact_prob_loss,
+    latent_diagnostics,
+    vae_loss,
+)
 from rl_modules.ctrac.ctrac_observation import CONTACT_POINTS_OFFSET, CONTACT_PROB_OFFSET, PARTIAL_DIM
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
@@ -58,7 +65,13 @@ class CTRACCVAEPretrainConfig:
     latent_dim: int = 32
     encoder_hidden: tuple = (512, 256, 128)
     decoder_hidden: tuple = (128, 256, 128)
-    vae_beta: float = 1.0
+    # See train_sac.py's cvae_vae_beta / cvae_free_bits and vae_loss()'s docstring: at
+    # beta=1.0 the KL term swamps a reconstruction loss whose natural scale here is ~0.08
+    # and the latent collapses to the prior. Stage I must be kept consistent with Stage II
+    # on both of these, otherwise the pretrained encoder handed to the actor is already dead
+    # (or is trained under a different objective than the one that continues it).
+    vae_beta: float = 0.01
+    free_bits: float = 0.5
     prob_weight: float = 1.0
     est_weight: float = 1.0
     geo_weight: float = 1.0
@@ -189,7 +202,7 @@ def train(cfg: CTRACCVAEPretrainConfig) -> None:
 
         _z, mu, logvar, pred_points, pred_prob, pred_recon = cvae(batch_hist, sample=True)
 
-        loss_vae, recon_l, kl_l = vae_loss(pred_recon, target_recon, mu, logvar, beta=cfg.vae_beta)
+        loss_vae, recon_l, kl_l = vae_loss(pred_recon, target_recon, mu, logvar, beta=cfg.vae_beta, free_bits=cfg.free_bits)
         loss_prob = contact_prob_loss(pred_prob, target_prob)
         loss_est = contact_est_loss(pred_points, target_points, target_prob)
         loss_geo = contact_geo_loss(pred_points, target_prob, target_points.mean(dim=1), cfg.max_reach)
@@ -201,7 +214,13 @@ def train(cfg: CTRACCVAEPretrainConfig) -> None:
         optim.step()
 
         if step % cfg.log_every == 0:
-            pbar.set_postfix(loss=loss.item(), recon=recon_l.item(), kl=kl_l.item(), prob=loss_prob.item(), est=loss_est.item(), geo=loss_geo.item())
+            # active_dims is the collapse tell — if it reaches 0 the encoder is emitting
+            # pure N(0, I) and the checkpoint this stage produces is worthless downstream.
+            diag = latent_diagnostics(mu, logvar)
+            pbar.set_postfix(
+                loss=loss.item(), recon=recon_l.item(), kl=kl_l.item(), prob=loss_prob.item(),
+                est=loss_est.item(), geo=loss_geo.item(), active_dims=diag["cvae_latent_active_dims"],
+            )
         if step % cfg.save_every == 0 and step > 0:
             torch.save(cvae.state_dict(), out_path)
 
