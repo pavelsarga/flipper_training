@@ -5,7 +5,8 @@ ICMD3QNEncoder (rl_modules/atd3qn/atd3qn_observation.py, rl_modules/icmd3qn/icmd
 loading the deployed dueling-D3QN checkpoint directly (bare encoder state_dict, no wrapper).
 
 Both baselines are structurally identical apart from:
-  - STATE_DIM: 2 (ATD3QN: front/rear flipper angle) vs 3 (ICMD3QN: + chassis pitch)
+  - STATE_DIM: 3 for both ({theta_f1, theta_f2, theta_R}, Eq. 2). They differ only in
+    how the state block is scaled: [0, 1] for ATD3QN, [-1, 1] for ICMD3QN.
   - flipper normalisation: (x + limit) / (2*limit) -> [0,1]  (ATD3QN)
                             x / limit                -> ~[-1,1]  (ICMD3QN)
 
@@ -111,7 +112,11 @@ class D3QNPolicyInferenceModule:
         if module_name not in ("atd3qn", "icmd3qn"):
             raise ValueError(f"D3QNPolicyInferenceModule requires module_name atd3qn/icmd3qn, got {module_name!r}")
         self.is_icm = module_name == "icmd3qn"
-        self.state_dim = 3 if self.is_icm else 2
+        # Both papers' Eq. 2 is E = {theta_f1, theta_f2, theta_R}: 3 dims, chassis pitch
+        # included. atd3qn was 17-D (pitch missing) until that omission was corrected, so
+        # this is 3 for both modules now. The two still differ in how they SCALE the state
+        # block ([0,1] for atd3qn, [-1,1] for icmd3qn) — see _state_vector.
+        self.state_dim = 3
 
         popts = self.cfg.get("policy_opts", {})
         self.track_vel = float(popts.get("track_vel", 0.6))
@@ -123,6 +128,20 @@ class D3QNPolicyInferenceModule:
         # Observation-normalisation joint limit — deg2rad(flipper_pos_max_deg), default
         # 90.0 (neither atd3qn nor icmd3qn config overrides it).
         self.obs_joint_limit = float(np.deg2rad(overrides.get("flipper_pos_max_deg", 90.0)))
+        # Per-flipper bounds actually enforced in sim (FtrEnv.flipper_angle_bounds): MARV's
+        # asymmetric limits when all four marv_flipper_*_deg are set, else the symmetric
+        # +/-flipper_pos_max_deg. The training modules normalise the flipper features by
+        # THESE, so deploying against the symmetric limit alone would feed the network a
+        # differently-scaled input than it was trained on (front is [-90, +80], not +/-90).
+        _marv = [overrides.get(k) for k in ("marv_flipper_front_up_deg", "marv_flipper_front_down_deg",
+                                            "marv_flipper_back_up_deg", "marv_flipper_back_down_deg")]
+        if overrides.get("robot_type") == "marv" and all(v is not None for v in _marv):
+            f_up, f_down, b_up, b_down = (float(np.deg2rad(v)) for v in _marv)
+            self.flipper_low = np.array([-f_up, -b_down], dtype=np.float32)
+            self.flipper_high = np.array([f_down, b_up], dtype=np.float32)
+        else:
+            self.flipper_low = np.array([-self.obs_joint_limit] * 2, dtype=np.float32)
+            self.flipper_high = np.array([self.obs_joint_limit] * 2, dtype=np.float32)
         # Physical clamp — asymmetric MARV limits (degrees), matching ftr_env.py's
         # marv_asym branch for sync_flipper_control + not only_front_flipper:
         #   low = [-front_up, -back_down], high = [front_down, back_up]
@@ -188,21 +207,22 @@ class D3QNPolicyInferenceModule:
         front_logical = -thetas[0]
         rear_logical = thetas[2]
 
+        # theta_R (Eq. 2) — required by BOTH modules now that atd3qn's 17-D omission is fixed.
+        pitch = 0.0
+        if quat is not None:
+            qx, qy, qz, qw = (float(v) for v in quat)
+            pitch = float(np.arcsin(np.clip(2.0 * (qw * qy - qz * qx), -1.0, 1.0)))
+        pitch_unit = pitch / (math.pi / 3.0)   # Eq. 2's stated domain, [-1, 1]
+
+        raw = np.array([front_logical, rear_logical], dtype=np.float32)
+        span = np.maximum(self.flipper_high - self.flipper_low, 1e-6)
+        unit = (raw - self.flipper_low) / span              # [0, 1]
         if self.is_icm:
-            pitch = 0.0
-            if quat is not None:
-                qx, qy, qz, qw = (float(v) for v in quat)
-                pitch = float(np.arcsin(np.clip(2.0 * (qw * qy - qz * qx), -1.0, 1.0)))
-            state = np.array([
-                front_logical / self.obs_joint_limit,
-                rear_logical / self.obs_joint_limit,
-                pitch / (math.pi / 3.0),
-            ], dtype=np.float32)
+            # ICMD3QNModule scales its whole state block to [-1, 1].
+            state = np.array([unit[0] * 2.0 - 1.0, unit[1] * 2.0 - 1.0, pitch_unit], dtype=np.float32)
         else:
-            state = np.array([
-                (front_logical + self.obs_joint_limit) / (2.0 * self.obs_joint_limit),
-                (rear_logical + self.obs_joint_limit) / (2.0 * self.obs_joint_limit),
-            ], dtype=np.float32)
+            # ATD3QNModule keeps its state block in [0, 1].
+            state = np.array([unit[0], unit[1], (pitch_unit + 1.0) * 0.5], dtype=np.float32)
 
         obs = np.concatenate([bands, state]).astype(np.float32)
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)

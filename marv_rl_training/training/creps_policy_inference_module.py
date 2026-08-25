@@ -74,15 +74,13 @@ class CREPSPolicyInferenceModule:
         self.front_low, self.front_high = -np.deg2rad(front_up), np.deg2rad(front_down)
         self.rear_low, self.rear_high = -np.deg2rad(back_down), np.deg2rad(back_up)
 
-        # height_ahead_row default (5) matches rl_modules/creps/creps_module.yaml;
-        # not exposed via env_cfg_overrides, so hardcode the deployed value. Row 5 =
-        # front flipper tip's flat-pose reach (0.6375m, from marv_sim.urdf) + the
-        # paper's 0.20m margin ahead of base_link -- matching "~20cm in front of the
-        # robot BODY" measured past what actually extends furthest forward (the
-        # flippers), not the chassis or the axle -- see creps_module.yaml's comment
-        # for the full derivation/history (this constant was 18, then 13, before
-        # settling on 5).
-        self.height_ahead_row = 5
+        # height_ahead_row default (9) matches rl_modules/creps/creps_module.yaml;
+        # not exposed via env_cfg_overrides, so hardcode the deployed value. Row 9 =
+        # front flipper tip's flat-pose reach (0.6375m, from marv_sim.urdf) ahead of
+        # base_link -- sampling right at the tip, not past it -- see
+        # creps_module.yaml's comment for the full derivation/history (this constant
+        # was 18, then 13, then 5, before settling on 9).
+        self.height_ahead_row = 9
 
         ckpt = np.load(str(policy_weights_path), allow_pickle=True) if str(policy_weights_path).endswith(".npy") else None
         if ckpt is None:
