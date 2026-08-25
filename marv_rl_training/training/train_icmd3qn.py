@@ -70,6 +70,7 @@ from marv_rl_training.training.eval_data import (
     save_per_spot_csv,
 )
 from marv_rl_training.utils.cfg_schedulers import _LinearCfgScheduler
+from marv_rl_training.training.replay_buffer_io import load_replay_subset, save_replay_subset
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
 
@@ -167,6 +168,16 @@ class FtrICMD3QNConfig:
     physx_gpu_temp_buffer_capacity: int = 2**26
     physx_gpu_max_num_partitions: int = 8
     physx_gpu_found_lost_aggregate_pairs_capacity: int = 2**27
+    # Fraction of the buffer's CAPACITY persisted to weights/replay_buffer.pt alongside each
+    # periodic checkpoint, and reloaded on the next attempt. 0 disables it entirely.
+    #
+    # Without this every respawn restarts from an empty buffer: measured over the completed
+    # runs, 26-44% (AT, 2M capacity) and 76-95% (ICM, 8M) of iterations trained below
+    # capacity — i.e. ICM's nominal 8M buffer never actually existed. See replay_buffer_io.
+    #
+    # 1/3 bounds the file at ~1/3 capacity regardless of when the crash lands; while the
+    # buffer is still filling and holds less than that, it is saved whole.
+    replay_buffer_save_fraction: float = 1.0 / 3.0
 
 
 # ============================================================
@@ -282,6 +293,13 @@ class FtrICMD3QNTrainer:
 
         # ---- resume optimizers / schedulers / counters (needs all of the above to exist) ----
         self._restore_training_state()
+
+        # Warm-start the replay buffer from the previous attempt. Best-effort: a missing or
+        # unreadable file just means a cold buffer (see replay_buffer_io).
+        if self.config.replay_buffer_save_fraction > 0:
+            load_replay_subset(
+                self.replay_buffer, self.run_logger.candidate_weight_dirs(), self.term_logger
+            )
 
         self._grad_steps = 0
         self.term_logger.info("Initialized FtrICMD3QNTrainer.")
@@ -614,6 +632,14 @@ class FtrICMD3QNTrainer:
                 self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.icm.state_dict(), f"icm_step_{total_collected_frames}")
                 self._save_training_checkpoint(effective_i, total_collected_frames)
+                if self.config.replay_buffer_save_fraction > 0:
+                    save_replay_subset(
+                        self.replay_buffer,
+                        self.config.replay_buffer_capacity,
+                        self.run_logger.weights_path,
+                        self.config.replay_buffer_save_fraction,
+                        self.term_logger,
+                    )
             if effective_i % self.config.eval_and_save_every == 0 and effective_i > 0:
                 try:
                     eval_log = self._get_eval_rollout_results()
