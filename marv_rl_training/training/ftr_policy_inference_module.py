@@ -158,6 +158,7 @@ class FtrPolicyInferenceModule:
     def _build_obs(
         self,
         heightmap: np.ndarray,
+        heightmap_extent: list | None,
         goal_vec_local: np.ndarray,
         xd_local: np.ndarray,
         omega_local: np.ndarray,
@@ -166,16 +167,28 @@ class FtrPolicyInferenceModule:
         robot_z: float,
     ) -> torch.Tensor:
         """Assemble the 966-D FTR observation from raw sensor values."""
-        import cv2
+        from marv_rl_training.training.ftr_heightmap_window import ftr_heightmap_window
 
-        # Heightmap: resample to 45×21 if needed, then centre on the robot's own ground
-        # reference (robot_z - track_wheel_radius) — matches training's
-        # calc_scanned_height_maps exactly (marv_rl_module.py), NOT the local patch's own
-        # mean (which is a different quantity whenever the patch's local terrain mean
-        # differs from the robot's actual height, e.g. while climbing).
-        hm = heightmap.astype(np.float32)
-        if hm.shape != (self._HM_ROWS, self._HM_COLS):
-            hm = cv2.resize(hm, (self._HM_COLS, self._HM_ROWS), interpolation=cv2.INTER_LINEAR)
+        # Crop to FTR's own 2.25 x 1.05 m window and mirror the lateral axis onto the
+        # training convention. Both steps are load-bearing and both used to be missing here
+        # (a bare cv2.resize of the whole map):
+        #
+        #  * LATERAL MIRROR. grid_map indexes col 0 at y_max — verified in grid_map_core's
+        #    transformBufferOrderToMapFrame, which returns {-index[0], -index[1]}, so index
+        #    (0,0) is (x_max, y_max) = FRONT-LEFT. Training is the opposite: measuring
+        #    MapHelper.get_obs + calc_scanned_height_maps' .flip(0) puts col 0 at -y, i.e.
+        #    the robot's RIGHT. Feeding the map through unflipped hands the policy a
+        #    left-right mirrored world, so it steers its flippers toward obstacles on the
+        #    wrong side. (The comment at ftr_env.py's flip(0) calls col 0 "left"; that
+        #    labels -y as left, which is backwards under REP-103.)
+        #  * WINDOW. A typical elevation_mapping crop is 8 x 8 m at 0.05 m = 160 x 160.
+        #    Resizing that straight to 45 x 21 squeezes 8 m into the 2.25 m the policy
+        #    believes it is seeing, so obstacles arrive ~3.6x too small along-track and
+        #    ~7.6x laterally.
+        #
+        # ftr_heightmap_window does both, and is the same helper the D3QN/CREPS modules use.
+        # It only flips when `heightmap_extent` is supplied, so passing it is required.
+        hm = ftr_heightmap_window(heightmap.astype(np.float32), heightmap_extent)
         hm_flat = (hm - (robot_z - self.track_wheel_radius)).flatten()  # [945]
 
         # Roll, pitch from ROS quaternion convention (x, y, z, w)
@@ -211,8 +224,10 @@ class FtrPolicyInferenceModule:
 
         Args:
             heightmap: 2-D elevation map (any size; resampled internally to 45×21).
-            heightmap_extent: Unused — FTR uses a fixed 2.25×1.05 m map. Kept for
-                API compatibility with PPOPolicyInferenceModule.
+            heightmap_extent: (x_max, y_max, x_min, y_min) in metres, robot frame.
+                REQUIRED: it is what lets the map be cropped to FTR's 2.25×1.05 m window
+                and mirrored onto the training lateral convention. Passing None falls back
+                to a bare resample and yields a mirrored, scale-squashed observation.
             goal_vec_local: (3,) goal vector in robot frame (m).
             xd_local: (3,) linear velocity in robot frame (m/s).
             omega_local: (3,) angular velocity in robot frame (rad/s).
@@ -224,7 +239,7 @@ class FtrPolicyInferenceModule:
         Returns:
             (6,) float32 array [v, w, fl, fr, rl, rr] — raw policy output in [-1, 1].
         """
-        obs = self._build_obs(heightmap, goal_vec_local, xd_local, omega_local, thetas, quat, robot_z)
+        obs = self._build_obs(heightmap, heightmap_extent, goal_vec_local, xd_local, omega_local, thetas, quat, robot_z)
         td = TensorDict({OBS_KEY: obs}, batch_size=[1], device=self.device)
         td = self.vecnorm(td)
         with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():

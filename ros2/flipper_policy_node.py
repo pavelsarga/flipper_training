@@ -53,6 +53,12 @@ class FlipperPolicyNode(Node):
         self.declare_parameter("track_velocity_scale", 1.0)   # Scale factor for FTR track velocity commands
         self.declare_parameter("publish_debug_cloud", True)  # Publish heightmap as point cloud for debugging
         self.declare_parameter("disable_turning", False)  # Force angular velocity to 0
+        # /policy_heightmap_img orientation. True (default) = drawn the way the world looks,
+        # so the panel lines up with /policy_heightmap_debug and Gazebo. False = the raw
+        # policy-convention observation, which is deliberately mirrored left/right (training
+        # puts col 0 at -y; see _publish_heightmap_image). This only affects the picture —
+        # the policy builds its own observation in infer_action and never sees this.
+        self.declare_parameter("heightmap_image_world_orientation", True)
 
         # Get parameters
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
@@ -65,6 +71,9 @@ class FlipperPolicyNode(Node):
         self.flipper_velocity_scale = self.get_parameter("flipper_velocity_scale").get_parameter_value().double_value
         self.track_velocity_scale = self.get_parameter("track_velocity_scale").get_parameter_value().double_value
         self.publish_debug_cloud = self.get_parameter("publish_debug_cloud").get_parameter_value().bool_value
+        self.heightmap_image_world_orientation = self.get_parameter(
+            "heightmap_image_world_orientation"
+        ).get_parameter_value().bool_value
         self.disable_turning = self.get_parameter("disable_turning").get_parameter_value().bool_value
 
         if not config_path or not policy_weights_path:
@@ -261,16 +270,24 @@ class FlipperPolicyNode(Node):
             cols = msg.data[layer_idx].layout.dim[0].size
             rows = msg.data[layer_idx].layout.dim[1].size
 
-            # Reshape with Fortran order and handle circular buffer
-            heightmap = data.reshape((cols, rows), order='F')
+            # grid_map_ros packs the layer as the Eigen matrix in COLUMN-major order with
+            # `rows` rows, so the matrix is recovered with reshape((rows, cols), order="F").
+            # This previously read reshape((cols, rows), order="F"), which happens to be
+            # identical for a SQUARE map (the usual elevation_mapping case, so it went
+            # unnoticed) but silently transposes — or raises — as soon as length_x !=
+            # length_y. dim[0] is "column_index" and dim[1] is "row_index", hence the
+            # cols/rows names above.
+            heightmap = data.reshape((rows, cols), order='F')
 
             # Apply circular buffer start indices if present
             if msg.outer_start_index != 0 or msg.inner_start_index != 0:
                 heightmap = np.roll(heightmap, -msg.outer_start_index, axis=0)
                 heightmap = np.roll(heightmap, -msg.inner_start_index, axis=1)
 
-            # Transpose to get [rows, cols] with X along rows, Y along cols
-            #heightmap = heightmap.T
+            # No transpose: the reshape above already yields grid_map's [row, col] matrix,
+            # with row 0 = x_max (front) and col 0 = y_max (the robot's LEFT). Verified in
+            # grid_map_core/GridMapMath.cpp: transformBufferOrderToMapFrame returns
+            # {-index[0], -index[1]}, so index (0,0) is the front-left cell.
 
             # Handle NaN values (unknown areas)
             heightmap = np.nan_to_num(heightmap, nan=0.0)
@@ -796,12 +813,38 @@ class FlipperPolicyNode(Node):
         )
 
     def _publish_heightmap_image(self, hmap: np.ndarray) -> None:
+        """Publish the policy's heightmap window for RViz.
+
+        Display only — this is a dead end. The policy builds its own observation inside
+        infer_action (ftr_policy_inference_module._build_obs), from the same raw
+        `current_heightmap` but independently of anything done here, so no choice made in
+        this function can affect what the robot does.
+
+        What is drawn is the real FTR window (2.25 x 1.05 m cropped and resampled to 45x21,
+        via ftr_heightmap_window), not the whole map squashed with a bare cv2.resize as it
+        used to be. Only the lateral direction is a display choice:
+
+          heightmap_image_world_orientation = True  (default)
+              Mirrored back to world orientation: row 0 (top) = FRONT, col 0 (left) = the
+              robot's LEFT. Lines up with /policy_heightmap_debug and Gazebo, so the panel
+              can be compared against reality at a glance.
+          heightmap_image_world_orientation = False
+              The observation exactly as the network receives it: col 0 = the robot's
+              RIGHT, because training's MapHelper.get_obs + .flip(0) put col 0 at -y. This
+              looks mirrored on screen, and that is correct.
+
+        The mirror between the two conventions is what
+        marv_rl_training/training/test_heightmap_orientation.py pins; it is not something
+        this panel can verify either way.
+        """
         if hmap is None or hmap.size == 0:
             return
-        # For FTR, resize to the 45×21 grid the policy actually uses
-        if self._is_ftr and hmap.shape != (45, 21):
-            import cv2
-            hmap = cv2.resize(hmap, (21, 45), interpolation=cv2.INTER_LINEAR)
+        if self._is_ftr:
+            from marv_rl_training.training.ftr_heightmap_window import ftr_heightmap_window
+            hmap = ftr_heightmap_window(np.asarray(hmap, dtype=np.float32), self.heightmap_extent)
+        if self.heightmap_image_world_orientation:
+            # Undo training's lateral mirror for display only (see the docstring).
+            hmap = hmap[:, ::-1]
         h, w = hmap.shape
         lo, hi = hmap.min(), hmap.max()
         norm = ((hmap - lo) / (hi - lo + 1e-6) * 255).astype(np.uint8)
