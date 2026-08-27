@@ -659,45 +659,96 @@ class MitriakovPolicyNode(Node):
         self._publish_hud(front_angle, rear_angle, psi_front, psi_rear, is_ascending)
 
     def _publish_hud(self, front_cmd, rear_cmd, psi_front, psi_rear, is_ascending):
-        """rl_generic.rviz's Flipper Command HUD: top-down schematic, front to the LEFT
-        (same layout/orientation flipper_policy_node.py uses, so the panel means the same
-        thing whichever policy is driving). This is a POSITION-mode policy, so each
-        corner shows the commanded ANGLE and its current measured angle rather than the
-        up/down/still direction glyph the velocity-mode families show -- and the pair
-        together is what tells you whether the flippers are actually reaching the target
-        or stalling against terrain, which was the failure mode this whole baseline kept
-        hitting in sim (see marv_config_mitriakov.yaml's notes on flipper torque pinned
-        at the effort limit)."""
+        """rl_generic.rviz's Flipper Command HUD, drawn as a SIDE view (front to the
+        LEFT) rather than the top-down four-corner schematic the velocity-mode families
+        use, for two reasons specific to this policy:
+
+        * `sync_flipper_control: true` means the front pair and the rear pair each move
+          as one, so a four-corner layout necessarily prints two values twice -- pure
+          duplication, and the main thing making the panel crowded.
+        * A flipper ANGLE is a side-view quantity, and its sign convention is MIRRORED
+          between the ends (front: negative = up; rear: positive = up -- see this repo's
+          CLAUDE.md table). A bare signed number therefore cannot be read as up or down
+          without remembering which end you are looking at, which is exactly the
+          confusion this panel should be removing. Drawing each flipper as a line at its
+          real angle makes up/down unambiguous without knowing the convention at all.
+
+        Commanded angle is the bright solid line; the measured angle is a dim ghost line
+        behind it. The GAP between them is the point of the panel: it is what
+        "commanding hard into terrain that will not yield" looks like, which is the
+        failure mode this baseline kept hitting (see marv_config_mitriakov.yaml's note on
+        flipper torque pinned at the effort limit).
+        """
         if cv2 is None:
             return
-        W, H = 360, 180
-        img = np.full((H, W, 3), 32, dtype=np.uint8)
-        x0, y0, x1, y1 = 70, 50, 290, 130
-        cv2.rectangle(img, (x0, y0), (x1, y1), (90, 90, 90), 2, cv2.LINE_AA)
-        nose = np.array([(x0 - 20, (y0 + y1) // 2), (x0, y0 + 8), (x0, y1 - 8)], dtype=np.int32)
-        cv2.fillPoly(img, [nose], (110, 110, 110))
+        W, H = 470, 276
+        img = np.full((H, W, 3), 28, dtype=np.uint8)
+        DIM, MID, BRIGHT = (110, 110, 110), (150, 150, 150), (215, 215, 215)
 
-        # Front pair and rear pair are commanded together (sync_flipper_control), so both
-        # corners of a pair necessarily carry the same number -- shown per corner anyway
-        # to keep the panel readable next to the other baselines' four-corner HUDs.
-        for label, (cx, cy), cmd, meas in (
-                ("FL", (x0 + 34, y0 - 6), front_cmd, psi_front),
-                ("FR", (x0 + 34, y1 + 22), front_cmd, psi_front),
-                ("RL", (x1 - 34, y0 - 6), rear_cmd, psi_rear),
-                ("RR", (x1 - 34, y1 + 22), rear_cmd, psi_rear)):
+        # --- header: name + climb-direction badge -------------------------------
+        cv2.putText(img, "MITRIAKOV", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, BRIGHT, 1, cv2.LINE_AA)
+        badge, bcol = ("ASCEND", (90, 200, 90)) if is_ascending else ("DESCEND", (230, 170, 60))
+        cv2.rectangle(img, (W - 132, 8), (W - 12, 34), bcol, 1, cv2.LINE_AA)
+        cv2.putText(img, badge, (W - 122, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bcol, 1, cv2.LINE_AA)
+
+        # --- side view ------------------------------------------------------------
+        cx0, cx1, cyt, cyb = 165, 305, 92, 116       # chassis box
+        pivot_y = (cyt + cyb) // 2
+        L = 58                                        # drawn flipper length, px
+        # 0 deg datum: a faint horizontal through both pivots, so "level" is visible as
+        # a reference rather than something you infer from the number.
+        cv2.line(img, (56, pivot_y), (W - 56, pivot_y), (58, 58, 58), 1, cv2.LINE_AA)
+        cv2.rectangle(img, (cx0, cyt), (cx1, cyb), (95, 95, 95), -1)
+        # End labels sit OUTSIDE the tip arc (radius L about each pivot) rather than
+        # above or below the chassis, where a fully raised or fully lowered flipper
+        # would draw straight through them.
+        cv2.putText(img, "front", (12, pivot_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, DIM, 1, cv2.LINE_AA)
+        cv2.putText(img, "rear", (W - 48, pivot_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, DIM, 1, cv2.LINE_AA)
+
+        def tip(end, ang):
+            """Flipper tip in screen coords. Front extends LEFT (-x) and rear RIGHT
+            (+x); screen y grows downward, so the two ends' opposite sign conventions
+            (front up = negative, rear up = positive) both come out as "tip above the
+            pivot" with these signs -- which is the whole point of drawing it."""
+            if end == "front":
+                return int(cx0 - L * math.cos(ang)), int(pivot_y + L * math.sin(ang))
+            return int(cx1 + L * math.cos(ang)), int(pivot_y - L * math.sin(ang))
+
+        for end, px, cmd, meas in (("front", cx0, front_cmd, psi_front),
+                                    ("rear", cx1, rear_cmd, psi_rear)):
+            gx, gy = tip(end, meas)
+            cv2.line(img, (px, pivot_y), (gx, gy), (85, 85, 85), 5, cv2.LINE_AA)   # measured ghost
+            tx, ty = tip(end, cmd)
             err = abs(math.degrees(cmd - meas))
-            # Amber once the measured angle is far from the target: that gap IS the
-            # "commanding hard into terrain that will not yield" signature.
-            color = (70, 210, 70) if err < 12.0 else (60, 170, 240)
-            cv2.putText(img, f"{label} {math.degrees(cmd):+6.1f}", (cx - 40, cy),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, color, 1, cv2.LINE_AA)
-            cv2.putText(img, f"is {math.degrees(meas):+6.1f}", (cx - 34, cy + 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1, cv2.LINE_AA)
+            col = (90, 215, 90) if err < 12.0 else (60, 170, 240)
+            cv2.line(img, (px, pivot_y), (tx, ty), col, 2, cv2.LINE_AA)            # commanded
+            cv2.circle(img, (tx, ty), 4, col, -1, cv2.LINE_AA)
+            cv2.circle(img, (px, pivot_y), 4, (140, 140, 140), -1, cv2.LINE_AA)
 
-        cv2.putText(img, "ASCEND" if is_ascending else "DESCEND", (x0 + 66, (y0 + y1) // 2 + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
-        cv2.putText(img, "mitriakov  cmd deg / measured deg", (10, H - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (130, 130, 130), 1, cv2.LINE_AA)
+        # --- numbers --------------------------------------------------------------
+        # UP/DOWN spelled out, resolving the mirrored convention in words so the reader
+        # never has to. Deadband so a near-level flipper does not flicker UP/DOWN.
+        def updown(end, ang):
+            up = ang < 0 if end == "front" else ang > 0
+            return "level" if abs(math.degrees(ang)) < 3.0 else ("UP" if up else "DOWN")
+
+        cv2.putText(img, "cmd", (150, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.38, DIM, 1, cv2.LINE_AA)
+        cv2.putText(img, "now", (232, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.38, DIM, 1, cv2.LINE_AA)
+        for row, (end, cmd, meas) in enumerate((("front", front_cmd, psi_front),
+                                                 ("rear", rear_cmd, psi_rear))):
+            y = 216 + row * 26
+            err = abs(math.degrees(cmd - meas))
+            col = (90, 215, 90) if err < 12.0 else (60, 170, 240)
+            cv2.putText(img, f"{end.upper():<5s}", (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, MID, 1, cv2.LINE_AA)
+            cv2.putText(img, f"{math.degrees(cmd):+7.1f}", (100, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+            cv2.putText(img, f"{math.degrees(meas):+7.1f}", (196, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, MID, 1, cv2.LINE_AA)
+            cv2.putText(img, updown(end, cmd), (300, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+            if err >= 12.0:
+                cv2.putText(img, f"gap {err:.0f}", (370, y), cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+                            (60, 170, 240), 1, cv2.LINE_AA)
+
+        cv2.putText(img, "deg, 0 = level   bright = commanded, grey = measured", (14, H - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 120, 120), 1, cv2.LINE_AA)
 
         img = np.ascontiguousarray(img, dtype=np.uint8)
         msg = RosImage()
