@@ -94,6 +94,7 @@ try:
 except ImportError:  # the HUD image degrades to a no-op; markers are unaffected
     cv2 = None
 from builtin_interfaces.msg import Time as TimeMsg
+from geometry_msgs.msg import Point
 from grid_map_msgs.msg import GridMap
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -655,7 +656,8 @@ class MitriakovPolicyNode(Node):
             self.pubs[corner].publish(Float64(data=rear_angle))
 
         self.pub_obs.publish(Float64MultiArray(data=[float(x) for x in obs]))
-        self._publish_markers(p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending, n_found)
+        self._publish_markers(p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending, n_found,
+                               rx, ry, rz, yaw, self.latest_map.header.frame_id)
         self._publish_hud(front_angle, rear_angle, psi_front, psi_rear, is_ascending)
 
     def _publish_hud(self, front_cmd, rear_cmd, psi_front, psi_rear, is_ascending):
@@ -760,52 +762,96 @@ class MitriakovPolicyNode(Node):
         msg.header.frame_id = self.base_frame
         self.pub_hud.publish(msg)
 
-    def _publish_markers(self, p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending, n_found):
-        """The two step-edge reference points, in base_link. p_y_* are heights relative
-        to the TRACK CONTACT PLANE (that is the frame the observation is built in), so
-        they are shifted down by track_wheel_radius to land in base_link, which sits at
-        axle height. p_x_rear/p_y_rear are stored as "distance BACK to the previous
-        edge", hence negated again to plot as a position."""
+    def _publish_markers(self, p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending,
+                          n_found, rx, ry, rz, yaw, map_frame):
+        """The two step-edge reference points plus a ground-level polyline through the
+        robot, published in the MAP frame.
+
+        NOT in base_link, which is what the first version did and what made the markers
+        sink underground whenever the chassis pitched. The observation's geometry is
+        built in a yaw-only, gravity-aligned frame -- step_edges() walks the map's XY
+        plane along the robot's heading and measures every height against the track
+        contact plane, so p_y_* are world-vertical offsets, not chassis-relative ones.
+        Placing them in base_link re-interprets those numbers in the PITCHED chassis
+        frame, which tips the whole pair with the robot and buries it on any slope or
+        stair. Converting to map coordinates here puts each point back where it was
+        actually measured, so the markers stay pinned on the terrain regardless of
+        attitude -- and, as a bonus, no TF transform is needed at all when RViz's fixed
+        frame is already map.
+
+        Heights are the terrain height at each edge: the contact plane sits at
+        rz - track_wheel_radius, and h (= p_y_front, or -p_y_rear for the previous edge)
+        is the edge's height above that plane, so their sum is ground level in map z.
+        """
         # ZERO stamp, deliberately -- "use the latest transform you have", not "the
-        # transform at this instant". base_link->map is produced by the ICP/odom chain a
-        # few tens of ms behind the clock, so stamping these with now() asks TF to
-        # extrapolate into the future; RViz refuses ("Lookup would require extrapolation
-        # into the future. Requested time 132.400000 but the latest data is at time
-        # 132.368000") and DROPS the markers, which at 20 Hz reads as violent flicker
-        # rather than as an error. These are decorations pinned to the robot's current
-        # pose, so the newest available transform is exactly what they want anyway.
+        # transform at this instant". map->base_link comes off the ICP/odom chain a few
+        # tens of ms behind the clock, so stamping with now() asks TF to extrapolate into
+        # the future; RViz refuses ("Lookup would require extrapolation into the future")
+        # and DROPS the markers, which at 20 Hz reads as violent flicker rather than as
+        # an error. Same convention (and reasoning) as flipper_policy_node.py's
+        # _viz_stamp().
         now = TimeMsg()
         arr = MarkerArray()
         r = self._terrain.track_wheel_radius
         solid = n_found == 2
-        for i, (name, x, z, rgb) in enumerate((
-                ("next_edge", p_x_front, p_y_front - r, (0.1, 0.9, 0.2)),
-                ("prev_edge", -p_x_rear, -p_y_rear - r, (1.0, 0.6, 0.1)))):
+        c, s = math.cos(yaw), math.sin(yaw)
+        ground_z = rz - r                      # track contact plane, map z
+
+        def world(local_x, h):
+            """Yaw-only local (along-heading, height-above-contact-plane) -> map xyz."""
+            return rx + local_x * c, ry + local_x * s, ground_z + h
+
+        next_pt = world(p_x_front, p_y_front)
+        prev_pt = world(-p_x_rear, -p_y_rear)
+        robot_pt = (rx, ry, ground_z)
+
+        for i, (name, pt, rgb) in enumerate((("next_edge", next_pt, (0.1, 0.9, 0.2)),
+                                              ("prev_edge", prev_pt, (1.0, 0.6, 0.1)))):
             mk = Marker()
-            mk.header.frame_id = self.base_frame
+            mk.header.frame_id = map_frame
             mk.header.stamp = now
             mk.ns = f"mitriakov_{name}"
             mk.id = i
             mk.type = Marker.SPHERE
             mk.action = Marker.ADD
-            mk.pose.position.x, mk.pose.position.y, mk.pose.position.z = float(x), 0.0, float(z)
+            mk.pose.position.x, mk.pose.position.y, mk.pose.position.z = (float(v) for v in pt)
             mk.pose.orientation.w = 1.0
             mk.scale.x = mk.scale.y = mk.scale.z = 0.12
             mk.color.r, mk.color.g, mk.color.b = rgb
-            # Hollow-looking (translucent) whenever the point is an extrapolation rather
-            # than a measured riser, so a glance separates "tracking a real step" from
-            # "mirroring across flat ground".
+            # Translucent whenever the point is an extrapolation rather than a measured
+            # riser, so a glance separates "tracking a real step" from "mirroring across
+            # flat ground".
             mk.color.a = 0.95 if solid else 0.35
             arr.markers.append(mk)
 
+        # prev edge -> robot -> next edge, along the ground. Makes the two spheres read
+        # as one measurement of the terrain profile the policy is actually acting on,
+        # and shows at a glance which side of the robot each edge is on.
+        link = Marker()
+        link.header.frame_id = map_frame
+        link.header.stamp = now
+        link.ns = "mitriakov_link"
+        link.id = 3
+        link.type = Marker.LINE_STRIP
+        link.action = Marker.ADD
+        link.pose.orientation.w = 1.0
+        link.scale.x = 0.015                   # LINE_STRIP: scale.x is the line width
+        link.color.r, link.color.g, link.color.b = 0.6, 0.8, 1.0
+        link.color.a = 0.9 if solid else 0.4
+        for pt in (prev_pt, robot_pt, next_pt):
+            p = Point()
+            p.x, p.y, p.z = (float(v) for v in pt)
+            link.points.append(p)
+        arr.markers.append(link)
+
         txt = Marker()
-        txt.header.frame_id = self.base_frame
+        txt.header.frame_id = map_frame
         txt.header.stamp = now
         txt.ns = "mitriakov_state"
         txt.id = 2
         txt.type = Marker.TEXT_VIEW_FACING
         txt.action = Marker.ADD
-        txt.pose.position.z = 0.6
+        txt.pose.position.x, txt.pose.position.y, txt.pose.position.z = float(rx), float(ry), float(rz + 0.5)
         txt.pose.orientation.w = 1.0
         txt.scale.z = 0.14
         txt.color.r = txt.color.g = txt.color.b = txt.color.a = 1.0
