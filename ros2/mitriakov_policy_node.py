@@ -88,14 +88,21 @@ import rclpy
 import torch
 import torch.nn as nn
 import yaml
+
+try:
+    import cv2
+except ImportError:  # the HUD image degrades to a no-op; markers are unaffected
+    cv2 = None
+from builtin_interfaces.msg import Time as TimeMsg
 from grid_map_msgs.msg import GridMap
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Image as RosImage, JointState
 from std_msgs.msg import Float64, Float64MultiArray
 from tf2_ros import Buffer, TransformListener
+from visualization_msgs.msg import Marker, MarkerArray
 
 CORNERS = ("front_left", "front_right", "rear_left", "rear_right")
 FLIPPER_NAMES = ["front_left_flipper_j", "front_right_flipper_j", "rear_left_flipper_j", "rear_right_flipper_j"]
@@ -306,23 +313,42 @@ class StepEdgeSampler:
         return out
 
     def step_edges(self, msg, rx, ry, rz, yaw,
-                    window_m: float = 1.5, res_m: float = 0.03,
+                    window_m: float = 3.0, res_m: float = 0.03,
                     dead_zone_m: float = 0.08, riser_threshold_m: float = 0.07):
-        """-> (p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending) or None.
+        """-> (p_x_front, p_y_front, p_x_rear, p_y_rear, n_found) or None.
+
+        None ONLY when the map has no usable layer -- a distinct, actionable failure
+        (wrong elevation_layer / map not arriving) that must not look the same as
+        "standing on flat ground", which is a perfectly normal state with a perfectly
+        well-defined observation. n_found (0/1/2) says how many real risers backed
+        the answer, for diagnostics.
 
         Samples height along the robot's local +x axis (y=0) from -window_m to
         +window_m at res_m spacing, relative to the track contact plane. dead_zone_m
         excludes samples directly under the robot (own-body occlusion) from edge
-        detection. A "step edge" is the largest consecutive-sample |height jump|
-        clearing riser_threshold_m, picked once ahead of the dead zone (next_edge,
-        Fig. 2a's front reference point) and once behind it (prev_edge, rear
-        reference point). None if either side has no riser within window_m (flat
-        ground, or the map hasn't covered far enough yet) -- caller should hold the
-        last command rather than act on a clipped fallback.
+        detection. A "step edge" is a consecutive-sample |height jump| clearing
+        riser_threshold_m, taken nearest the robot ahead of the dead zone (next_edge,
+        Fig. 2a's front reference point) and nearest behind it (prev_edge, rear
+        reference point).
 
-        is_ascending = the far side of whichever edge sits closer to the robot is
-        HIGHER than the near side -- i.e. is the staircase, right where the robot
-        currently straddles it, going up in the direction of travel.
+        MISSING EDGES MIRROR TRAINING'S CLAMP RATHER THAN ABORTING. mitriakov_module.
+        py's _progress_and_edges() indexes an analytic edge table with
+        `next_idx = clamp(searchsorted(edges, progress_x), max=n-1)` and
+        `prev_idx = clamp(next_idx - 1, min=0)`, so the observation is ALWAYS defined:
+        before the staircase both indices collapse onto edges[0], making the front and
+        rear pair an exact mirror (p_x_rear = -p_x_front, p_y_rear = -p_y_front) whose
+        magnitude is simply the distance still to travel. The whole approach phase of
+        every training episode looks like that, so it is squarely in-distribution -- and
+        the policy has to be able to act during the approach, since that is when it
+        chooses the pose it will hit the first step with. Reproduced here:
+          * riser ahead, none behind (the normal approach) -> rear mirrors front;
+          * riser behind, none ahead (rolled off the last step) -> front mirrors rear;
+          * neither (flat ground, or staircase still beyond the map) -> saturate at
+            +-window_m with zero height, i.e. "nothing anywhere near", still mirrored.
+        Returning None here instead -- as the first version of this node did -- meant
+        the node held its (nonexistent) last command and never wrote a flipper target
+        at all until the robot was already straddling a step, which on an 8 m map with
+        the obstacle 4 m out is never.
         """
         grid = self._grid_array(msg)
         if grid is None:
@@ -342,15 +368,33 @@ class StepEdgeSampler:
 
         edge_ahead = self._nearest_riser(xs[ahead_mask], h[ahead_mask], riser_threshold_m, from_start=True)
         edge_behind = self._nearest_riser(xs[behind_mask], h[behind_mask], riser_threshold_m, from_start=False)
-        if edge_ahead is None or edge_behind is None:
-            return None
-        x_ahead, h_ahead = edge_ahead
-        x_behind, h_behind = edge_behind
+        n_found = int(edge_ahead is not None) + int(edge_behind is not None)
 
-        p_x_front, p_y_front = x_ahead, h_ahead
-        p_x_rear, p_y_rear = -x_behind, -h_behind
-        is_ascending = bool(h_ahead > h_behind)
-        return p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending
+        # (x_next, h_next) / (x_prev, h_prev) are the next/previous edge in signed
+        # robot-local x (negative = behind), mirroring mitriakov_module.py's
+        # next_edge/prev_edge exactly -- INCLUDING the clamp, where prev_idx == next_idx
+        # makes them literally the same edge (not a reflected one), which is what turns
+        # the p_front/p_rear pair into exact negatives of each other.
+        if edge_ahead is not None and edge_behind is not None:
+            x_next, h_next = edge_ahead
+            x_prev, h_prev = edge_behind
+        elif edge_ahead is not None:
+            x_next, h_next = edge_ahead
+            x_prev, h_prev = x_next, h_next
+        elif edge_behind is not None:
+            x_prev, h_prev = edge_behind
+            x_next, h_next = x_prev, h_prev
+        else:
+            x_next, h_next = window_m, 0.0
+            x_prev, h_prev = x_next, h_next
+
+        # Training's exact four expressions, with h_* already expressed as
+        # (edge height - robot height) by the contact-plane subtraction above:
+        #   p_x_front = next_edge - progress   p_y_front = next_height - height_rel
+        #   p_x_rear  = progress - prev_edge   p_y_rear  = height_rel - prev_height
+        p_x_front, p_y_front = x_next, h_next
+        p_x_rear, p_y_rear = -x_prev, -h_prev
+        return p_x_front, p_y_front, p_x_rear, p_y_rear, n_found
 
     @staticmethod
     def _nearest_riser(xs, h, riser_threshold_m, from_start):
@@ -393,9 +437,25 @@ class MitriakovPolicyNode(Node):
         # Empty sentinel: resolved from `gt` below unless explicitly overridden.
         self.declare_parameter("elevation_topic", "")
         self.declare_parameter("odom_topic", "")
+        # /marv/joint_states, NOT plain /joint_states. Both are throttles off the gz
+        # bridge's /joint_states_raw (sim_foundation.launch.py), but /marv/joint_states is
+        # the "robot-parity" feed that file deliberately added and that the reactive
+        # controller, robot_state_publisher, flipper_eval_node, xu_hto and oehler_baseline
+        # all subscribe to -- so it is the one kept alive and watched. Plain /joint_states
+        # was observed with ZERO publishers on a fully-running session (its throttle
+        # process had died while the marv one kept going), which starved this node
+        # completely: it sat on "waiting for elevation map / joint states" forever and
+        # never published a flipper command, a marker or a HUD frame.
+        self.declare_parameter("joint_topic", "/marv/joint_states")
         self.declare_parameter("elevation_layer", "elevation_inpainted")
-        self.declare_parameter("edge_window_m", 1.5)
+        # 3.0 m: the sim's elevation map is 8x8 m robot-centred (elevation_sim.yaml's
+        # length_in_x/y), so +-3 m stays well inside it with margin for the map lagging
+        # the robot. It has to be this big -- the arena's obstacles sit ~4 m from spawn,
+        # and a window that cannot see the staircase reports flat ground all the way in.
+        self.declare_parameter("edge_window_m", 3.0)
         self.declare_parameter("edge_riser_threshold_m", 0.07)
+        # Deadband on p_y_front for the ascending/descending latch (see _tick).
+        self.declare_parameter("ascend_deadband_m", 0.04)
 
         gp = lambda n: self.get_parameter(n).get_parameter_value()  # noqa: E731
         config_path = gp("config_path").string_value
@@ -407,9 +467,11 @@ class MitriakovPolicyNode(Node):
         gt = gp("gt").bool_value
         elevation_topic = gp("elevation_topic").string_value
         odom_topic = gp("odom_topic").string_value
+        joint_topic = gp("joint_topic").string_value
         self.elevation_layer = gp("elevation_layer").string_value
         self.edge_window_m = gp("edge_window_m").double_value
         self.edge_riser_threshold_m = gp("edge_riser_threshold_m").double_value
+        self.ascend_deadband_m = gp("ascend_deadband_m").double_value
 
         if not config_path or not weights_path:
             self.get_logger().error("config_path and policy_weights_path parameters are required!")
@@ -443,21 +505,41 @@ class MitriakovPolicyNode(Node):
         self.latest_map = None
         self.latest_joints = None
         self.fwd_vel = 0.0
+        self.is_ascending = True  # latched, see _tick
+        self._last_n_found = None
 
         sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
 
         self.create_subscription(GridMap, elevation_topic, self._on_map, 2)
-        self.create_subscription(JointState, "/joint_states", self._on_joints, sensor_qos)
+        self.create_subscription(JointState, joint_topic, self._on_joints, sensor_qos)
         self.create_subscription(Odometry, odom_topic, self._on_odom, sensor_qos)
+        self._elevation_topic, self._joint_topic = elevation_topic, joint_topic
 
         self.pubs = {c: self.create_publisher(Float64, f"/flippers_cmd_pos/{c}", 4) for c in CORNERS}
         self.pub_obs = self.create_publisher(Float64MultiArray, "~/obs", 5)
+        # /policy_obs_markers is an existing display in marv_flipper_eval's rl_generic.rviz
+        # (the config policy.launch.py falls back to for any rl run without a dedicated
+        # one). Publishing the detected step edges there means that config shows this
+        # node's actual perception instead of sitting empty -- its /policy_heightmap*
+        # displays stay blank on purpose, since a mitriakov policy has no heightmap input
+        # at all (mitriakov_observation.py). These two markers ARE the observation's
+        # geometry, and the thing most worth watching: everything downstream is a
+        # deterministic function of them.
+        self.pub_markers = self.create_publisher(MarkerArray, "/policy_obs_markers", 4)
+        # rl_generic.rviz's "Flipper Command HUD" Image display. flipper_policy_node.py
+        # fills this for the families it serves; without it the panel reads "No Image"
+        # for the whole run. Its sibling display, "Policy Heightmap Image", is left
+        # unpublished ON PURPOSE and will keep saying "No Image": a mitriakov policy has
+        # no heightmap input at all (mitriakov_observation.py's 8-D Eq. 2 state vector),
+        # so there is nothing truthful to draw there -- better an obviously empty panel
+        # than a synthesised picture implying an input the network never receives.
+        self.pub_hud = self.create_publisher(RosImage, "/policy_flipper_command_hud", 4)
 
         self.create_timer(1.0 / control_rate, self._tick)
 
         self.get_logger().info(
             f"mitriakov_policy_node ready: {weights_path}\n"
-            f"  gt={gt} -> elevation={elevation_topic}, odom={odom_topic}, joints=/joint_states\n"
+            f"  gt={gt} -> elevation={elevation_topic}, odom={odom_topic}, joints={joint_topic}\n"
             "  -> /flippers_cmd_pos/* only, no /cmd_vel (fixed_forward_vel policy -- "
             "drive with teleop/auto_ride)\n"
             f"  @ {control_rate:g} Hz, edge_window_m={self.edge_window_m:g}, "
@@ -487,8 +569,19 @@ class MitriakovPolicyNode(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def _tick(self):
-        if self.latest_map is None or self.latest_joints is None:
-            self.get_logger().warning("waiting for elevation map / joint states", throttle_duration_sec=5)
+        # Name the topic that is actually silent. The original combined message ("waiting
+        # for elevation map / joint states") could not distinguish a missing map from
+        # missing joints, and the real cause -- a dead /joint_states throttle while the
+        # map streamed fine -- was invisible in it.
+        missing = []
+        if self.latest_map is None:
+            missing.append(self._elevation_topic)
+        if self.latest_joints is None:
+            missing.append(self._joint_topic)
+        if missing:
+            self.get_logger().warning(
+                f"no messages yet on: {', '.join(missing)} -- check that topic has a publisher "
+                "(ros2 topic info <topic>)", throttle_duration_sec=5)
             return
 
         pose = self._terrain.robot_pose(self.latest_map.header.frame_id, self._now())
@@ -502,15 +595,34 @@ class MitriakovPolicyNode(Node):
             window_m=self.edge_window_m, riser_threshold_m=self.edge_riser_threshold_m)
         if edges is None:
             self.get_logger().warning(
-                "no step edge found within edge_window_m on both sides of the robot "
-                "(flat ground, or map not covering far enough yet) -- holding last "
-                "flipper command", throttle_duration_sec=5)
+                f"elevation layer {self.elevation_layer!r} missing from the incoming map "
+                f"(layers: {list(self.latest_map.layers)}) -- holding last flipper command",
+                throttle_duration_sec=5)
             return
-        p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending = edges
+        p_x_front, p_y_front, p_x_rear, p_y_rear, n_found = edges
+
+        # is_ascending: in training this is a FIXED per-episode property of the course
+        # (mitriakov_module.py's _ascending_mask(): target_z > start_z, decided once at
+        # spawn). Nothing hands us that on a real robot, so it is derived from the only
+        # local evidence there is -- whether the next edge ahead is above or below the
+        # robot -- which agrees with the training signal wherever the training signal is
+        # defined: while ascending a staircase the next edge ahead is always higher,
+        # while descending it is always the lip of a drop, hence lower. The deadband +
+        # latch matter because p_y_front passes through ~0 on every flat approach and on
+        # every tread, and this bit SWITCHES WHICH FLIPPER IS ANGLE-LIMITED
+        # (MitriakovFlipperBounds) -- letting it chatter there would swap the tight bound
+        # between front and rear several times per second mid-climb. Latched to whatever
+        # was last unambiguous, starting from ascending.
+        if p_y_front > self.ascend_deadband_m:
+            self.is_ascending = True
+        elif p_y_front < -self.ascend_deadband_m:
+            self.is_ascending = False
+        is_ascending = self.is_ascending
 
         flippers = self._flipper_angles(self.latest_joints)
         if flippers is None:
-            self.get_logger().warning("flipper joint names not found in /joint_states", throttle_duration_sec=5)
+            self.get_logger().warning(
+                f"none of {FLIPPER_NAMES} found in {self._joint_topic}", throttle_duration_sec=5)
             return
         psi_front, psi_rear = flippers
 
@@ -525,12 +637,130 @@ class MitriakovPolicyNode(Node):
         front_angle = self.bounds.to_angle(loc_front, front_lo, front_hi, self.bounds.front_low, self.bounds.front_high)
         rear_angle = self.bounds.to_angle(loc_rear, rear_lo, rear_hi, self.bounds.rear_low, self.bounds.rear_high)
 
+        # Log on CHANGE, not on a throttle: how many real risers back the observation is
+        # the single thing that separates "tracking a staircase" from "extrapolating over
+        # flat ground", and a periodic reprint of an unchanged value buries that.
+        if n_found != self._last_n_found:
+            what = {0: "no risers in window (flat/unmapped -- mirrored saturation)",
+                    1: "one riser (other side mirrored, as in training's approach phase)",
+                    2: "both risers (straddling a step)"}[n_found]
+            self.get_logger().info(
+                f"step-edge perception: {what}; p_front=({p_x_front:+.2f} m, {p_y_front:+.2f} m) "
+                f"p_rear=({p_x_rear:+.2f} m, {p_y_rear:+.2f} m) ascending={is_ascending}")
+            self._last_n_found = n_found
+
         for corner in ("front_left", "front_right"):
             self.pubs[corner].publish(Float64(data=front_angle))
         for corner in ("rear_left", "rear_right"):
             self.pubs[corner].publish(Float64(data=rear_angle))
 
         self.pub_obs.publish(Float64MultiArray(data=[float(x) for x in obs]))
+        self._publish_markers(p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending, n_found)
+        self._publish_hud(front_angle, rear_angle, psi_front, psi_rear, is_ascending)
+
+    def _publish_hud(self, front_cmd, rear_cmd, psi_front, psi_rear, is_ascending):
+        """rl_generic.rviz's Flipper Command HUD: top-down schematic, front to the LEFT
+        (same layout/orientation flipper_policy_node.py uses, so the panel means the same
+        thing whichever policy is driving). This is a POSITION-mode policy, so each
+        corner shows the commanded ANGLE and its current measured angle rather than the
+        up/down/still direction glyph the velocity-mode families show -- and the pair
+        together is what tells you whether the flippers are actually reaching the target
+        or stalling against terrain, which was the failure mode this whole baseline kept
+        hitting in sim (see marv_config_mitriakov.yaml's notes on flipper torque pinned
+        at the effort limit)."""
+        if cv2 is None:
+            return
+        W, H = 360, 180
+        img = np.full((H, W, 3), 32, dtype=np.uint8)
+        x0, y0, x1, y1 = 70, 50, 290, 130
+        cv2.rectangle(img, (x0, y0), (x1, y1), (90, 90, 90), 2, cv2.LINE_AA)
+        nose = np.array([(x0 - 20, (y0 + y1) // 2), (x0, y0 + 8), (x0, y1 - 8)], dtype=np.int32)
+        cv2.fillPoly(img, [nose], (110, 110, 110))
+
+        # Front pair and rear pair are commanded together (sync_flipper_control), so both
+        # corners of a pair necessarily carry the same number -- shown per corner anyway
+        # to keep the panel readable next to the other baselines' four-corner HUDs.
+        for label, (cx, cy), cmd, meas in (
+                ("FL", (x0 + 34, y0 - 6), front_cmd, psi_front),
+                ("FR", (x0 + 34, y1 + 22), front_cmd, psi_front),
+                ("RL", (x1 - 34, y0 - 6), rear_cmd, psi_rear),
+                ("RR", (x1 - 34, y1 + 22), rear_cmd, psi_rear)):
+            err = abs(math.degrees(cmd - meas))
+            # Amber once the measured angle is far from the target: that gap IS the
+            # "commanding hard into terrain that will not yield" signature.
+            color = (70, 210, 70) if err < 12.0 else (60, 170, 240)
+            cv2.putText(img, f"{label} {math.degrees(cmd):+6.1f}", (cx - 40, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, color, 1, cv2.LINE_AA)
+            cv2.putText(img, f"is {math.degrees(meas):+6.1f}", (cx - 34, cy + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1, cv2.LINE_AA)
+
+        cv2.putText(img, "ASCEND" if is_ascending else "DESCEND", (x0 + 66, (y0 + y1) // 2 + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(img, "mitriakov  cmd deg / measured deg", (10, H - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (130, 130, 130), 1, cv2.LINE_AA)
+
+        img = np.ascontiguousarray(img, dtype=np.uint8)
+        msg = RosImage()
+        msg.height, msg.width = img.shape[:2]
+        msg.encoding = "bgr8"
+        msg.is_bigendian = 0
+        msg.step = 3 * msg.width
+        msg.data = img.tobytes()
+        msg.header.frame_id = self.base_frame
+        self.pub_hud.publish(msg)
+
+    def _publish_markers(self, p_x_front, p_y_front, p_x_rear, p_y_rear, is_ascending, n_found):
+        """The two step-edge reference points, in base_link. p_y_* are heights relative
+        to the TRACK CONTACT PLANE (that is the frame the observation is built in), so
+        they are shifted down by track_wheel_radius to land in base_link, which sits at
+        axle height. p_x_rear/p_y_rear are stored as "distance BACK to the previous
+        edge", hence negated again to plot as a position."""
+        # ZERO stamp, deliberately -- "use the latest transform you have", not "the
+        # transform at this instant". base_link->map is produced by the ICP/odom chain a
+        # few tens of ms behind the clock, so stamping these with now() asks TF to
+        # extrapolate into the future; RViz refuses ("Lookup would require extrapolation
+        # into the future. Requested time 132.400000 but the latest data is at time
+        # 132.368000") and DROPS the markers, which at 20 Hz reads as violent flicker
+        # rather than as an error. These are decorations pinned to the robot's current
+        # pose, so the newest available transform is exactly what they want anyway.
+        now = TimeMsg()
+        arr = MarkerArray()
+        r = self._terrain.track_wheel_radius
+        solid = n_found == 2
+        for i, (name, x, z, rgb) in enumerate((
+                ("next_edge", p_x_front, p_y_front - r, (0.1, 0.9, 0.2)),
+                ("prev_edge", -p_x_rear, -p_y_rear - r, (1.0, 0.6, 0.1)))):
+            mk = Marker()
+            mk.header.frame_id = self.base_frame
+            mk.header.stamp = now
+            mk.ns = f"mitriakov_{name}"
+            mk.id = i
+            mk.type = Marker.SPHERE
+            mk.action = Marker.ADD
+            mk.pose.position.x, mk.pose.position.y, mk.pose.position.z = float(x), 0.0, float(z)
+            mk.pose.orientation.w = 1.0
+            mk.scale.x = mk.scale.y = mk.scale.z = 0.12
+            mk.color.r, mk.color.g, mk.color.b = rgb
+            # Hollow-looking (translucent) whenever the point is an extrapolation rather
+            # than a measured riser, so a glance separates "tracking a real step" from
+            # "mirroring across flat ground".
+            mk.color.a = 0.95 if solid else 0.35
+            arr.markers.append(mk)
+
+        txt = Marker()
+        txt.header.frame_id = self.base_frame
+        txt.header.stamp = now
+        txt.ns = "mitriakov_state"
+        txt.id = 2
+        txt.type = Marker.TEXT_VIEW_FACING
+        txt.action = Marker.ADD
+        txt.pose.position.z = 0.6
+        txt.pose.orientation.w = 1.0
+        txt.scale.z = 0.14
+        txt.color.r = txt.color.g = txt.color.b = txt.color.a = 1.0
+        txt.text = f"{'ASCEND' if is_ascending else 'DESCEND'}  risers={n_found}"
+        arr.markers.append(txt)
+        self.pub_markers.publish(arr)
 
 
 def main(args=None):
