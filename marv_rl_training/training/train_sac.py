@@ -129,6 +129,17 @@ class FtrSACConfig:
     alpha_optimizer_opts: dict[str, Any] = field(default_factory=lambda: {"lr": 3e-4})
     loss_function: str = "smooth_l1"
 
+    # Persist the replay buffer across respawns. Without this every PhysX crash threw away
+    # all replay_buffer_capacity transitions while respawn_common.sh went on decrementing
+    # the frame budget as though the data had been kept, so the critic refit from a
+    # near-empty buffer each time. On run 11416521 five crashes landed between 31.0M and
+    # 36.2M frames and eval success rate fell from 0.417 (25-30M bin mean) to 0.341
+    # (35-40M) — a broad regression across nearly every obstacle type, including flat_patch
+    # dropping off 1.000. Costs one buffer's worth of disk (~21 GB at 500k transitions and
+    # history_len 16 — see marv_config_ctrac.yaml's footprint table) held for the whole
+    # job rather than per attempt, so it is a net saving; set False if scratch cannot take it.
+    persist_replay_buffer: bool = True
+
     # C-VAE (Eq. 9-14) — alternating update: for every SAC gradient step, run this many
     # additional supervised C-VAE gradient steps (Fig. 2 caption: "1 iteration" SAC : "5
     # iterations" C-VAE contact-model refinement).
@@ -331,20 +342,26 @@ class FtrSACTrainer:
         # much smaller, single-obs, no-history transitions never hit this at the same
         # nominal capacity, which is why replay_buffer_capacity was copied from those
         # configs without anyone (including this) reconsidering the per-transition size.
+        # The buffer lives at the RUN root (<job>/replay_buffer), not under this attempt's
+        # logpath, and its memmap scratch dir is the same directory the checkpoint is
+        # written to. Both of those are load-bearing for persistence across respawns:
+        # torchrl's TensorStorageCheckpointer is zero-copy in each direction only when the
+        # dump path equals the storage's scratch_dir (dumps() then just calls
+        # memmap_refresh_(); loads() just re-opens the existing memmaps). A per-attempt
+        # scratch dir would turn every save and every resume into a ~21 GB file copy.
+        self._replay_buffer_path = Path(self.run_logger.run_root) / "replay_buffer"
         self.replay_buffer = TensorDictReplayBuffer(
             storage=LazyMemmapStorage(
                 max_size=self.config.replay_buffer_capacity, ndim=1,
-                scratch_dir=str(self.run_logger.logpath / "replay_buffer"),
-                # train_ctrac.sbatch's respawn loop re-invokes this script fresh after a
-                # crash, reusing the same attempt/logpath — existsok=True so a scratch dir
-                # left over from the killed attempt doesn't itself crash the respawn
-                # (the replay buffer restarting empty after a respawn is expected/fine,
-                # same as this project's other off-policy trainers never persisting it
-                # across crash-restarts either).
+                scratch_dir=str(self._replay_buffer_path / "storage"),
+                # existsok=True so the memmap files left behind by the killed attempt
+                # don't themselves crash the respawn — with persist_replay_buffer they
+                # are exactly the files _restore_replay_buffer() reopens.
                 existsok=True,
             ),
             sampler=RandomSampler(), batch_size=self.config.batch_size,
         )
+        self._restore_replay_buffer()
 
         self._grad_steps = 0
         self.term_logger.info("Initialized FtrSACTrainer.")
@@ -360,6 +377,12 @@ class FtrSACTrainer:
     # SLURM job 11362192 that happened 15 times — attempt_14 alone reached 27.8M frames and
     # threw all of it away on the next PhysX crash, while the respawn helper meanwhile
     # decremented the remaining-frames budget as if the progress had been kept.
+    #
+    # The replay buffer was the last piece to be closed, and it cost a second run before it
+    # was: with the networks resuming correctly, run 11416521 still regressed from a 0.417
+    # eval success rate (25-30M bin mean) to 0.341 (35-40M) across a cluster of five crashes
+    # at 31.0-36.2M frames, each of which silently reset 500k transitions. It is persisted
+    # by _save_replay_buffer/_restore_replay_buffer, keyed off persist_replay_buffer.
     #
     # Everything is saved and restored through loss_module rather than through
     # policy_operator/qvalue_operator, because SACLoss.convert_to_functional() re-wraps
@@ -436,6 +459,59 @@ class FtrSACTrainer:
             self.cvae_scheduler.load_state_dict(checkpoint["cvae_scheduler_state_dict"])
         self._grad_steps = checkpoint.get("grad_steps", 0)
 
+    def _restore_replay_buffer(self):
+        """Reopen the previous attempt's replay buffer, if one was checkpointed.
+
+        Called from __init__ right after the buffer is constructed and while it is still
+        uninitialized — that is the state in which TensorStorageCheckpointer.loads() takes
+        its zero-copy path (`storage._storage = TensorDict.load_memmap(path)`) instead of
+        allocating a second copy and copying into it.
+
+        A crash leaves more transitions physically written into the memmap than the last
+        checkpoint's metadata counts, because extend() writes through to the mapped pages
+        continuously while `_len` and the writer cursor are only recorded by dumps(). Those
+        extra slots are simply not counted after the restore and get overwritten by the new
+        attempt's writes, which is correct: it makes the buffer consistent with the
+        training_state.pth written in the same call, rather than half a step ahead of it.
+        """
+        if not self.config.persist_replay_buffer:
+            return
+        if not (self._replay_buffer_path / "storage" / "storage_metadata.json").exists():
+            self.term_logger.info("No replay-buffer checkpoint found — starting with an empty buffer.")
+            return
+        try:
+            self.replay_buffer.loads(self._replay_buffer_path)
+        except Exception as e:
+            # Non-fatal by design: an empty buffer costs min_replay_size frames of warmup,
+            # whereas refusing to start costs the whole allocation. But log it loudly —
+            # silently falling back here would reproduce the exact regression this feature
+            # exists to prevent.
+            self.term_logger.error(
+                f"Failed to restore replay buffer: {e}. Continuing with an EMPTY buffer — "
+                f"this attempt refills from scratch."
+            )
+            traceback.print_exception(e)
+            return
+        self.term_logger.warning(
+            f"Restored replay buffer: {len(self.replay_buffer)} transitions "
+            f"from {self._replay_buffer_path}."
+        )
+
+    def _save_replay_buffer(self):
+        """Checkpoint the replay buffer (zero-copy — see the scratch_dir comment in __init__).
+
+        Only the metadata is actually written: storage_metadata.json (with `_len`), plus the
+        sampler/writer/rng state. Failures are logged and swallowed, since losing the buffer
+        checkpoint must never take down a run whose network checkpoint is otherwise fine.
+        """
+        if not self.config.persist_replay_buffer or not self.replay_buffer._storage.initialized:
+            return
+        try:
+            self._replay_buffer_path.mkdir(parents=True, exist_ok=True)
+            self.replay_buffer.dumps(self._replay_buffer_path)
+        except Exception as e:
+            self.term_logger.warning(f"Could not checkpoint the replay buffer ({e}); the next respawn starts empty.")
+
     def _save_training_checkpoint(self, iteration: int, total_collected_frames: int):
         """Persist everything needed to continue this run after a crash."""
         checkpoint = {
@@ -454,6 +530,9 @@ class FtrSACTrainer:
         if self.cvae_scheduler is not None:
             checkpoint["cvae_scheduler_state_dict"] = self.cvae_scheduler.state_dict()
         self.run_logger.save_weights(checkpoint, "training_state")
+        # Paired with the networks deliberately: an off-policy critic resumed against a
+        # buffer from a different point in the run is worse than either alone.
+        self._save_replay_buffer()
 
     # ------------------------------------------------------------------
     def train(self):
@@ -527,9 +606,27 @@ class FtrSACTrainer:
         torch.nn.utils.clip_grad_norm_(self.cvae.parameters(), self.config.max_grad_norm, error_if_nonfinite=False, norm_type=self.config.clip_grad_norm_p)
         self.cvae_optim.step()
 
+        # Diagnostics for L_prob, which is otherwise uninterpretable on its own. It sat flat
+        # at 0.67-0.68 for all 40M frames of run 11416521 — suspiciously close to ln 2 =
+        # 0.693, the BCE of a predictor that outputs 0.5 for everything — but "flat near
+        # ln 2" only means "learned nothing" when contact is roughly 50/50. target_prob is
+        # binary (see CTRACContactExtractor.compute), so the BCE of the best CONSTANT
+        # predictor is exactly the base rate's binary entropy: log prob_baseline alongside
+        # prob_base_rate and read cvae_loss_prob against it. Above baseline = the head is
+        # being actively pulled off by a conflicting term; at baseline = no gradient is
+        # reaching it (raise cvae_prob_weight); below = it is genuinely learning.
+        # prob_pred_std separates the two ways to score at baseline: ~0 means the head
+        # really is emitting a constant, >0 means it varies but is uncorrelated with truth.
+        with torch.no_grad():
+            base_rate = target_prob.mean()
+            p_clamped = base_rate.clamp(1e-6, 1 - 1e-6)
+            prob_baseline = -(p_clamped * p_clamped.log() + (1 - p_clamped) * (1 - p_clamped).log())
         return {
             "cvae_loss": loss.item(), "cvae_loss_recon": recon_l.item(), "cvae_loss_kl": kl_l.item(),
             "cvae_loss_prob": loss_prob.item(), "cvae_loss_est": loss_est.item(), "cvae_loss_geo": loss_geo.item(),
+            "cvae_prob_base_rate": base_rate.item(),
+            "cvae_prob_baseline": prob_baseline.item(),
+            "cvae_prob_pred_std": pred_prob.std().item(),
             **latent_diagnostics(mu, logvar),
         }
 

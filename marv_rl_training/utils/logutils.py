@@ -1,5 +1,6 @@
 import csv
 import logging
+import re
 import os
 import threading
 import time
@@ -182,6 +183,20 @@ class RunLogger:
                 latest = cfg
             n += 1
         return latest  # None if no previous attempt exists yet
+
+    @property
+    def run_root(self) -> Path:
+        """Directory shared by every attempt of this run.
+
+        For the SLURM attempt_N layout this is the job directory (the parent of
+        attempt_N); otherwise it is logpath itself. Used for state that must survive a
+        respawn *in place* rather than being copied forward — currently only the C-TRAC
+        replay buffer, whose memmap storage is tens of GB and whose checkpointing is
+        zero-copy only when the save path and the storage's scratch_dir are the same
+        directory (see train_sac.py's replay-buffer persistence).
+        """
+        lp = Path(self.logpath)
+        return lp.parent if re.match(r"attempt_\d+$", lp.name) else lp
 
     def candidate_weight_dirs(self) -> list[Path]:
         """Return weight directories to search for checkpoints, most-recent-first.
