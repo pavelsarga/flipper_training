@@ -77,6 +77,9 @@ class CTRACCVAEPretrainConfig:
     geo_weight: float = 1.0
     max_reach: float = 0.8
     max_grad_norm: float = 0.5
+    # Exclude episode-boundary transitions from the dataset (see train()). Keep it on: with
+    # it off, a small learning rate never learns contact existence at all.
+    skip_reset_frames: bool = True
     optimizer: type = torch.optim.Adam
     optimizer_opts: dict[str, Any] = field(default_factory=lambda: {"lr": 3e-4})
     log_every: int = 100
@@ -176,8 +179,27 @@ def train(cfg: CTRACCVAEPretrainConfig) -> None:
     device = torch.device(cfg.device if torch.cuda.is_available() or cfg.device == "cpu" else "cpu")
 
     obs_history, obs, next_obs = _load_dataset(cfg.dataset_path, cfg.max_dataset_rows)
+    _log.info(f"Loaded {obs.shape[0]} transitions from {cfg.dataset_path}")
+
+    # Drop episode-boundary rows once, up front, rather than per batch — same filter and
+    # same three reasons as train_sac.py's _cvae_update (o_{t+1} crosses into a different
+    # episode; the obs_history window is 16 copies of one frame; and on any dataset
+    # collected before ftr_env._refresh_state_after_reset existed the row also carries a
+    # stale robot pose, putting ground-truth contact points up to 87 m from the base and a
+    # mask-weighted L_est of 405 on it against 0.006 for a clean row).
+    #
+    # Keeping them is not survivable at a small learning rate. Measured on shards 0-2 from
+    # random init, 4000 steps: at lr 3e-4 the contact head reaches 73.7% accuracy with them
+    # and 71.5% at lr 1e-5 WITHOUT them — but only 56.5% at lr 1e-5 WITH them, i.e. it never
+    # leaves the 55.8% chance level. The corruption is survivable only if the step size is
+    # large enough to punch through it.
+    if cfg.skip_reset_frames:
+        keep = (obs[:, PARTIAL_DIM - 1] == 0) & (next_obs[:, PARTIAL_DIM - 1] == 0)
+        n_drop = int((~keep).sum())
+        obs_history, obs, next_obs = obs_history[keep], obs[keep], next_obs[keep]
+        _log.info(f"Dropped {n_drop} episode-boundary transitions "
+                  f"({100.0 * n_drop / (n_drop + obs.shape[0]):.2f}%); {obs.shape[0]} remain")
     n = obs.shape[0]
-    _log.info(f"Loaded {n} transitions from {cfg.dataset_path}")
 
     cvae = CTRACCVAE(
         history_len=cfg.history_len, partial_dim=PARTIAL_DIM,
@@ -205,7 +227,7 @@ def train(cfg: CTRACCVAEPretrainConfig) -> None:
         loss_vae, recon_l, kl_l = vae_loss(pred_recon, target_recon, mu, logvar, beta=cfg.vae_beta, free_bits=cfg.free_bits)
         loss_prob = contact_prob_loss(pred_prob, target_prob)
         loss_est = contact_est_loss(pred_points, target_points, target_prob)
-        loss_geo = contact_geo_loss(pred_points, target_prob, target_points.mean(dim=1), cfg.max_reach)
+        loss_geo = contact_geo_loss(pred_points, target_prob, cfg.max_reach)
         loss = loss_vae + cfg.prob_weight * loss_prob + cfg.est_weight * loss_est + cfg.geo_weight * loss_geo
 
         optim.zero_grad()

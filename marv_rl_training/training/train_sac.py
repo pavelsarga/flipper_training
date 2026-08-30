@@ -157,7 +157,10 @@ class FtrSACConfig:
     cvae_prob_weight: float = 1.0    # L_prob's weight in L_C = L_prob + L_est + L_geo
     cvae_est_weight: float = 1.0
     cvae_geo_weight: float = 1.0
-    cvae_max_reach: float = 0.8      # L_geo's Omega radius (m) around the contact centroid
+    cvae_max_reach: float = 0.8      # L_geo's Omega radius (m) around the robot base
+    # Exclude episode-boundary rows from the C-VAE update (see _cvae_update for why each of
+    # the three reasons is independent of the others). Off restores the old behaviour.
+    cvae_skip_reset_frames: bool = True
 
     eval_and_save_every: int = 8
     eval_repeats: int = 2
@@ -364,6 +367,7 @@ class FtrSACTrainer:
         self._restore_replay_buffer()
 
         self._grad_steps = 0
+        self._last_cvae_log: dict[str, float] = {}
         self.term_logger.info("Initialized FtrSACTrainer.")
 
     # ------------------------------------------------------------------
@@ -581,6 +585,40 @@ class FtrSACTrainer:
         obs = batch[OBS_KEY].to(self.device)                    # (B, obs_dim) — this step's ground truth
         next_obs = batch[("next", OBS_KEY)].to(self.device)     # (B, obs_dim) — reconstruction target
 
+        # Drop episode-boundary rows. The partial obs's last column is the reset flag
+        # ((episode_length_buf == 0), see ctrac_module.get_observations), so obs[...,
+        # PARTIAL_DIM-1] marks "this observation is the first of a new episode" and the same
+        # column of next_obs marks "the NEXT one is". Both make the row unusable here:
+        #
+        #  * o_{t+1} across a reset is a different episode, so target_recon asks the decoder
+        #    to predict a teleport — unlearnable by construction, whatever else is fixed.
+        #  * a reset row's obs_history is 16 copies of one frame (CTRACObsHistory refills the
+        #    ring buffer on reset), so the encoder sees no temporal signal at all.
+        #  * before ftr_env._refresh_state_after_reset existed, reset rows also carried stale
+        #    positions: contact points up to 87 m from the base, worth a mask-weighted L_est
+        #    of 405 against 0.006 for a clean row, in 99.9% of 256-sample batches. That is
+        #    fixed at the source now; this filter is the second line of defence and is what
+        #    makes the other two points above hold regardless.
+        #
+        # Measured offline on the Stage-I shards: at this trainer's C-VAE learning rate,
+        # filtering these rows is the difference between the contact-existence head reaching
+        # 71.5% accuracy and never leaving its 55.8% chance level.
+        if self.config.cvae_skip_reset_frames:
+            keep = (obs[..., PARTIAL_DIM - 1] == 0) & (next_obs[..., PARTIAL_DIM - 1] == 0)
+            n_keep = int(keep.sum())
+            if n_keep < 2:
+                # Degenerate batch (essentially all boundaries) — a gradient step on 0-1 rows
+                # is noise, so skip rather than divide by nothing. Returns the previous
+                # update's log rather than a differently-shaped dict: this return value
+                # becomes the iteration's "train/cvae_*" CSV columns, so a one-off key set
+                # here would produce a ragged row. At a ~3% boundary rate over 256 samples
+                # this branch is effectively unreachable; it exists so the filter cannot
+                # divide by an empty batch.
+                return dict(self._last_cvae_log)
+            obs_hist, obs, next_obs = obs_hist[keep], obs[keep], next_obs[keep]
+        else:
+            n_keep = obs.shape[0]
+
         target_points = obs[..., CONTACT_POINTS_OFFSET:CONTACT_PROB_OFFSET].reshape(-1, 4, 3)
         target_prob = obs[..., CONTACT_PROB_OFFSET:CONTACT_PROB_OFFSET + 4]
         target_recon = next_obs[..., :PARTIAL_DIM]
@@ -593,7 +631,7 @@ class FtrSACTrainer:
         )
         loss_prob = contact_prob_loss(pred_prob, target_prob)
         loss_est = contact_est_loss(pred_points, target_points, target_prob)
-        loss_geo = contact_geo_loss(pred_points, target_prob, target_points.mean(dim=1), self.config.cvae_max_reach)
+        loss_geo = contact_geo_loss(pred_points, target_prob, self.config.cvae_max_reach)
         loss = (
             loss_vae
             + self.config.cvae_prob_weight * loss_prob
@@ -621,7 +659,7 @@ class FtrSACTrainer:
             base_rate = target_prob.mean()
             p_clamped = base_rate.clamp(1e-6, 1 - 1e-6)
             prob_baseline = -(p_clamped * p_clamped.log() + (1 - p_clamped) * (1 - p_clamped).log())
-        return {
+        self._last_cvae_log = {
             "cvae_loss": loss.item(), "cvae_loss_recon": recon_l.item(), "cvae_loss_kl": kl_l.item(),
             "cvae_loss_prob": loss_prob.item(), "cvae_loss_est": loss_est.item(), "cvae_loss_geo": loss_geo.item(),
             "cvae_prob_base_rate": base_rate.item(),
@@ -629,6 +667,7 @@ class FtrSACTrainer:
             "cvae_prob_pred_std": pred_prob.std().item(),
             **latent_diagnostics(mu, logvar),
         }
+        return self._last_cvae_log
 
     def _sac_update(self, batch) -> dict[str, float]:
         batch = batch.to(self.device)
