@@ -298,6 +298,10 @@ def aggregate_per_spot(
 # ── Observation stats helpers (shared between eval_ftr.py and eval_ftr_rand.py) ──
 
 # 16 observation groups: name → (start_idx, end_idx) in the 966-dim flat obs vector
+#
+# These indices are meaningful ONLY for that exact layout (marv_rl's MarvRLFlatObservation).
+# _obs_slices_apply() below gates on the exact width for that reason — see its docstring.
+_MARV_RL_OBS_DIM = 966
 _OBS_SLICES = [
     ("heightmap",   0,   945),
     ("roll",        945, 946),
@@ -318,6 +322,23 @@ _OBS_SLICES = [
 ]
 
 
+def _obs_slices_apply(obs_dim: int) -> bool:
+    """Whether _OBS_SLICES can be read against an observation vector of this width.
+
+    Only for the exact 966-dim marv_rl layout. The previous per-slice guard
+    (``if e > obs_dim: continue``) was written for observations SMALLER than 966 —
+    mitriakov's 8-D, atd3qn/icmd3qn's 17/18-D — where every slice overshoots and is
+    correctly skipped. It silently does the wrong thing for a LARGER vector with a
+    different layout: C-TRAC's observation is 1227-dim ([partial 251 | privileged 976],
+    see ctrac_observation.py), so no slice overshoots and all sixteen are read at
+    marv_rl's indices against unrelated fields. ``observations/flipper_fl`` (953:954) then
+    reports a cell of C-TRAC's privileged heightmap rather than a flipper angle — the four
+    "flipper" channels come out near-identical (they are adjacent cells of one heightmap
+    row) and in metres, which reads as a plausible flipper trace and is not.
+    """
+    return obs_dim == _MARV_RL_OBS_DIM
+
+
 def _compute_obs_stats(obs: torch.Tensor) -> dict[str, float]:
     """_OBS_SLICES describes the 966-dim flat heightmap+state observation (PPO's
     MarvRLFlatObservation). Other PPO-trained modules (e.g. mitriakov's 8-D obs) use a
@@ -327,9 +348,9 @@ def _compute_obs_stats(obs: torch.Tensor) -> dict[str, float]:
     obs_flat = obs.reshape(-1, obs.shape[-1])
     obs_dim = obs_flat.shape[-1]
     stats: dict[str, float] = {}
+    if not _obs_slices_apply(obs_dim):
+        return stats
     for name, s, e in _OBS_SLICES:
-        if e > obs_dim:
-            continue
         vals = obs_flat[:, s:e].reshape(-1)
         stats[f"observations/{name}_mean"] = vals.mean().item()
         stats[f"observations/{name}_std"] = vals.std().item()
@@ -494,9 +515,7 @@ def run_tracked_rollout(
         # MarvRLFlatObservation). D3QN variants use a much smaller hand-crafted obs
         # (17-18 dims) that doesn't match these slices — skip whatever doesn't fit
         # rather than reducing over an empty (0-width) slice.
-        for name, s, e in _OBS_SLICES:
-            if e > obs_dim:
-                continue
+        for name, s, e in (_OBS_SLICES if _obs_slices_apply(obs_dim) else []):
             obs_stats[f"observations/{name}_mean"] = mean[s:e].mean().item()
             obs_stats[f"observations/{name}_std"]  = std[s:e].mean().item()
             obs_stats[f"observations/{name}_min"]  = mn[s:e].min().item()
