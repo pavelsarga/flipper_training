@@ -193,13 +193,21 @@ def train(cfg: CTRACCVAEPretrainConfig) -> None:
     # and 71.5% at lr 1e-5 WITHOUT them — but only 56.5% at lr 1e-5 WITH them, i.e. it never
     # leaves the 55.8% chance level. The corruption is survivable only if the step size is
     # large enough to punch through it.
+    # Kept as an INDEX, never as a filtered copy. `obs_history[keep]` with a boolean mask
+    # allocates a second tensor ~97% the size of the first, which would double the peak RAM
+    # this function was carefully written to bound (see _load_dataset: mmap + pre-allocated
+    # destination, so peak is the dataset itself). At max_dataset_rows 3e6 and history_len
+    # 16 that is 78 GB -> 155 GB, i.e. an OOM instead of a filter. Indexing costs 8 B/row.
     if cfg.skip_reset_frames:
         keep = (obs[:, PARTIAL_DIM - 1] == 0) & (next_obs[:, PARTIAL_DIM - 1] == 0)
-        n_drop = int((~keep).sum())
-        obs_history, obs, next_obs = obs_history[keep], obs[keep], next_obs[keep]
+        row_idx = keep.nonzero(as_tuple=False).squeeze(1)
+        n_drop = int(obs.shape[0] - row_idx.numel())
         _log.info(f"Dropped {n_drop} episode-boundary transitions "
-                  f"({100.0 * n_drop / (n_drop + obs.shape[0]):.2f}%); {obs.shape[0]} remain")
-    n = obs.shape[0]
+                  f"({100.0 * n_drop / max(obs.shape[0], 1):.2f}%); {row_idx.numel()} remain")
+        del keep
+    else:
+        row_idx = torch.arange(obs.shape[0])
+    n = row_idx.numel()
 
     cvae = CTRACCVAE(
         history_len=cfg.history_len, partial_dim=PARTIAL_DIM,
@@ -213,7 +221,7 @@ def train(cfg: CTRACCVAEPretrainConfig) -> None:
 
     pbar = tqdm(range(cfg.total_steps), desc="C-VAE pretraining", unit="step")
     for step in pbar:
-        idx = torch.randint(0, n, (cfg.batch_size,))
+        idx = row_idx[torch.randint(0, n, (cfg.batch_size,))]
         batch_hist = obs_history[idx].to(device)
         batch_obs = obs[idx].to(device)
         batch_next_obs = next_obs[idx].to(device)
