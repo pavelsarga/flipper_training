@@ -87,10 +87,32 @@ class FlipperPolicyNode(Node):
         # Publish /cmd_vel at all. Off by default: this node is flipper control only and
         # the operator/autodrive owns track velocity (see the block in the policy setup).
         self.declare_parameter("publish_cmd_vel", False)
+        # ---- robot branch ----------------------------------------------------
+        # I/O topics are parameters with REAL-ROBOT defaults on this branch
+        # (main hardcodes the sim names; run_flipper_policy_sim.sh passes these
+        # explicitly in both profiles, so the defaults only matter for a bare
+        # `ros2 run`). /icp_odom is the NUC's norlab ICP odometry -- there is
+        # no /ground_truth_odom on hardware.
+        self.declare_parameter("odom_topic", "/icp_odom")
+        self.declare_parameter("imu_topic", "/imu/data")
+        self.declare_parameter("joint_topic", "/marv/joint_states")
+        self.declare_parameter("elevation_topic", "/elevation_map_filtered")
+        # Hard ceiling on |/cmd_vel.linear.x| [m/s] whenever publish_cmd_vel is
+        # on. Carried over from the retired rodeo_rl_ws deployment (0.3 there);
+        # a policy echoing its training-time fixed forward speed must never be
+        # able to command more on hardware.
+        self.declare_parameter("max_linear_velocity", 0.3)
+        # Deadman + estop gate (the C++ reactive controller has the same gate,
+        # Control.cpp:874-908; an RL node commanding actuators must not be the
+        # one path without it). require_deadman=false is for bag replay /
+        # bench runs only -- leave true on the robot.
+        self.declare_parameter("require_deadman", True)
+        self.declare_parameter("deadman_topic", "/marv/teleop/deadman")
+        self.declare_parameter("estop_topic", "/marv/estop")
+        self.declare_parameter("deadman_timeout_sec", 0.2)
         # Previously passed by run_flipper_policy_sim.sh but never declared --
-        # silent no-ops (no_angular:=true and obstacle_goal:=false had zero
-        # effect on RL policies). disable_angular_output is the launch-facing
-        # alias of disable_turning; auto_goal_on_release gates the one-shot
+        # silent no-ops. disable_angular_output is the launch-facing alias of
+        # disable_turning; auto_goal_on_release gates the one-shot
         # goal-ahead-on-override-release below.
         self.declare_parameter("disable_angular_output", False)
         self.declare_parameter("auto_goal_on_release", False)
@@ -113,6 +135,10 @@ class FlipperPolicyNode(Node):
         self.disable_turning = (
             self.get_parameter("disable_turning").get_parameter_value().bool_value
             or self.get_parameter("disable_angular_output").get_parameter_value().bool_value)
+        self.max_linear_velocity = abs(
+            self.get_parameter("max_linear_velocity").get_parameter_value().double_value)
+        self.require_deadman = self.get_parameter("require_deadman").get_parameter_value().bool_value
+        self.deadman_timeout_sec = self.get_parameter("deadman_timeout_sec").get_parameter_value().double_value
         self.auto_goal_on_release = self.get_parameter("auto_goal_on_release").get_parameter_value().bool_value
         self.auto_goal_ahead_m = self.get_parameter("auto_goal_ahead_m").get_parameter_value().double_value
 
@@ -268,15 +294,33 @@ class FlipperPolicyNode(Node):
             depth=1,
         )
 
-        # Subscribers
-        # Note: ground_truth_odom uses RELIABLE QoS, so we must match it
-        self.odom_sub = self.create_subscription(Odometry, "/ground_truth_odom", self.odom_callback, reliable_qos)
-        self.imu_sub = self.create_subscription(Imu, "/imu/data", self.imu_callback, sensor_qos)
-        self.joint_state_sub = self.create_subscription(JointState, "/joint_state", self.joint_state_callback, sensor_qos)
+        # Subscribers (topics are parameters on this branch; both odom sources
+        # -- sim GT and the robot ICP -- publish RELIABLE, so we must match)
+        _odom_topic = self.get_parameter("odom_topic").get_parameter_value().string_value
+        _imu_topic = self.get_parameter("imu_topic").get_parameter_value().string_value
+        _joint_topic = self.get_parameter("joint_topic").get_parameter_value().string_value
+        _elevation_topic = self.get_parameter("elevation_topic").get_parameter_value().string_value
+        self.get_logger().info(
+            f"I/O: odom={_odom_topic} imu={_imu_topic} joints={_joint_topic} "
+            f"elevation={_elevation_topic} (layer {self.heightmap_layer})")
+        self.odom_sub = self.create_subscription(Odometry, _odom_topic, self.odom_callback, reliable_qos)
+        self.imu_sub = self.create_subscription(Imu, _imu_topic, self.imu_callback, sensor_qos)
+        self.joint_state_sub = self.create_subscription(JointState, _joint_topic, self.joint_state_callback, sensor_qos)
         # Goal uses VOLATILE to accept messages from any publisher (RViz, ros2 topic pub, etc.)
         self.goal_sub = self.create_subscription(PoseStamped, "/goal_pose", self.goal_callback, 10)
         self.goal_reset_sub = self.create_subscription(PoseStamped, "/goal_reset", self.goal_reset_callback, 10)
-        self.elevation_map_sub = self.create_subscription(GridMap, "/elevation_map", self.elevation_map_callback, reliable_qos)
+        self.elevation_map_sub = self.create_subscription(GridMap, _elevation_topic, self.elevation_map_callback, reliable_qos)
+        # Deadman + estop gate state (see control_callback). A deadman message
+        # older than deadman_timeout_sec counts as NOT held.
+        self._deadman_held = False
+        self._deadman_rx_time = None
+        self._estop_latched = False
+        self.create_subscription(
+            Bool, self.get_parameter("deadman_topic").get_parameter_value().string_value,
+            self._on_deadman, 10)
+        self.create_subscription(
+            Bool, self.get_parameter("estop_topic").get_parameter_value().string_value,
+            self._on_estop, 10)
 
         # Publishers
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -717,7 +761,8 @@ class FlipperPolicyNode(Node):
         right_vel = (track_vels[1] + track_vels[3]) / 2.0  # front_right + rear_right
 
         twist = Twist()
-        twist.linear.x = float((left_vel + right_vel) / 2.0)
+        twist.linear.x = float(np.clip((left_vel + right_vel) / 2.0,
+                                       -self.max_linear_velocity, self.max_linear_velocity))
         twist.angular.z = float((right_vel - left_vel) / self.TRACK_WIDTH)
 
         return twist
@@ -728,6 +773,19 @@ class FlipperPolicyNode(Node):
             # Overridden: publish NOTHING (not even zeros -- that would fight the
             # manual/autodrive stream that now owns these topics). stop_all() ran
             # once on the rising edge.
+            return
+
+        # Deadman/estop gate (robot branch): without the operator's deadman
+        # held (or with the estop latched / deadman stale) this node commands
+        # nothing but zeros -- velocity zeros hold the flippers, position
+        # targets are left alone. Mirrors the reactive controller's own gate.
+        if not self._actuation_allowed():
+            self.stop_all()
+            self.get_logger().warn(
+                "actuation gated: "
+                + ("ESTOP latched" if self._estop_latched else "deadman not held/stale")
+                + " -- commanding zeros (require_deadman:=false only for bag replay)",
+                throttle_duration_sec=2.0)
             return
 
         # Log status of each input for debugging
@@ -871,7 +929,8 @@ class FlipperPolicyNode(Node):
         if self._is_ftr:
             # FTR: 6-D [v, w, fl, fr, rl, rr]
             # Track: raw output is already in m/s and rad/s (clamped to 0.95 m/s, 1.0 rad/s in training)
-            twist.linear.x = float(action[0] * self.track_velocity_scale)
+            twist.linear.x = float(np.clip(action[0] * self.track_velocity_scale,
+                                           -self.max_linear_velocity, self.max_linear_velocity))
             twist.angular.z = 0.0 if self.disable_turning else float(action[1] * self.track_velocity_scale)
             if self.publish_cmd_vel:
                 self.cmd_vel_pub.publish(twist)
@@ -966,7 +1025,8 @@ class FlipperPolicyNode(Node):
         self._publish_heightmap_image(self.current_heightmap)
 
         twist = Twist()
-        twist.linear.x = float(action[0])
+        twist.linear.x = float(np.clip(action[0], -self.max_linear_velocity,
+                                       self.max_linear_velocity))
         twist.angular.z = 0.0 if self.disable_turning else float(action[1])
         if self.publish_cmd_vel:
             self.cmd_vel_pub.publish(twist)
@@ -1300,6 +1360,25 @@ class FlipperPolicyNode(Node):
         msg.data = img.tobytes()
         msg.header.frame_id = "base_link"
         return msg
+
+    def _on_deadman(self, msg: Bool):
+        self._deadman_held = bool(msg.data)
+        self._deadman_rx_time = self.get_clock().now()
+
+    def _on_estop(self, msg: Bool):
+        if bool(msg.data) and not self._estop_latched:
+            self.get_logger().warn("/marv/estop latched -- policy output gated")
+        self._estop_latched = bool(msg.data)
+
+    def _actuation_allowed(self) -> bool:
+        if self._estop_latched:
+            return False
+        if not self.require_deadman:
+            return True
+        if not self._deadman_held or self._deadman_rx_time is None:
+            return False
+        age = (self.get_clock().now() - self._deadman_rx_time).nanoseconds * 1e-9
+        return age <= self.deadman_timeout_sec
 
     def _on_flipper_override(self, msg: Bool):
         was = self._flipper_override_active

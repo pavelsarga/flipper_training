@@ -101,7 +101,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import Image as RosImage, JointState
-from std_msgs.msg import Float64, Float64MultiArray
+from std_msgs.msg import Bool, Float64, Float64MultiArray
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -448,6 +448,12 @@ class MitriakovPolicyNode(Node):
         # completely: it sat on "waiting for elevation map / joint states" forever and
         # never published a flipper command, a marker or a HUD frame.
         self.declare_parameter("joint_topic", "/marv/joint_states")
+        # Deadman + estop gate (robot branch; same rationale as
+        # flipper_policy_node). require_deadman:=false only for bag replay.
+        self.declare_parameter("require_deadman", True)
+        self.declare_parameter("deadman_topic", "/marv/teleop/deadman")
+        self.declare_parameter("estop_topic", "/marv/estop")
+        self.declare_parameter("deadman_timeout_sec", 0.2)
         self.declare_parameter("elevation_layer", "elevation_inpainted")
         # 3.0 m: the sim's elevation map is 8x8 m robot-centred (elevation_sim.yaml's
         # length_in_x/y), so +-3 m stays well inside it with margin for the map lagging
@@ -517,6 +523,17 @@ class MitriakovPolicyNode(Node):
         self._elevation_topic, self._joint_topic = elevation_topic, joint_topic
 
         self.pubs = {c: self.create_publisher(Float64, f"/flippers_cmd_pos/{c}", 4) for c in CORNERS}
+        self._deadman_held = False
+        self._deadman_rx_time = None
+        self._estop_latched = False
+        self.require_deadman = self.get_parameter("require_deadman").get_parameter_value().bool_value
+        self.deadman_timeout_sec = self.get_parameter("deadman_timeout_sec").get_parameter_value().double_value
+        self.create_subscription(
+            Bool, self.get_parameter("deadman_topic").get_parameter_value().string_value,
+            self._on_deadman, 10)
+        self.create_subscription(
+            Bool, self.get_parameter("estop_topic").get_parameter_value().string_value,
+            self._on_estop, 10)
         self.pub_obs = self.create_publisher(Float64MultiArray, "~/obs", 5)
         # /policy_obs_markers is an existing display in marv_flipper_eval's rl_generic.rviz
         # (the config policy.launch.py falls back to for any rl run without a dedicated
@@ -569,7 +586,34 @@ class MitriakovPolicyNode(Node):
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def _on_deadman(self, msg: Bool):
+        self._deadman_held = bool(msg.data)
+        self._deadman_rx_time = self.get_clock().now()
+
+    def _on_estop(self, msg: Bool):
+        if bool(msg.data) and not self._estop_latched:
+            self.get_logger().warning("/marv/estop latched -- policy output gated")
+        self._estop_latched = bool(msg.data)
+
+    def _actuation_allowed(self) -> bool:
+        if self._estop_latched:
+            return False
+        if not self.require_deadman:
+            return True
+        if not self._deadman_held or self._deadman_rx_time is None:
+            return False
+        age = (self.get_clock().now() - self._deadman_rx_time).nanoseconds * 1e-9
+        return age <= self.deadman_timeout_sec
+
     def _tick(self):
+        # Deadman/estop gate: this node emits POSITION targets, so gating means
+        # publishing NOTHING (the last target holds the flippers where they are).
+        if not self._actuation_allowed():
+            self.get_logger().warning(
+                "actuation gated: "
+                + ("ESTOP latched" if self._estop_latched else "deadman not held/stale")
+                + " -- holding last flipper positions", throttle_duration_sec=2)
+            return
         # Name the topic that is actually silent. The original combined message ("waiting
         # for elevation map / joint states") could not distinguish a missing map from
         # missing joints, and the real cause -- a dead /joint_states throttle while the
