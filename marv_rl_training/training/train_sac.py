@@ -161,6 +161,9 @@ class FtrSACConfig:
     # Exclude episode-boundary rows from the C-VAE update (see _cvae_update for why each of
     # the three reasons is independent of the others). Off restores the old behaviour.
     cvae_skip_reset_frames: bool = True
+    # Freeze the C-VAE in Stage II: keep the Stage-I weights, run the same forward pass and
+    # log the same metrics, but take no gradient step. See _cvae_update's "frozen" block.
+    freeze_cvae: bool = False
 
     eval_and_save_every: int = 8
     eval_repeats: int = 2
@@ -580,7 +583,32 @@ class FtrSACTrainer:
     def _cvae_update(self, batch) -> dict[str, float]:
         """One supervised gradient step for the C-VAE (Eq. 10-14), on a batch of
         precomputed obs_history windows (see CTRACActorNet's docstring for why these are
-        stored at collection time rather than reconstructed from a random minibatch)."""
+        stored at collection time rather than reconstructed from a random minibatch).
+
+        With config.freeze_cvae the forward pass and every logged metric are unchanged but
+        no gradient step is taken, so the Stage-I weights are carried through Stage II
+        untouched. That deviates from the paper's "jointly optimized" wording, and is worth
+        the deviation because joint optimisation is measurably destroying the module the
+        paper's whole contribution rests on:
+
+          run 11449348 (all corruption fixed, C-VAE lr 1.5e-4 -> 3e-4), gap between the
+          contact head's BCE and the base-rate predictor's, in nats:
+             0.07M frames  +0.0998   <- the Stage-I checkpoint, transferring correctly
+             1.25M frames  +0.0016
+             3.74M frames  -0.0007
+            11.08M frames  +0.0066   mean over the run +0.0045
+
+        The capability is present and correct at initialisation and is gone within ~1.2M
+        frames. A frozen C-VAE that estimates contact is a closer reproduction of the
+        method than a jointly-optimised one whose contact head sits at chance.
+
+        The metrics are still computed and logged when frozen, deliberately: that is what
+        answers the open question about this workaround, namely whether the Stage-I encoder
+        stays accurate as the SAC policy's state distribution drifts away from the marv_rl
+        trajectories it was fitted on. Read cvae_loss_prob against cvae_prob_baseline over
+        the run -- if the gap decays even with the weights pinned, the problem is the input
+        distribution, not the optimisation, and freezing only hides it.
+        """
         obs_hist = batch["obs_history"].to(self.device)         # (B, H, PARTIAL_DIM)
         obs = batch[OBS_KEY].to(self.device)                    # (B, obs_dim) — this step's ground truth
         next_obs = batch[("next", OBS_KEY)].to(self.device)     # (B, obs_dim) — reconstruction target
@@ -623,7 +651,8 @@ class FtrSACTrainer:
         target_prob = obs[..., CONTACT_PROB_OFFSET:CONTACT_PROB_OFFSET + 4]
         target_recon = next_obs[..., :PARTIAL_DIM]
 
-        _z, mu, logvar, pred_points, pred_prob, pred_recon = self.cvae(obs_hist, sample=True)
+        with torch.enable_grad() if not self.config.freeze_cvae else torch.no_grad():
+            _z, mu, logvar, pred_points, pred_prob, pred_recon = self.cvae(obs_hist, sample=True)
 
         loss_vae, recon_l, kl_l = vae_loss(
             pred_recon, target_recon, mu, logvar,
@@ -639,10 +668,11 @@ class FtrSACTrainer:
             + self.config.cvae_geo_weight * loss_geo
         )
 
-        self.cvae_optim.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.cvae.parameters(), self.config.max_grad_norm, error_if_nonfinite=False, norm_type=self.config.clip_grad_norm_p)
-        self.cvae_optim.step()
+        if not self.config.freeze_cvae:
+            self.cvae_optim.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.cvae.parameters(), self.config.max_grad_norm, error_if_nonfinite=False, norm_type=self.config.clip_grad_norm_p)
+            self.cvae_optim.step()
 
         # Diagnostics for L_prob, which is otherwise uninterpretable on its own. It sat flat
         # at 0.67-0.68 for all 40M frames of run 11416521 — suspiciously close to ln 2 =
@@ -789,12 +819,20 @@ class FtrSACTrainer:
 
             sac_log, cvae_log = {}, {}
             if len(self.replay_buffer) >= self.config.min_replay_size:
+                # 5 C-VAE refinements per SAC update, per the paper's Fig. 2 caption. When
+                # the C-VAE is frozen there is nothing to refine, so the inner loop collapses
+                # to a single no-grad pass per iteration purely to keep cvae_loss_prob /
+                # cvae_prob_baseline in the logs — 160 forward passes per iteration would
+                # otherwise be spent producing the same number 160 times.
+                cvae_passes = 0 if self.config.freeze_cvae else self.config.cvae_updates_per_sac_step
                 for _ in range(self.config.updates_per_batch):
                     sub_batch = self.replay_buffer.sample()
                     sac_log = self._sac_update(sub_batch)
-                    for _ in range(self.config.cvae_updates_per_sac_step):
+                    for _ in range(cvae_passes):
                         cvae_batch = self.replay_buffer.sample()
                         cvae_log = self._cvae_update(cvae_batch)
+                if self.config.freeze_cvae:
+                    cvae_log = self._cvae_update(self.replay_buffer.sample())
 
             if "cuda" in str(self.device):
                 torch.cuda.empty_cache()
