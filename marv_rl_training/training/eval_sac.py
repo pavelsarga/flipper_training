@@ -92,7 +92,21 @@ def run_eval(raw_cfg, ftr_gym_env, max_steps, repeats, output_dir=None, num_env_
 
     # Only the actor is needed for eval — CTRACPolicyConfig.create()'s weights_path loads
     # a flat policy_operator.state_dict() (see ctrac_policy.py's docstring on this).
-    policy_cfg = CTRACPolicyConfig(**cfg.policy_opts)
+    #
+    # cvae_weights_path is forced to None here, the same as
+    # ctrac_policy_inference_module.py does for the ROS2 node, and for the same reason: the
+    # C-VAE is a submodule of CTRACActorNet, so the trained one is already inside
+    # policy_final.pth (22 of its 28 keys, verified byte-identical to the separately saved
+    # cvae_final.pth). Loading the path from the training config would pull in the STAGE I
+    # pretrained C-VAE, which is a training-time artifact and not what this policy ran with.
+    #
+    # It is also a dependency eval has no business having. That path points into the
+    # collection dataset directory, so evaluating an archived experiment required a file
+    # that may have been cleaned up, moved, or -- as happened here -- half-transferred,
+    # producing "PytorchStreamReader failed reading zip archive: failed finding central
+    # directory" from a truncated 5.3 MB copy of a 9.3 MB checkpoint.
+    policy_opts = {**cfg.policy_opts, "cvae_weights_path": None}
+    policy_cfg = CTRACPolicyConfig(**policy_opts)
     policy_operator, _qvalue_operator, _cvae, _optim_groups = policy_cfg.create(
         ftr_torchrl_env, device=device, weights_path=cfg.policy_weights_path,
     )
