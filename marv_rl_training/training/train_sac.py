@@ -286,12 +286,26 @@ class FtrSACTrainer:
         # via direct smoke test that SACLoss.convert_to_functional() re-wraps each
         # parameter into a new tensor object that ALIASES the same underlying storage as
         # the original module (in-place edits are mutually visible, so optimizing these
-        # correctly updates the live policy_operator/self.cvae/qvalue_operator used for
-        # rollout) but is a DIFFERENT object for autograd's `.grad`-accumulation purposes —
+        # correctly updates the live policy_operator/self.cvae used for rollout) but is a
+        # DIFFERENT object for autograd's `.grad`-accumulation purposes —
         # an optimizer built from the original modules' own .parameters() would silently
         # never receive gradients (loss_module's backward populates .grad only on ITS OWN
         # copies), which cost real debugging time to catch (a plain "loss.backward();
         # optim.step()" runs with no error either way — it would just silently never train).
+        # ⚠ THE ALIASING ABOVE HOLDS FOR THE ACTOR BUT NOT FOR THE CRITIC. qvalue is passed
+        # to SACLoss with num_qvalue_nets=2, and convert_to_functional STACKS it into a
+        # (2, ...) ensemble — visible in the checkpoint as
+        # qvalue_network_params.module.mlp.mlp.0.bias with shape (2, 512). Stacking has to
+        # allocate new storage, so the functional params cannot alias self.qvalue_operator,
+        # and that module keeps its random initialisation for the entire run.
+        #
+        # Training and resume are unaffected (both go through loss_module), and eval never
+        # loads a critic. What it broke is the SAVED ARTEFACT: measured on the finished run
+        # 11450743, qvalue_final.pth had layer-0 weight norm 13.05 against the trained
+        # 45.75, and produced Q with std 0.058 where the real critic gives std 22.1 over the
+        # same 2000 states — a value function that should sit near -66 by the discounted
+        # return. Anything analysing a saved critic was analysing noise. _qvalue_state_dict()
+        # below is what the qvalue_*.pth files are written from now.
         actor_params_named = list(self.loss_module.actor_network_params.named_parameters())
         actor_only_params = [p for n, p in actor_params_named if "cvae" not in n]
         qvalue_params = list(self.loss_module.qvalue_network_params.parameters())
@@ -519,6 +533,33 @@ class FtrSACTrainer:
         except Exception as e:
             self.term_logger.warning(f"Could not checkpoint the replay buffer ({e}); the next respawn starts empty.")
 
+    def _qvalue_state_dict(self) -> dict:
+        """The TRAINED critic, keyed exactly like qvalue_operator.state_dict().
+
+        self.qvalue_operator is never updated (see the ensembling note in __init__), so its
+        state_dict is the random init. The real parameters live in
+        loss_module.qvalue_network_params as a (num_qvalue_nets, ...) stack. This returns
+        twin 0 with the ensemble dimension dropped, so the file still loads straight into a
+        CTRACQNet and the on-disk contract is unchanged.
+
+        Twin 0 is representative rather than arbitrary: on run 11450743 the two twins' layer
+        norms were 45.751 and 45.611, a 0.3% difference. The full ensemble, both twins and
+        the SoftUpdate targets, is in training_state.pth's loss_module_state_dict — that is
+        the file to use for resuming or for anything needing the exact critic pair.
+        """
+        prefix = "qvalue_network_params."
+        n_nets = self.config.num_qvalue_nets if hasattr(self.config, "num_qvalue_nets") else 2
+        out = {}
+        for k, v in self.loss_module.state_dict().items():
+            if not k.startswith(prefix):
+                continue
+            sub = k[len(prefix):]
+            if sub.startswith("__") or not torch.is_tensor(v):
+                continue
+            # Drop the ensemble axis only when it is actually the ensemble axis.
+            out[sub] = (v[0] if v.dim() > 0 and v.shape[0] == n_nets else v).detach().clone()
+        return out
+
     def _save_training_checkpoint(self, iteration: int, total_collected_frames: int):
         """Persist everything needed to continue this run after a crash."""
         checkpoint = {
@@ -565,7 +606,7 @@ class FtrSACTrainer:
                 _os._exit(75)
             try:
                 self.run_logger.save_weights(self.policy_operator.state_dict(), "policy_crash")
-                self.run_logger.save_weights(self.qvalue_operator.state_dict(), "qvalue_crash")
+                self.run_logger.save_weights(self._qvalue_state_dict(), "qvalue_crash")
                 self.run_logger.save_weights(self.cvae.state_dict(), "cvae_crash")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_crash")
                 self._save_training_checkpoint(
@@ -878,7 +919,7 @@ class FtrSACTrainer:
             save_every = self.config.save_weights_every or self.config.eval_and_save_every
             if effective_i % save_every == 0:
                 self.run_logger.save_weights(self.policy_operator.state_dict(), f"policy_step_{total_collected_frames}")
-                self.run_logger.save_weights(self.qvalue_operator.state_dict(), f"qvalue_step_{total_collected_frames}")
+                self.run_logger.save_weights(self._qvalue_state_dict(), f"qvalue_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.cvae.state_dict(), f"cvae_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
                 # Written alongside the weights, so a crash never loses more than one
@@ -911,7 +952,7 @@ class FtrSACTrainer:
             self.run_logger.log_data(log, total_collected_frames)
 
         self.run_logger.save_weights(self.policy_operator.state_dict(), "policy_final")
-        self.run_logger.save_weights(self.qvalue_operator.state_dict(), "qvalue_final")
+        self.run_logger.save_weights(self._qvalue_state_dict(), "qvalue_final")
         self.run_logger.save_weights(self.cvae.state_dict(), "cvae_final")
         self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_final")
 
