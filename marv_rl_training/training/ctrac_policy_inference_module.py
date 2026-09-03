@@ -139,8 +139,10 @@ class CTRACPolicyInferenceModule:
             heightmap=hm, heightmap_extent=extent, goal_vec_local=goal,
             xd_local=xd, omega_local=om, thetas=thetas, quat=quat, robot_z=z,
         )
-        # action: (6,) float32 [v, w, fl, fr, rl, rr] — v in m/s, w always 0.0, and
-        # fl..rr the RAW [-1, 1] flipper velocity commands in FTR order [FL,FR,RL,RR].
+        # action: (6,) float32 [v, w, fl, fr, rl, rr] — v in m/s (the policy's own output,
+        # or env_cfg_overrides.fixed_forward_vel verbatim when the checkpoint was trained
+        # with one), w always 0.0, and fl..rr the RAW [-1, 1] flipper velocity commands in
+        # FTR order [FL,FR,RL,RR].
     """
 
     def __init__(self, config_path: str | Path, policy_weights_path: str | Path, device: str = "cpu", **_ignored):
@@ -184,11 +186,24 @@ class CTRACPolicyInferenceModule:
         )
         self.track_vel_max = float(self.cfg.get("track_vel_max", 0.7))
 
+        # If the checkpoint was trained with a pinned chassis speed, the policy's v output
+        # is MEANINGLESS and must not be used. ftr_env._apply_action discards actions[:, 0]
+        # whenever fixed_forward_vel is set, so that head never receives a gradient.
+        # Measured on the finished runs, action/v_mean over the last 40 logged points:
+        #     learned velocity (11450743) ..... +0.355  (range +0.309 .. +0.411)
+        #     fixed 0.6 m/s   (11456021) ..... -0.0004  (range -0.060 .. +0.063)
+        # i.e. untrained noise centred on zero. Deploying a fixed-velocity checkpoint and
+        # reading action[0] would command v ~ 0: the flippers would articulate correctly
+        # and the robot would never drive. Mirror the env instead.
+        eco_v = (self.cfg.env_cfg_overrides or {}).get("fixed_forward_vel", None)
+        self.fixed_forward_vel = None if eco_v is None else float(eco_v)
+
         self.last_policy_heightmap = None
         self._fresh = True
         self.logger.info(
             f"CTRACPolicyInferenceModule ready — device={device}, history_len={policy_opts['history_len']}, "
-            f"latent_dim={policy_opts['latent_dim']}, track_vel_max={self.track_vel_max}"
+            f"latent_dim={policy_opts['latent_dim']}, track_vel_max={self.track_vel_max}, "
+            f"velocity={'FIXED %.3f m/s (policy v output ignored)' % self.fixed_forward_vel if self.fixed_forward_vel is not None else 'learned by the policy'}"
         )
 
     def reset(self):
@@ -277,7 +292,10 @@ class CTRACPolicyInferenceModule:
             td = self.actor(td)
         action = td["action"].squeeze(0).detach().cpu().numpy()  # [v, w, FL, FR, RL, RR]
 
-        v = float(np.clip(action[0], -self.track_vel_max, self.track_vel_max))
+        if self.fixed_forward_vel is not None:
+            v = self.fixed_forward_vel          # see __init__: action[0] is untrained noise here
+        else:
+            v = float(np.clip(action[0], -self.track_vel_max, self.track_vel_max))
         # w is pinned to ~0 by CTRACActorNet (the paper's task is straight-path only) and
         # this platform has ~3.6% yaw authority anyway — see CLAUDE.md's skid-steer note.
         return np.concatenate([[v, 0.0], action[2:6]]).astype(np.float32)
