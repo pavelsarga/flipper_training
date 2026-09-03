@@ -87,6 +87,14 @@ class FlipperPolicyNode(Node):
         # Publish /cmd_vel at all. Off by default: this node is flipper control only and
         # the operator/autodrive owns track velocity (see the block in the policy setup).
         self.declare_parameter("publish_cmd_vel", False)
+        # Previously passed by run_flipper_policy_sim.sh but never declared --
+        # silent no-ops (no_angular:=true and obstacle_goal:=false had zero
+        # effect on RL policies). disable_angular_output is the launch-facing
+        # alias of disable_turning; auto_goal_on_release gates the one-shot
+        # goal-ahead-on-override-release below.
+        self.declare_parameter("disable_angular_output", False)
+        self.declare_parameter("auto_goal_on_release", False)
+        self.declare_parameter("auto_goal_ahead_m", 5.0)
 
         # Get parameters
         config_path = self.get_parameter("config_path").get_parameter_value().string_value
@@ -102,7 +110,11 @@ class FlipperPolicyNode(Node):
         self.heightmap_image_world_orientation = self.get_parameter(
             "heightmap_image_world_orientation"
         ).get_parameter_value().bool_value
-        self.disable_turning = self.get_parameter("disable_turning").get_parameter_value().bool_value
+        self.disable_turning = (
+            self.get_parameter("disable_turning").get_parameter_value().bool_value
+            or self.get_parameter("disable_angular_output").get_parameter_value().bool_value)
+        self.auto_goal_on_release = self.get_parameter("auto_goal_on_release").get_parameter_value().bool_value
+        self.auto_goal_ahead_m = self.get_parameter("auto_goal_ahead_m").get_parameter_value().double_value
 
         if not config_path or not policy_weights_path:
             self.get_logger().error("config_path and policy_weights_path parameters are required!")
@@ -1301,6 +1313,24 @@ class FlipperPolicyNode(Node):
             # is no dead-man's-switch), so whatever was commanded at this instant
             # would otherwise be held forever. Zero it once, now.
             self.stop_all()
+        elif self.auto_goal_on_release and self.current_goal is None and self.current_odom is not None:
+            # Falling edge: hand the policy a one-shot goal straight ahead so a
+            # release immediately resumes progress without an external goal
+            # source. Gated by auto_goal_on_release (off when
+            # obstacle_goal_publisher or an operator owns /goal_pose).
+            pose = self.current_odom.pose.pose
+            yaw = Rotation.from_quat([pose.orientation.x, pose.orientation.y,
+                                      pose.orientation.z, pose.orientation.w]).as_euler("xyz")[2]
+            goal = PoseStamped()
+            goal.header = self.current_odom.header
+            goal.pose.position.x = pose.position.x + self.auto_goal_ahead_m * float(np.cos(yaw))
+            goal.pose.position.y = pose.position.y + self.auto_goal_ahead_m * float(np.sin(yaw))
+            goal.pose.position.z = pose.position.z
+            goal.pose.orientation = pose.orientation
+            self.get_logger().info(
+                f"override released -> auto goal {self.auto_goal_ahead_m:.1f} m ahead "
+                f"({goal.pose.position.x:.2f}, {goal.pose.position.y:.2f})")
+            self.goal_callback(goal)
 
     def stop_all(self):
         """Zero /cmd_vel and the flipper VELOCITY topics.
