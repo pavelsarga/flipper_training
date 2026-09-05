@@ -1138,7 +1138,7 @@ if __name__ == "__main__":
         trainer = FtrDiffusionTrainer(raw_cfg, ftr_gym_env)
         try:
             trainer.train()
-        except BaseException:  # noqa: BLE001 — deliberately catching everything, see below
+        except BaseException as _exc:  # noqa: BLE001 — deliberately catching everything, see below
             # ⚠ An exception must NOT be allowed to propagate out of here.
             #
             # The same reason simulation_app.close() is skipped below applies to ordinary
@@ -1157,7 +1157,7 @@ if __name__ == "__main__":
             sys.stdout.flush()
             sys.stderr.flush()
             import os as _os
-            _os._exit(1)
+            _os._exit(_exc.code if isinstance(_exc, SystemExit) and isinstance(_exc.code, int) else 1)
 
     # Skip simulation_app.close() — Isaac Sim's shutdown re-initialises GPU foundation
     # and frequently deadlocks, keeping the SLURM slot busy for hours.

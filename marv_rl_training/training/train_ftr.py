@@ -38,6 +38,7 @@ if __name__ == "__main__":
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
+import sys
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1017,7 +1018,20 @@ if __name__ == "__main__":
                 td = td["next"]
     else:
         trainer = FtrPPOTrainer(raw_cfg, ftr_gym_env)
-        trainer.train()
+        try:
+            trainer.train()
+        except BaseException as _exc:  # noqa: BLE001 — must catch everything, see below
+            # Isaac Sim's atexit handlers deadlock on normal interpreter shutdown, so an
+            # exception escaping train() leaves the job holding its node until walltime
+            # instead of failing it (observed: a crashed run sat on a GPU for 15 minutes
+            # doing nothing). train() already force-exits on CUDA/W&B errors; this covers
+            # every other cause. Same guard optuna_train_ftr.py has had all along.
+            # Exit 1, not 75 — 75 means "transient, respawn me" to the sbatch loop.
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            import os as _os
+            _os._exit(_exc.code if isinstance(_exc, SystemExit) and isinstance(_exc.code, int) else 1)
 
     # Skip simulation_app.close() — Isaac Sim's shutdown re-initialises GPU foundation
     # and frequently deadlocks, keeping the SLURM slot busy for hours.
