@@ -14,7 +14,20 @@ if TYPE_CHECKING:
     from marv_rl_training.training.train_ftr import FtrPPOConfig
 
 
-def make_transformed_env(env: "FtrTorchRLEnv", train_config: "FtrPPOConfig", policy_transforms: list[Transform]) -> tuple[TransformedEnv, VecNorm]:
+def make_transformed_env(
+    env: "FtrTorchRLEnv",
+    train_config: "FtrPPOConfig",
+    policy_transforms: list[Transform],
+    post_vecnorm_transforms: list[Transform] | None = None,
+) -> tuple[TransformedEnv, VecNorm]:
+    """Build the standard transform stack around an FTR env.
+
+    ``post_vecnorm_transforms`` are appended AFTER VecNorm. The action-chunking policy uses
+    it for the CatFrames observation-history window, which has to stack already-normalised
+    frames — putting it in ``extra_env_transforms`` (which run before VecNorm) would leave
+    each history slot on a different, un-normalised scale and would make VecNorm's running
+    statistics apply to a key that no longer means one observation.
+    """
     vecnorm_keys = [o.name for o in env.observations if o.supports_vecnorm]
     if train_config.vecnorm_on_reward:
         vecnorm_keys.append("reward")
@@ -27,6 +40,7 @@ def make_transformed_env(env: "FtrTorchRLEnv", train_config: "FtrPPOConfig", pol
     transforms += [t["cls"](**(t["opts"] or {})) for t in train_config.extra_env_transforms]
     transforms += policy_transforms
     transforms.append(vecnorm)
+    transforms += list(post_vecnorm_transforms or [])
     return TransformedEnv(env, Compose(*transforms)), vecnorm
 
 

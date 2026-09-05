@@ -39,6 +39,9 @@ OmegaConf.register_new_resolver("add", lambda *args: sum(args))
 OmegaConf.register_new_resolver("mul", lambda *args: math.prod(args))
 OmegaConf.register_new_resolver("div", lambda a, b: a / b)
 OmegaConf.register_new_resolver("intdiv", lambda a, b: a // b)
+# Used by the action-chunking configs to derive the macro-step discount from the
+# per-control-step one: gae_opts.gamma = ${pow:${control_gamma},${T_a}}.
+OmegaConf.register_new_resolver("pow", lambda a, b: a ** b)
 OmegaConf.register_new_resolver("cls", resolve_class)
 OmegaConf.register_new_resolver("dtype", lambda s: getattr(torch, s))  # get a torch dtype
 OmegaConf.register_new_resolver("tensor", lambda s: torch.tensor(s))
