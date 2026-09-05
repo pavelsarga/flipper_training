@@ -40,6 +40,7 @@ if __name__ == "__main__":
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
+import sys
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1135,7 +1136,28 @@ if __name__ == "__main__":
                 td = td["next"]
     else:
         trainer = FtrDiffusionTrainer(raw_cfg, ftr_gym_env)
-        trainer.train()
+        try:
+            trainer.train()
+        except BaseException:  # noqa: BLE001 — deliberately catching everything, see below
+            # ⚠ An exception must NOT be allowed to propagate out of here.
+            #
+            # The same reason simulation_app.close() is skipped below applies to ordinary
+            # interpreter shutdown: Isaac Sim's atexit handlers deadlock. FtrDiffusionTrainer
+            # .train() force-exits with os._exit(75) on CUDA/W&B errors, but any OTHER
+            # exception is re-raised, and an uncaught exception here means Python runs a
+            # normal shutdown -> Isaac's atexit -> hang. The job then holds its node until
+            # walltime instead of failing, which on amdgpulong is up to 24 h of a GPU per
+            # crash. Observed for real: job 11493997 crashed on a tensor-shape bug at
+            # 00:10:20, wrote its crash checkpoint, closed the RunLogger — and was still
+            # RUNNING 15 minutes later, doing nothing, until it was cancelled by hand.
+            #
+            # Exit 1, not 75: 75 means "transient, respawn me", and a crash that reaches
+            # here is a bug that will recur. The sbatch loop treats non-75 as terminal.
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            import os as _os
+            _os._exit(1)
 
     # Skip simulation_app.close() — Isaac Sim's shutdown re-initialises GPU foundation
     # and frequently deadlocks, keeping the SLURM slot busy for hours.
