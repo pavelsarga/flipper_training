@@ -212,8 +212,19 @@ class ObsHistoryEncoder(nn.Module):
     """Applies the per-frame observation encoder across the T_o history with shared weights.
 
     Input is the flat ``obs_history`` key written by the CatFrames transform,
-    ``[N, T_o * obs_dim]``; output is ``[N, T_o * frame_dim]``, the paper's "encode each
-    timestep independently and concatenate".
+    ``[..., T_o * obs_dim]``; output is ``[..., T_o * frame_dim]`` — the paper's "images in
+    each timestep are encoded independently and then concatenated".
+
+    ⚠ Must be agnostic to the number of LEADING dimensions. The critic is called with a
+    plain ``[N, ...]`` batch during collection and PPO updates, but GAE calls it as
+    ``vmap(value_net, (0,))`` over an ``[envs, time]`` tensordict, so it also sees an extra
+    batch dim and a vmap dim on top of that. An earlier version reshaped using
+    ``shape[0]``, which worked everywhere except there and died inside GAE with
+    ``shape '[2, 32, 966]' is invalid for input of size 989184``. Slicing the last dimension
+    and concatenating avoids any reshape, and hands the per-frame encoder exactly the same
+    tensor rank the un-chunked policy gives it — which is the rank its own internals
+    (``x[..., :945].view(*x.shape[:-1], 1, 45, 21)``) are known to handle under vmap.
+    T_o is 2-3, so the Python loop costs nothing.
     """
 
     def __init__(self, frame_encoder: nn.Module, obs_dim: int, history_len: int):
@@ -224,9 +235,11 @@ class ObsHistoryEncoder(nn.Module):
         self.output_dim = frame_encoder.output_dim * history_len
 
     def forward(self, obs_history: torch.Tensor) -> torch.Tensor:
-        n = obs_history.shape[0]
-        frames = obs_history.view(n * self.history_len, self.obs_dim)
-        return self.frame_encoder(frames).view(n, -1)
+        frames = [
+            self.frame_encoder(obs_history[..., t * self.obs_dim : (t + 1) * self.obs_dim])
+            for t in range(self.history_len)
+        ]
+        return torch.cat(frames, dim=-1)
 
 
 # ----------------------------------------------------------------------------------
@@ -270,13 +283,19 @@ class ChunkGaussianActorNet(nn.Module):
 
     def forward(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         cond = self.encoder(obs_history)
-        n = cond.shape[0]
-        out = self.unet(self.query.expand(n, -1, -1), cond)  # [N, 2A, T_p]
+        # Conv1d needs exactly (N, C, L), so flatten any leading dims and restore them after.
+        # In practice the actor is only ever called with a single batch dim, but being
+        # explicit here beats silently mis-shaping if that ever changes.
+        lead = cond.shape[:-1]
+        cond_flat = cond.reshape(-1, cond.shape[-1])
+        n = cond_flat.shape[0]
+        out = self.unet(self.query.expand(n, -1, -1), cond_flat)  # [N, 2A, T_p]
         loc_c, scale_c = out[:, : self.action_dim], out[:, self.action_dim :]
         # [N, A, T_p] -> [N, T_p, A] -> flat, so the chunk is laid out step-major and the
         # env wrapper's reshape(N, T_p, A) recovers it.
-        loc = loc_c.transpose(1, 2).reshape(n, -1)
-        scale_raw = scale_c.transpose(1, 2).reshape(n, -1)
+        chunk_dim = self.prediction_horizon * self.action_dim
+        loc = loc_c.transpose(1, 2).reshape(*lead, chunk_dim)
+        scale_raw = scale_c.transpose(1, 2).reshape(*lead, chunk_dim)
         return self.param_extractor(torch.cat([loc, scale_raw], dim=-1))
 
 
