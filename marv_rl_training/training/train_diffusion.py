@@ -37,6 +37,30 @@ if __name__ == "__main__":
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
+    # Force-exit on ANY uncaught exception, from here on.
+    #
+    # The try/except around trainer.train() lower down covers only training. It does not
+    # cover the module-level imports in BLOCK 2, which run after Isaac has already started —
+    # and an exception there hangs exactly as a training crash does, because the interpreter
+    # falls into a normal shutdown and Isaac's atexit handlers deadlock. Observed: job
+    # 11498701 died instantly on a ModuleNotFoundError and then sat on a GPU for its full
+    # 30-minute walltime.
+    #
+    # sys.excepthook runs before interpreter shutdown, so os._exit here bypasses atexit for
+    # every uncaught exception regardless of where it was raised.
+    import sys as _sys
+
+    def _force_exit_on_uncaught(exc_type, exc, tb):
+        import os as _os
+        import traceback as _tb
+
+        _tb.print_exception(exc_type, exc, tb)
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+        _os._exit(1)
+
+    _sys.excepthook = _force_exit_on_uncaught
+
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================

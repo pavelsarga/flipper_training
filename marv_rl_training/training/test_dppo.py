@@ -104,7 +104,9 @@ try:
           {"loss_objective", "loss_critic"} <= keys, str(sorted(keys)))
     check("clip_fraction is reported", "clip_fraction" in keys)
     check("no entropy terms (entropy_bonus off, dist is None)", "loss_entropy" not in keys)
-    tot = out["loss_objective"].mean() + out["loss_critic"].mean()
+    check("2A loss_objective is a scalar too", out["loss_objective"].dim() == 0,
+          f"shape {tuple(out['loss_objective'].shape)}")
+    tot = out["loss_objective"] + out["loss_critic"]
     tot.backward()
     # torchrl wraps the actor functionally, so gradients land on loss.actor_network_params,
     # NOT on actor.parameters() — checking the latter reports ~0 and looks like a pass
@@ -169,7 +171,13 @@ try:
           str(sorted(o2.keys())))
     check("per-step clip_fraction is reported for every denoising step",
           tuple(o2["clip_fraction_per_step"].shape) == (K,), str(tuple(o2["clip_fraction_per_step"].shape)))
-    (o2["loss_objective"].mean() + o2["loss_critic"].mean()).backward()
+    # Backward EXACTLY as the trainer does — no .mean() here. An earlier version of this
+    # test reduced first, which made a [N]-shaped loss_objective look fine and let a
+    # "grad can be implicitly created only for scalar outputs" failure reach the cluster.
+    check("loss_objective is a scalar, as backward() requires",
+          o2["loss_objective"].dim() == 0, f"shape {tuple(o2['loss_objective'].shape)}")
+    check("loss_critic is a scalar", o2["loss_critic"].dim() == 0, f"shape {tuple(o2['loss_critic'].shape)}")
+    (o2["loss_objective"] + o2["loss_critic"]).backward()
     ug = [p_.grad for n_, p_ in loss2.named_parameters() if "unet" in n_ and p_.grad is not None]
     un2 = torch.sqrt(sum((g.double()**2).sum() for g in ug)) if ug else torch.tensor(0.0)
     check("eps_theta receives gradient under per-step clipping", len(ug) > 0 and float(un2) > 1e-8,

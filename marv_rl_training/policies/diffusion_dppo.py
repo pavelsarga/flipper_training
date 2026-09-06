@@ -228,14 +228,35 @@ class DPPOPerStepClipLoss(DPPOClipLoss):
         gain2 = lw_clip.exp() * adv
         gain = torch.stack([gain1, gain2], -1).min(dim=-1).values
 
-        td_out = _TD({"loss_objective": -gain.mean(dim=1)}, batch_size=[])
-        td_out.set("clip_fraction", (lw_clip != log_weight).to(log_weight.dtype).mean())
+        # torchrl's losses apply self.reduction at the end of forward, and every caller
+        # relies on it: the trainer does loss_objective.backward() directly, which needs a
+        # scalar. DPPOClipLoss inherits ClipPPOLoss.forward and gets this for free; this
+        # class overrides forward, so it has to reduce explicitly. Without it the loss comes
+        # back shaped [N] and backward() raises "grad can be implicitly created only for
+        # scalar outputs" on the first update.
+        reduction = getattr(self, "reduction", "mean")
+
+        def _red(x):
+            if reduction == "mean":
+                return x.mean()
+            if reduction == "sum":
+                return x.sum()
+            return x
+
+        td_out = _TD({"loss_objective": _red(-gain.mean(dim=1))}, batch_size=[])
+        td_out.set("clip_fraction", (lw_clip != log_weight).to(log_weight.dtype).mean().detach())
         td_out.set("kl_approx", (prev - cur).mean().detach())
         # Per-step diagnostics: if the later steps carry all the drift, K_infer is too long.
         td_out.set("clip_fraction_per_step", (lw_clip != log_weight).to(log_weight.dtype).mean(dim=0).detach())
         if self.critic_coef is not None:
-            loss_critic, value_clip_fraction = self.loss_critic(tensordict)
-            td_out.set("loss_critic", loss_critic)
+            _lc = self.loss_critic(tensordict)
+            # loss_critic returns (loss, value_clip_fraction) in some versions and a bare
+            # tensor in others — accept both rather than assume.
+            if isinstance(_lc, tuple):
+                loss_critic, value_clip_fraction = _lc
+            else:
+                loss_critic, value_clip_fraction = _lc, None
+            td_out.set("loss_critic", _red(loss_critic))
             if value_clip_fraction is not None:
                 td_out.set("value_clip_fraction", value_clip_fraction)
         return td_out
