@@ -909,8 +909,20 @@ class FtrDiffusionTrainer:
                             _diag_sum[_dk] = _diag_sum.get(_dk, 0.0) + loss_vals[_dk].mean().item()
                     _diag_n += 1
                     if "kl_approx" in loss_vals.keys():
-                        _epoch_kl += float(loss_vals["kl_approx"].mean().item())
+                        _kl_now = float(loss_vals["kl_approx"].mean().item())
+                        _epoch_kl += _kl_now
                         _epoch_kl_n += 1
+                        # Break INSIDE the epoch too. Checking only between epochs lets a
+                        # whole pass of sub-batch updates run before the guard sees
+                        # anything, which is where the damage happens: Phase 2 job 11513387
+                        # reached kl_approx 2037 in its first iteration, destroying a BC
+                        # warm start (chunk_step_delta 0.052 -> 0.63) despite epochs_run
+                        # correctly reporting 1. The per-epoch check was measuring a fire
+                        # after the building had burned down. Uses a multiple of target_kl
+                        # so ordinary sub-batch noise does not trip it.
+                        if self.config.target_kl is not None and _kl_now > 4.0 * self.config.target_kl:
+                            _stopped_on_kl = True
+                            break
                     loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
                     if "loss_entropy" in loss_vals.keys():
                         loss_value = loss_value + loss_vals["loss_entropy"]
@@ -929,7 +941,9 @@ class FtrDiffusionTrainer:
                         self.optim.step()
                         self.optim.zero_grad()
                 _epochs_run += 1
-                # Checked per epoch, not per sub-batch: a single minibatch's kl_approx is
+                if _stopped_on_kl:
+                    break
+                # Also checked per epoch: a single minibatch's kl_approx is
                 # noisy enough to trip constantly, and the quantity we care about is the
                 # drift accumulated over a pass, not the excursion of one batch.
                 if self.config.target_kl is not None and _epoch_kl_n:
