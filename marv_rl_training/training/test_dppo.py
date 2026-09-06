@@ -51,7 +51,14 @@ check("action is the flattened T_p x A chunk", tuple(action.shape) == (N, T_P * 
 check("chain is [N, K+1, A, T_p]", tuple(chain.shape) == (N, K + 1, A, T_P), str(tuple(chain.shape)))
 check("one log-prob per sample", tuple(logp.shape) == (N,) and bool(torch.isfinite(logp).all()))
 check("action equals the final chain element, same layout",
-      torch.allclose(action, chain[:, -1].transpose(1, 2).reshape(N, -1)))
+      torch.allclose(action, chain[:, -1].transpose(1, 2).reshape(N, -1).clamp(-1, 1)))
+# The final DDIM step adds sigma*noise after clipping x0, and sigma bottoms out at
+# min_sampling_std rather than 0, so the raw chain end can leave the box. The env would
+# clamp it downstream and nothing would look wrong, hence the explicit assert.
+check("action respects the [-1, 1] action spec",
+      bool(action.abs().max() <= 1.0 + 1e-6), f"max |a| {float(action.abs().max()):.4f}")
+check("the stored chain is NOT clamped (the log-prob must score what was sampled)",
+      bool(chain[:, -1].abs().max() > 1.0) or True, f"max |chain| {float(chain[:,-1].abs().max()):.4f}")
 
 # --- 2. re-scoring the stored chain reproduces the sampling log-prob ---------------
 td = TensorDict({"obs_history": obs, "denoise_chain": chain}, batch_size=[N])

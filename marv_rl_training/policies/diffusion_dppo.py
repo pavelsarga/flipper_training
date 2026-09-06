@@ -105,8 +105,19 @@ class DiffusionChunkActor(TensorDictModuleBase):
         return torch.cat([obs_emb, self.step_embed(kt)], dim=-1)
 
     def _chain_to_action(self, x: torch.Tensor) -> torch.Tensor:
-        # [N, A, T_p] -> [N, T_p, A] -> flat, matching ActionChunkEnv's reshape(N, T_p, A).
-        return x.transpose(1, 2).reshape(x.shape[0], -1)
+        """[N, A, T_p] -> [N, T_p*A], matching ActionChunkEnv's reshape(N, T_p, A).
+
+        Clamped to the action spec's [-1, 1]. ddim_step clips its x0 prediction, but the
+        sample it returns is mean + sigma*noise, and at the final step sigma sits at the
+        min_sampling_std floor rather than 0 — so the emitted action lands slightly outside
+        the box (measured ~±0.06). The env clamps downstream, so this would never have
+        crashed; the policy would simply have been sampling outside its declared spec.
+
+        Clamping here is safe under DPPO: the log-probability scores the CHAIN, and the
+        action is a deterministic function of the chain's final element. Squashing it
+        changes no density we evaluate, unlike a tanh on a Gaussian policy.
+        """
+        return x.transpose(1, 2).reshape(x.shape[0], -1).clamp(-1.0, 1.0)
 
     # ------------------------------------------------------------------ rollout
 
@@ -297,6 +308,11 @@ class DiffusionPolicyPhase2Config(PolicyConfig):
     min_sampling_std: float = 0.02
     per_step_clipping: bool = False
     obs_history_key: str = "obs_history"
+    # Checkpoint from pretrain_diffusion_bc.py, loaded straight into the ACTOR.
+    # Distinct from PolicyConfig's weights_path, which loads a full actor-critic wrapper
+    # state_dict: the BC stage trains only eps_theta and its encoder, so it has no critic to
+    # restore, and its keys are actor-relative rather than wrapper-prefixed.
+    bc_weights_path: str | None = None
 
     def create(self, env, **kwargs):
         from torchrl.modules import ActorCriticWrapper
@@ -340,6 +356,17 @@ class DiffusionPolicyPhase2Config(PolicyConfig):
             {"params": list(actor.parameters()), "name": "policy_operator", **self.actor_optimizer_opts},
             {"params": list(critic.parameters()), "name": "value_operator", **self.value_optimizer_opts},
         ]
+        if self.bc_weights_path:
+            sd = torch.load(self.bc_weights_path, map_location=device or "cpu")
+            mu = actor.load_state_dict(sd, strict=False)
+            _log.info(f"BC warm start from {self.bc_weights_path}")
+            if mu.missing_keys:
+                # The critic is expected to be missing; anything else means a mismatch
+                # between the pretraining geometry and this config.
+                _log.warning(f"BC checkpoint missing keys: {mu.missing_keys}")
+            if mu.unexpected_keys:
+                _log.warning(f"BC checkpoint unexpected keys: {mu.unexpected_keys}")
+
         if weights_path := kwargs.get("weights_path", None):
             sd = torch.load(weights_path, map_location=device or "cpu")
             mu = wrapper.load_state_dict(sd, strict=False)
