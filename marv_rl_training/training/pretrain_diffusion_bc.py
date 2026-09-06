@@ -85,15 +85,26 @@ class EMA:
     weights are consistently the better initialisation.
     """
 
-    def __init__(self, model: nn.Module, power: float, max_value: float):
-        self.power, self.max_value = power, max_value
+    def __init__(self, model: nn.Module, power: float, max_value: float, inv_gamma: float = 1.0):
+        self.power, self.max_value, self.inv_gamma = power, max_value, inv_gamma
         self.shadow = {k: v.detach().clone().float() for k, v in model.state_dict().items()
                        if v.dtype.is_floating_point}
         self.step = 0
 
     def update(self, model: nn.Module) -> None:
         self.step += 1
-        decay = min(self.max_value, (1 + self.step) / (10 + self.step) ** self.power)
+        # decay = 1 - (1 + step/inv_gamma)^-power  (Karras et al. / diffusers EMAModel).
+        # It RAMPS UP: ~0.40 at step 1, ~0.97 at step 100, ~0.994 at step 1000, so the
+        # average tracks the model early and only becomes sluggish once it has something
+        # worth averaging.
+        #
+        # A previous version used (1+step)/(10+step)^power, which exceeds 1.0 by about step
+        # 10 and therefore pinned at max_value immediately — the shadow weights barely moved
+        # and the saved checkpoint was near its initialisation. It showed up as validation
+        # epsilon-MSE stuck at ~1.0 (i.e. predicting nothing) while training loss fell to
+        # 0.53. Worth remembering that an EMA bug looks exactly like "the model didn't
+        # learn", not like a crash.
+        decay = 1.0 - (1.0 + self.step / self.inv_gamma) ** (-self.power)
         decay = min(max(decay, 0.0), self.max_value)
         with torch.no_grad():
             for k, v in model.state_dict().items():
