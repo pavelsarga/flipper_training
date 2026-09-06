@@ -795,6 +795,34 @@ class FtrDiffusionTrainer:
                 action_log["action/chunk_step_delta"] = _delta.mean().item()
                 action_log["action/chunk_step_delta_flipper"] = _delta[..., 2:].mean().item()
                 action_log["action/chunk_step_delta_max"] = _delta.max().item()
+            # ⚠ The three metrics above are computed on SAMPLED actions, so while the policy's
+            # scale is still ~1 they measure sampling noise, not the predicted trajectory: for
+            # near-independent actions on [-1,1] the expected step delta is 2/3, and the first
+            # shakedown duly sat at 0.7239 -> 0.7224 across ten iterations no matter what the
+            # network was doing. The mean chunk (loc) is the actual predicted trajectory, and
+            # scale_mean says whether the policy is concentrating at all — log both, or a flat
+            # chunk_step_delta is uninterpretable.
+            if "loc" in flat.keys():
+                _loc = flat["loc"].reshape(-1, self.config.prediction_horizon, action_dim)
+                if self.config.prediction_horizon > 1:
+                    _ld = (_loc[:, 1:] - _loc[:, :-1]).abs()
+                    action_log["action/loc_step_delta"] = _ld.mean().item()
+                    action_log["action/loc_step_delta_flipper"] = _ld[..., 2:].mean().item()
+                action_log["action/loc_abs_mean"] = _loc.abs().mean().item()
+            if "scale" in flat.keys():
+                action_log["action/scale_mean"] = flat["scale"].mean().item()
+            # TanhNormal conditioning. With scale=1 in PRE-tanh space the sampled actions
+            # pile up against +-1, where recovering the pre-tanh value (atanh) explodes and
+            # log-prob becomes hypersensitive: ClipPPOLoss re-evaluates the STORED action
+            # under the updated policy, so a saturated sample can move the ratio far out of
+            # the clip band even when loc and scale have barely changed. That is exactly the
+            # contradiction seen on attempt 2 (scale 1.0000, loc 0.02, clip_fraction 0.345).
+            # sat_frac is the direct measurement; if it is large, lower the initial scale
+            # rather than the learning rate.
+            _a = flat["action"]
+            action_log["action/sat_frac_099"] = (_a.abs() > 0.99).float().mean().item()
+            action_log["action/sat_frac_09"] = (_a.abs() > 0.9).float().mean().item()
+            action_log["action/abs_mean"] = _a.abs().mean().item()
 
             self.replay_buffer.extend(flat)
             del tensordict_data, flat
@@ -803,10 +831,21 @@ class FtrDiffusionTrainer:
 
             n_subbatches = max(1, n_valid // self.config.frames_per_sub_batch)
             skipped_updates = 0
+            # Accumulate the loss diagnostics across EVERY sub-batch. Taking them from the
+            # loop variable afterwards (what train_ftr.py does) reports only the last
+            # sub-batch of the last epoch while calling it "mean_*", which hides how the
+            # policy drifted across the 160 updates inside one iteration — exactly the
+            # quantity clip_fraction exists to measure.
+            _diag_sum: dict[str, float] = {}
+            _diag_n = 0
             for _j in range(self.config.epochs_per_batch):
                 for _k in range(n_subbatches):
                     sub_batch = self.replay_buffer.sample().to(self.device)
                     loss_vals = self.loss_module(sub_batch)
+                    for _dk in ("clip_fraction", "kl_approx", "entropy", "loss_objective", "loss_critic"):
+                        if _dk in loss_vals.keys():
+                            _diag_sum[_dk] = _diag_sum.get(_dk, 0.0) + loss_vals[_dk].mean().item()
+                    _diag_n += 1
                     loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"] + loss_vals["loss_entropy"]
                     loss_value.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -845,12 +884,15 @@ class FtrDiffusionTrainer:
                 "train/value_minus_reward": rollout_value_minus_reward,
                 "train/mean_advantage_GAE": rollout_adv_mean,
                 "train/mean_action_sample_log_prob": rollout_log_prob,
-                "train/mean_critic_loss": loss_vals["loss_critic"].mean().item(),
-                "train/mean_objective_loss": loss_vals["loss_objective"].mean().item(),
+                "train/mean_critic_loss": _diag_sum.get("loss_critic", 0.0) / max(1, _diag_n),
+                "train/mean_objective_loss": _diag_sum.get("loss_objective", 0.0) / max(1, _diag_n),
                 "train/mean_entropy_loss": loss_vals["loss_entropy"].mean().item(),
-                "train/mean_entropy": loss_vals["entropy"].mean().item(),
-                "train/mean_kl_approx": loss_vals["kl_approx"].mean().item(),
-                "train/mean_clip_fraction": loss_vals["clip_fraction"].mean().item(),
+                "train/mean_entropy": _diag_sum.get("entropy", 0.0) / max(1, _diag_n),
+                "train/mean_kl_approx": _diag_sum.get("kl_approx", 0.0) / max(1, _diag_n),
+                "train/mean_clip_fraction": _diag_sum.get("clip_fraction", 0.0) / max(1, _diag_n),
+                # Last sub-batch only — the END-of-iteration drift, vs the mean above.
+                "train/final_clip_fraction": loss_vals["clip_fraction"].mean().item(),
+                "train/final_kl_approx": loss_vals["kl_approx"].mean().item(),
                 "train/mean_advantage": rollout_adv_mean,
                 "train/std_advantage": rollout_adv_std,
                 "train/total_grad_norm": grad_norm.item(),
