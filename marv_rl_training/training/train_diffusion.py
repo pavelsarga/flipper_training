@@ -231,6 +231,17 @@ class FtrDiffusionConfig:
     execution_horizon: int
     history_len: int
     control_gamma: float
+    # Stop an iteration's epoch loop early once the policy has drifted this far from the
+    # rollout policy (mean kl_approx over an epoch). None = disabled.
+    #
+    # This exists because "how many updates per iteration" has been the dominant failure
+    # mode of this trainer, and tuning epochs_per_batch by hand got it wrong twice: ep=5
+    # diverged fast (clip_fraction 0.66 by iteration 6), and ep=3 looked stable for seven
+    # iterations and then climbed steadily to 0.44. A fixed epoch count cannot adapt as the
+    # policy sharpens — log-prob sensitivity grows as scale falls, so the same number of
+    # updates moves the policy further later in training. target_kl bounds the drift
+    # directly instead of proxying it through an epoch count.
+    target_kl: float | None = None
     save_weights_every: int = 0  # 0 = same as eval_and_save_every
     max_eval_steps: int = 0  # 0 = auto: 2 × max_episode_length derived from sim_dt
     # Per-env-type breakdown of mid-training eval success rate — logged to wandb under the
@@ -838,7 +849,10 @@ class FtrDiffusionTrainer:
             # quantity clip_fraction exists to measure.
             _diag_sum: dict[str, float] = {}
             _diag_n = 0
+            _epochs_run = 0
+            _stopped_on_kl = False
             for _j in range(self.config.epochs_per_batch):
+                _epoch_kl, _epoch_kl_n = 0.0, 0
                 for _k in range(n_subbatches):
                     sub_batch = self.replay_buffer.sample().to(self.device)
                     loss_vals = self.loss_module(sub_batch)
@@ -846,6 +860,9 @@ class FtrDiffusionTrainer:
                         if _dk in loss_vals.keys():
                             _diag_sum[_dk] = _diag_sum.get(_dk, 0.0) + loss_vals[_dk].mean().item()
                     _diag_n += 1
+                    if "kl_approx" in loss_vals.keys():
+                        _epoch_kl += float(loss_vals["kl_approx"].mean().item())
+                        _epoch_kl_n += 1
                     loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"] + loss_vals["loss_entropy"]
                     loss_value.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -861,6 +878,14 @@ class FtrDiffusionTrainer:
                     else:
                         self.optim.step()
                         self.optim.zero_grad()
+                _epochs_run += 1
+                # Checked per epoch, not per sub-batch: a single minibatch's kl_approx is
+                # noisy enough to trip constantly, and the quantity we care about is the
+                # drift accumulated over a pass, not the excursion of one batch.
+                if self.config.target_kl is not None and _epoch_kl_n:
+                    if (_epoch_kl / _epoch_kl_n) > self.config.target_kl:
+                        _stopped_on_kl = True
+                        break
 
             if "cuda" in str(self.device):
                 torch.cuda.empty_cache()
@@ -899,6 +924,8 @@ class FtrDiffusionTrainer:
                 **{f"train/{g['name']}_lr": g["lr"] for g in self.optim.param_groups},
                 "train/step_penalty": _sp_current if _sp_current is not None else 0.0,
                 "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
+                "train/epochs_run": _epochs_run,
+                "train/stopped_on_kl": float(_stopped_on_kl),
                 "explosions/dirty_envs": n_dirty,
                 "explosions/skipped_updates": skipped_updates,
                 "explosions/skipped_updates_frac": skipped_updates / (n_subbatches * self.config.epochs_per_batch),
