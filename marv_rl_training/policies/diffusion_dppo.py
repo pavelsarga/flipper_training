@@ -32,6 +32,7 @@ from the sampling sigma floor (`min_sampling_std` on the schedule) instead.
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -39,10 +40,15 @@ from tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase
 from torchrl.objectives import ClipPPOLoss
 
+from marv_rl_training.policies import PolicyConfig
 from marv_rl_training.policies.diffusion_policy import ConditionalUnet1D, ObsHistoryEncoder, SinusoidalPosEmb
 from marv_rl_training.policies.diffusion_schedule import DiffusionSchedule
+from marv_rl_training.utils.logutils import get_terminal_logger
 
-__all__ = ["DiffusionChunkActor", "DPPOClipLoss", "DPPOPerStepClipLoss"]
+_log = get_terminal_logger("DiffusionPolicyPhase2")
+
+__all__ = ["DiffusionChunkActor", "DPPOClipLoss", "DPPOPerStepClipLoss",
+           "DiffusionPolicyPhase2Config", "make_dppo_loss"]
 
 
 class DiffusionChunkActor(TensorDictModuleBase):
@@ -233,3 +239,113 @@ class DPPOPerStepClipLoss(DPPOClipLoss):
             if value_clip_fraction is not None:
                 td_out.set("value_clip_fraction", value_clip_fraction)
         return td_out
+
+
+@dataclass
+class DiffusionPolicyPhase2Config(PolicyConfig):
+    """Phase 2 actor-critic: DDIM diffusion actor + the same MLP critic as Phase 1.
+
+    Deliberately mirrors DiffusionPolicyConfig so a Phase 1 checkpoint is a usable
+    initialisation: same ObsHistoryEncoder, same ConditionalUnet1D geometry. Only the
+    U-Net's output width changes (A instead of 2A — epsilon rather than loc/scale) and the
+    conditioning vector gains the denoising-step embedding.
+
+    Args:
+        num_train_timesteps / num_inference_steps: K_train and K_infer.
+        eta: DDIM stochasticity. Must be > 0 — a deterministic chain has no log-prob.
+        min_sampling_std: Floor on the per-step sigma; the exploration knob that replaces
+            entropy_coef. Measured to be a weak lever on ratio sensitivity (0.02 -> 0.2
+            moved it 0.007 -> 0.004 nats), so treat it as exploration only.
+        per_step_clipping: Use DPPOPerStepClipLoss instead of DPPOClipLoss. Chain-level is
+            the default because it measured comfortably inside the trust region at
+            realistic step sizes; this is the safety valve if KL misbehaves.
+    """
+
+    actor_optimizer_opts: dict
+    value_optimizer_opts: dict
+    value_mlp_opts: dict
+    prediction_horizon: int = 4
+    history_len: int = 2
+    down_dims: list = field(default_factory=lambda: [64, 128])
+    kernel_size: int = 5
+    n_groups: int = 8
+    step_embed_dim: int = 64
+    num_train_timesteps: int = 100
+    num_inference_steps: int = 8
+    eta: float = 1.0
+    min_sampling_std: float = 0.02
+    per_step_clipping: bool = False
+    obs_history_key: str = "obs_history"
+
+    def create(self, env, **kwargs):
+        from torchrl.modules import ActorCriticWrapper
+        from tensordict.nn import TensorDictModule
+        from marv_rl_training.policies.diffusion_policy import ChunkCriticNet
+
+        chunk_dim = env.action_spec.shape[-1]
+        action_dim = chunk_dim // self.prediction_horizon
+        if action_dim * self.prediction_horizon != chunk_dim:
+            raise ValueError(
+                f"action_spec last dim ({chunk_dim}) is not prediction_horizon "
+                f"({self.prediction_horizon}) x action_dim — is the env wrapped in ActionChunkEnv?"
+            )
+        observation = env.observations[0]
+        device = kwargs.get("device", None)
+
+        def _enc():
+            return ObsHistoryEncoder(observation.get_encoder(), observation.dim, self.history_len)
+
+        schedule = DiffusionSchedule(
+            num_train_timesteps=self.num_train_timesteps,
+            num_inference_steps=self.num_inference_steps,
+            eta=self.eta,
+            min_sampling_std=self.min_sampling_std,
+        )
+        actor = DiffusionChunkActor(
+            encoder=_enc(), schedule=schedule, action_dim=action_dim,
+            prediction_horizon=self.prediction_horizon, down_dims=list(self.down_dims),
+            kernel_size=self.kernel_size, n_groups=self.n_groups,
+            step_embed_dim=self.step_embed_dim, obs_history_key=self.obs_history_key,
+        )
+        critic = TensorDictModule(
+            ChunkCriticNet(_enc(), dict(self.value_mlp_opts)),
+            in_keys=[self.obs_history_key], out_keys=["state_value"],
+        )
+        wrapper = ActorCriticWrapper(policy_operator=actor, value_operator=critic)
+        if device is not None:
+            wrapper.to(device)
+
+        optim_groups = [
+            {"params": list(actor.parameters()), "name": "policy_operator", **self.actor_optimizer_opts},
+            {"params": list(critic.parameters()), "name": "value_operator", **self.value_optimizer_opts},
+        ]
+        if weights_path := kwargs.get("weights_path", None):
+            sd = torch.load(weights_path, map_location=device or "cpu")
+            mu = wrapper.load_state_dict(sd, strict=False)
+            _log.info(f"Loaded weights from {weights_path}")
+            if mu.missing_keys:
+                _log.warning(f"Missing keys: {mu.missing_keys}")
+            if mu.unexpected_keys:
+                _log.warning(f"Unexpected keys: {mu.unexpected_keys}")
+
+        _log.info(
+            "Diffusion policy (Phase 2): T_p=%d T_o=%d A=%d K_train=%d K_infer=%d eta=%.2f "
+            "sigma_floor=%.3f per_step_clip=%s | actor %s params, critic %s params",
+            self.prediction_horizon, self.history_len, action_dim, self.num_train_timesteps,
+            self.num_inference_steps, self.eta, self.min_sampling_std, self.per_step_clipping,
+            f"{sum(p.numel() for p in actor.parameters() if p.requires_grad):,}",
+            f"{sum(p.numel() for p in critic.parameters() if p.requires_grad):,}",
+        )
+        return wrapper, optim_groups, []
+
+
+def make_dppo_loss(policy_cfg, actor, critic, **ppo_opts):
+    """Pick the DPPO loss class the policy config asks for, and refuse a fatal misconfig."""
+    if ppo_opts.get("entropy_bonus", False):
+        raise ValueError(
+            "entropy_bonus must be false for a diffusion policy: its entropy is not tractable, "
+            "the loss returns dist=None, and ClipPPOLoss would call dist.entropy(). Use the "
+            "schedule's min_sampling_std for exploration instead."
+        )
+    cls = DPPOPerStepClipLoss if getattr(policy_cfg, "per_step_clipping", False) else DPPOClipLoss
+    return cls(actor, critic, **ppo_opts)

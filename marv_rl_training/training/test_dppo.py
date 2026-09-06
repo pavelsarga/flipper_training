@@ -19,7 +19,8 @@ from tensordict.nn import TensorDictModule
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from marv_rl_training.policies.diffusion_dppo import (  # noqa: E402
-    DiffusionChunkActor, DPPOClipLoss, DPPOPerStepClipLoss)
+    DiffusionChunkActor, DPPOClipLoss, DPPOPerStepClipLoss,
+    DiffusionPolicyPhase2Config, make_dppo_loss)
 from marv_rl_training.policies.diffusion_policy import ChunkCriticNet, ObsHistoryEncoder  # noqa: E402
 from marv_rl_training.policies.diffusion_schedule import DiffusionSchedule  # noqa: E402
 from rl_modules.marv_rl.marv_rl_cnn_flat_encoder import MarvRLCNNFlatEncoder  # noqa: E402
@@ -209,6 +210,57 @@ for floor in (0.02, 0.05, 0.1, 0.2):
             q.copy_(b)
     print(f"  INFO  min_sampling_std={floor:<5g} per-step |log w| after a 3e-4 step = "
           f"{float(d2.mean()):7.3f} nats  ({float((d2 > thr).float().mean())*100:3.0f}% clip)")
+
+# --- 8. the Phase 2 policy config assembles and runs through the collector's path -------
+from torchrl.data import Bounded  # noqa: E402
+
+
+class _StubObs:
+    dim = OBS
+    def get_encoder(self):
+        return MarvRLCNNFlatEncoder(input_dim=OBS, **ENC)
+
+
+class _StubEnv:
+    action_spec = Bounded(low=-1.0, high=1.0, shape=(N, T_P * A))
+    observations = [_StubObs()]
+
+
+cfg = DiffusionPolicyPhase2Config(
+    actor_optimizer_opts={"lr": 1e-4}, value_optimizer_opts={"lr": 1e-3},
+    value_mlp_opts={"num_hidden": 2, "hidden_dim": 64, "layernorm": True},
+    prediction_horizon=T_P, history_len=T_O, down_dims=[64, 128], num_inference_steps=K,
+)
+try:
+    wrapper, groups, transforms = cfg.create(_StubEnv())
+    check("Phase 2 config builds an actor-critic wrapper",
+          hasattr(wrapper, "get_policy_operator") and hasattr(wrapper, "get_value_operator"))
+    check("two optimiser groups, named as the trainer expects",
+          [g["name"] for g in groups] == ["policy_operator", "value_operator"], str([g["name"] for g in groups]))
+    td_roll = TensorDict({"obs_history": obs}, batch_size=[N])
+    out_roll = wrapper.get_policy_operator()(td_roll)
+    check("actor writes action, chain, log-prob and per-step log-probs into the tensordict",
+          {"action", "denoise_chain", "sample_log_prob", "denoise_logp_steps"} <= set(out_roll.keys()),
+          str(sorted(out_roll.keys())))
+    check("critic produces one value per macro step",
+          tuple(wrapper.get_value_operator()(td_roll)["state_value"].shape) == (N, 1))
+except Exception as e:  # noqa: BLE001
+    check("Phase 2 config builds", False, f"{type(e).__name__}: {e}")
+
+# entropy_bonus is a fatal misconfiguration for a diffusion policy — it must not be silent.
+try:
+    make_dppo_loss(cfg, actor, critic, clip_epsilon=0.2, entropy_bonus=True)
+    check("make_dppo_loss rejects entropy_bonus=True", False, "it did not raise")
+except ValueError:
+    check("make_dppo_loss rejects entropy_bonus=True", True)
+l_default = make_dppo_loss(cfg, actor, critic, clip_epsilon=0.2, entropy_bonus=False)
+cfg2 = DiffusionPolicyPhase2Config(actor_optimizer_opts={}, value_optimizer_opts={},
+                                   value_mlp_opts={"num_hidden": 1, "hidden_dim": 32, "layernorm": False},
+                                   per_step_clipping=True)
+l_perstep = make_dppo_loss(cfg2, actor, critic, clip_epsilon=0.2, entropy_bonus=False)
+check("make_dppo_loss selects the loss class from per_step_clipping",
+      type(l_default).__name__ == "DPPOClipLoss" and type(l_perstep).__name__ == "DPPOPerStepClipLoss",
+      f"{type(l_default).__name__} / {type(l_perstep).__name__}")
 
 print()
 if _fails:
