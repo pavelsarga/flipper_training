@@ -1021,10 +1021,23 @@ class FtrDiffusionTrainer:
 
             self.run_logger.log_data(log, total_collected_frames)
 
+        # Name the final checkpoint by the CUMULATIVE frame count, not config.total_frames.
+        # They are the same on a fresh run, but on a cross-job resume config.total_frames is
+        # only the ADDITIONAL frames requested — so the final checkpoint would be misnamed
+        # and could collide with one from the job being resumed, corrupting the frame
+        # accounting (attempt_record_progress reads these names) on any further resume.
+        _final_frames = getattr(self, "_current_total_frames", None) or self.config.total_frames
+        _final_iter = getattr(self, "_current_iteration", 0)
         self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), "policy_final")
         self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_final")
-        self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), f"policy_step_{self.config.total_frames}")
-        self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{self.config.total_frames}")
+        self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), f"policy_step_{_final_frames}")
+        self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{_final_frames}")
+        # Save the matching training state too. Without this the run ends with weights one
+        # save-interval ahead of the optimizer/scheduler state that training_state.pth holds,
+        # so a resume restores mismatched pairs — measured on the resume test: weights from
+        # frame 32768 but schedules from 28672, silently losing two iterations of schedule
+        # progress on every resume.
+        self._save_training_checkpoint(_final_iter, _final_frames)
 
     def _get_eval_rollout_results(self) -> dict[str, float]:
         self.env.eval()
