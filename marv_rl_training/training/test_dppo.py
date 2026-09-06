@@ -18,7 +18,8 @@ from tensordict.nn import TensorDictModule
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from marv_rl_training.policies.diffusion_dppo import DiffusionChunkActor, DPPOClipLoss  # noqa: E402
+from marv_rl_training.policies.diffusion_dppo import (  # noqa: E402
+    DiffusionChunkActor, DPPOClipLoss, DPPOPerStepClipLoss)
 from marv_rl_training.policies.diffusion_policy import ChunkCriticNet, ObsHistoryEncoder  # noqa: E402
 from marv_rl_training.policies.diffusion_schedule import DiffusionSchedule  # noqa: E402
 from rl_modules.marv_rl.marv_rl_cnn_flat_encoder import MarvRLCNNFlatEncoder  # noqa: E402
@@ -44,7 +45,7 @@ obs = torch.randn(N, T_O * OBS)
 
 # --- 1. shapes -------------------------------------------------------------------
 with torch.no_grad():
-    action, chain, logp = actor.sample_chain(obs)
+    action, chain, logp, steps = actor.sample_chain(obs)
 check("action is the flattened T_p x A chunk", tuple(action.shape) == (N, T_P * A), str(tuple(action.shape)))
 check("chain is [N, K+1, A, T_p]", tuple(chain.shape) == (N, K + 1, A, T_P), str(tuple(chain.shape)))
 check("one log-prob per sample", tuple(logp.shape) == (N,) and bool(torch.isfinite(logp).all()))
@@ -63,10 +64,16 @@ check("chain_log_prob is deterministic (no resampling)", torch.allclose(again, r
 
 # --- 3. it actually responds to parameter changes ---------------------------------
 before = relogp.clone()
+_bak0 = [q.detach().clone() for q in actor.unet.final_conv[-1].parameters()]
 with torch.no_grad():
-    for p in actor.unet.final_conv[-1].parameters():
-        p.add_(torch.randn_like(p) * 0.05)
+    for q in actor.unet.final_conv[-1].parameters():
+        q.add_(torch.randn_like(q) * 0.05)
     after = actor.chain_log_prob(td)
+    # RESTORE. Leaving this perturbation in place silently invalidated every later
+    # comparison against `logp`/`steps`, which were captured before it — it made the 2A/2B
+    # sensitivity numbers read 80 and 10.5 nats when the true values are ~1 and ~0.03.
+    for q, b in zip(actor.unet.final_conv[-1].parameters(), _bak0):
+        q.copy_(b)
 check("perturbing eps_theta changes the chain log-prob (the ratio is live)",
       not torch.allclose(after, before, atol=1e-3), f"mean |d| {float((after - before).abs().mean()):.3f}")
 
@@ -132,6 +139,76 @@ for scale in (1e-4, 1e-3, 1e-2):
     d = float((moved - base).abs().mean())
     print(f"  INFO  perturb eps_theta by {scale:g}: mean |d log-prob| = {d:.3f} nats "
           f"({'clips immediately' if d > 0.182 else 'within the trust region'})")
+
+# --- 6. per-step clipping (2B) — the intended default ---------------------------------
+check("per-step log-probs are [N, K] and sum to the chain log-prob",
+      tuple(steps.shape) == (N, K) and torch.allclose(steps.sum(1), logp, atol=1e-4),
+      f"{tuple(steps.shape)}, max diff {float((steps.sum(1)-logp).abs().max()):.2e}")
+# NB `steps` was captured before section 3 perturbed the actor, so it is a stale reference.
+# The meaningful invariant at the current parameters is that the per-step log-probs sum to
+# the chain log-prob — that is what makes 2A and 2B two views of the same quantity.
+with torch.no_grad():
+    re_steps = actor.chain_log_prob_steps(td)
+    re_chain = actor.chain_log_prob(td)
+check("chain_log_prob_steps reproduces the sampled per-step log-probs",
+      torch.allclose(re_steps, steps, atol=1e-4), f"max diff {float((re_steps-steps).abs().max()):.2e}")
+check("per-step log-probs sum to the chain log-prob at the current parameters",
+      torch.allclose(re_steps.sum(1), re_chain, atol=1e-4),
+      f"max diff {float((re_steps.sum(1)-re_chain).abs().max()):.2e}")
+
+loss2 = DPPOPerStepClipLoss(actor, critic, clip_epsilon=0.2, entropy_bonus=False,
+                            critic_coef=1.0, loss_critic_type="smooth_l1", normalize_advantage=True)
+td2 = td_loss.clone()
+td2.set("denoise_logp_steps", re_steps)
+for p_ in loss2.parameters():
+    p_.grad = None
+try:
+    o2 = loss2(td2)
+    check("DPPOPerStepClipLoss returns objective + critic", {"loss_objective","loss_critic"} <= set(o2.keys()),
+          str(sorted(o2.keys())))
+    check("per-step clip_fraction is reported for every denoising step",
+          tuple(o2["clip_fraction_per_step"].shape) == (K,), str(tuple(o2["clip_fraction_per_step"].shape)))
+    (o2["loss_objective"].mean() + o2["loss_critic"].mean()).backward()
+    ug = [p_.grad for n_, p_ in loss2.named_parameters() if "unet" in n_ and p_.grad is not None]
+    un2 = torch.sqrt(sum((g.double()**2).sum() for g in ug)) if ug else torch.tensor(0.0)
+    check("eps_theta receives gradient under per-step clipping", len(ug) > 0 and float(un2) > 1e-8,
+          f"{len(ug)} tensors, norm {float(un2):.6g}")
+except Exception as e:  # noqa: BLE001
+    check("DPPOPerStepClipLoss runs", False, f"{type(e).__name__}: {e}")
+
+# 2A vs 2B under a realistic parameter step: how much of the batch clips?
+bak = [q.detach().clone() for q in actor.unet.parameters()]
+with torch.no_grad():
+    for q in actor.unet.parameters():
+        q.add_(torch.randn_like(q) * 3e-4)
+    chain_lw = (actor.chain_log_prob(td) - logp).abs()
+    step_lw = (actor.chain_log_prob_steps(td) - steps).abs()
+    for q, b in zip(actor.unet.parameters(), bak):
+        q.copy_(b)
+thr = torch.log(torch.tensor(1.2))
+print(f"  INFO  after a 3e-4 step — 2A chain ratio |log w| = {float(chain_lw.mean()):.3f} nats "
+      f"({float((chain_lw > thr).float().mean())*100:.0f}% of samples clip)")
+print(f"  INFO  after a 3e-4 step — 2B per-step |log w| = {float(step_lw.mean()):.3f} nats "
+      f"({float((step_lw > thr).float().mean())*100:.0f}% of steps clip)")
+
+# --- 7. sigma floor directly controls ratio sensitivity -------------------------------
+# log N(x; mu, sigma) sensitivity to a shift in mu scales as 1/sigma^2, so min_sampling_std
+# is not only an exploration knob — it decides whether PPO ratios are usable at all.
+from marv_rl_training.policies.diffusion_schedule import DiffusionSchedule as _DS
+for floor in (0.02, 0.05, 0.1, 0.2):
+    a2 = DiffusionChunkActor(enc(), _DS(100, K, min_sampling_std=floor), A, T_P, [64, 128]).eval()
+    a2.load_state_dict(actor.state_dict())
+    with torch.no_grad():
+        _, ch2, _, st2 = a2.sample_chain(obs)
+        td2s = TensorDict({"obs_history": obs, "denoise_chain": ch2}, batch_size=[N])
+        bak2 = [q.detach().clone() for q in a2.unet.parameters()]
+        for q in a2.unet.parameters():
+            q.add_(torch.randn_like(q) * 3e-4)
+        d2 = (a2.chain_log_prob_steps(td2s) - st2).abs()
+        for q, b in zip(a2.unet.parameters(), bak2):
+            q.copy_(b)
+    print(f"  INFO  min_sampling_std={floor:<5g} per-step |log w| after a 3e-4 step = "
+          f"{float(d2.mean()):7.3f} nats  ({float((d2 > thr).float().mean())*100:3.0f}% clip)")
 
 print()
 if _fails:
