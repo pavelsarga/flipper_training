@@ -991,6 +991,12 @@ class FtrDiffusionTrainer:
                 "train/step_penalty": _sp_current if _sp_current is not None else 0.0,
                 "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
                 "train/epochs_run": _epochs_run,
+                # Sub-batch updates that actually landed. epochs_run alone is not enough
+                # once target_kl can break mid-epoch: a run reporting epochs_run=1 might
+                # have done 32 updates or 1, and those are completely different training
+                # regimes. Without this the only way to tell was to infer it from the KL.
+                "train/updates_run": _diag_n,
+                "train/updates_possible": self.config.epochs_per_batch * n_subbatches,
                 "train/stopped_on_kl": float(_stopped_on_kl),
                 "explosions/dirty_envs": n_dirty,
                 "explosions/skipped_updates": skipped_updates,
