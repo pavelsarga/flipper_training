@@ -65,6 +65,7 @@ import marv_rl_training  # registers OmegaConf resolvers
 from torchrl.envs import CatFrames
 
 from marv_rl_training.environment.chunked_env import ActionChunkEnv
+from marv_rl_training.policies.diffusion_dppo import DiffusionChunkActor, make_dppo_loss
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_type_registry import default_num_env_types
@@ -430,13 +431,22 @@ class FtrDiffusionTrainer:
             differentiable=False,
         )
         self.advantage_module = self.advantage_module.to(self.config.training_dtype)
-        self.loss_module = ClipPPOLoss(
-            self.actor_operator,
+        _critic_for_loss = (
             self.actor_value_wrapper.get_value_head()
             if isinstance(self.actor_value_wrapper, ActorValueOperator)
-            else self.value_operator,
-            **self.config.ppo_opts,
+            else self.value_operator
         )
+        if isinstance(self.actor_operator, DiffusionChunkActor):
+            # Phase 2. ClipPPOLoss cannot score a diffusion actor: it recomputes log-probs
+            # via actor.get_dist(td).log_prob(action), and the quantity to score is the
+            # stored denoising chain, not the final action. make_dppo_loss also refuses
+            # entropy_bonus=True, which is fatal-but-silent here (no tractable entropy).
+            self.loss_module = make_dppo_loss(
+                policy_cfg, self.actor_operator, _critic_for_loss, **self.config.ppo_opts
+            )
+            self.term_logger.info(f"Phase 2: using {type(self.loss_module).__name__}")
+        else:
+            self.loss_module = ClipPPOLoss(self.actor_operator, _critic_for_loss, **self.config.ppo_opts)
         self.loss_module = self.loss_module.to(self.config.training_dtype)
 
         # ---- optimizer + scheduler ----
@@ -822,6 +832,20 @@ class FtrDiffusionTrainer:
                 action_log["action/loc_abs_mean"] = _loc.abs().mean().item()
             if "scale" in flat.keys():
                 action_log["action/scale_mean"] = flat["scale"].mean().item()
+            # Phase 2 health. C-TRAC's lesson: a collapsed latent looked fine on the success
+            # curve for 22M frames. The analogous silent failure here is a denoising chain
+            # that has stopped doing anything — if the late chain_delta_k are ~0 the chain is
+            # inert and K_infer is wasted compute; if the early ones are ~0 the schedule is
+            # wrong. Logged from the first iteration, not added after something looks off.
+            if "denoise_chain" in flat.keys():
+                _ch = flat["denoise_chain"]                      # [N, K+1, A, T_p]
+                _cd = (_ch[:, 1:] - _ch[:, :-1]).abs().mean(dim=(0, 2, 3))
+                for _i, _v in enumerate(_cd.tolist()):
+                    action_log[f"diff/chain_delta_k{_i}"] = _v
+                action_log["diff/chain_delta_total"] = _cd.sum().item()
+            if "sample_log_prob" in flat.keys():
+                action_log["diff/logprob_std"] = flat["sample_log_prob"].std().item()
+                action_log["diff/logprob_mean"] = flat["sample_log_prob"].mean().item()
             # TanhNormal conditioning. With scale=1 in PRE-tanh space the sampled actions
             # pile up against +-1, where recovering the pre-tanh value (atanh) explodes and
             # log-prob becomes hypersensitive: ClipPPOLoss re-evaluates the STORED action
@@ -863,7 +887,9 @@ class FtrDiffusionTrainer:
                     if "kl_approx" in loss_vals.keys():
                         _epoch_kl += float(loss_vals["kl_approx"].mean().item())
                         _epoch_kl_n += 1
-                    loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"] + loss_vals["loss_entropy"]
+                    loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
+                    if "loss_entropy" in loss_vals.keys():
+                        loss_value = loss_value + loss_vals["loss_entropy"]
                     loss_value.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.actor_value_wrapper.parameters(),
@@ -911,7 +937,9 @@ class FtrDiffusionTrainer:
                 "train/mean_action_sample_log_prob": rollout_log_prob,
                 "train/mean_critic_loss": _diag_sum.get("loss_critic", 0.0) / max(1, _diag_n),
                 "train/mean_objective_loss": _diag_sum.get("loss_objective", 0.0) / max(1, _diag_n),
-                "train/mean_entropy_loss": loss_vals["loss_entropy"].mean().item(),
+                "train/mean_entropy_loss": (
+                    loss_vals["loss_entropy"].mean().item() if "loss_entropy" in loss_vals.keys() else 0.0
+                ),
                 "train/mean_entropy": _diag_sum.get("entropy", 0.0) / max(1, _diag_n),
                 "train/mean_kl_approx": _diag_sum.get("kl_approx", 0.0) / max(1, _diag_n),
                 "train/mean_clip_fraction": _diag_sum.get("clip_fraction", 0.0) / max(1, _diag_n),
