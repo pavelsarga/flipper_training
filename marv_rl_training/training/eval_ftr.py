@@ -3,6 +3,7 @@
 # ============================================================
 import argparse
 import os
+import sys
 from omni.isaac.lab.app import AppLauncher
 
 parser = argparse.ArgumentParser(
@@ -653,4 +654,10 @@ if __name__ == "__main__":
         print_actions=args.print_actions,
     )
 
+    # os._exit skips atexit (needed — Isaac Sim deadlocks there) but ALSO skips flushing
+    # stdout. When stdout is a redirected file it is block-buffered, so without this the
+    # whole results summary is discarded and the run looks like it produced nothing while
+    # still exiting 0.
+    sys.stdout.flush()
+    sys.stderr.flush()
     os._exit(0)

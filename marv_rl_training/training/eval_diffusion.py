@@ -3,6 +3,7 @@
 # ============================================================
 import argparse
 import os
+import sys
 from omni.isaac.lab.app import AppLauncher
 
 parser = argparse.ArgumentParser(
@@ -402,9 +403,13 @@ def run_eval(
         control_gamma=cfg.control_gamma,
     )
 
+    # --max_steps / max_eval_steps are always in CONTROL steps, matching eval_ftr.py, so the
+    # same number means the same amount of simulated time for a chunked and an unchunked run
+    # (scripts/eval.sh passes a hardcoded 2000 to both). The rollout loop counts MACRO steps,
+    # so convert once here.
     if max_steps == 0:
-        # max_episode_length is in CONTROL steps; the rollout loop counts macro steps.
-        max_steps = max(1, (ftr_gym_env.unwrapped.max_episode_length * 2) // cfg.execution_horizon)
+        max_steps = ftr_gym_env.unwrapped.max_episode_length * 2
+    max_steps = max(1, max_steps // cfg.execution_horizon)
     logger.info(
         f"T_p={cfg.prediction_horizon} T_a={cfg.execution_horizon} T_o={cfg.history_len} | "
         f"{max_steps} macro steps ({max_steps * cfg.execution_horizon} control steps)"
@@ -686,4 +691,10 @@ if __name__ == "__main__":
         print_actions=args.print_actions,
     )
 
+    # os._exit skips atexit (needed — Isaac Sim deadlocks there) but ALSO skips flushing
+    # stdout. When stdout is a redirected file it is block-buffered, so without this the
+    # whole results summary is discarded and the run looks like it produced nothing while
+    # still exiting 0.
+    sys.stdout.flush()
+    sys.stderr.flush()
     os._exit(0)
