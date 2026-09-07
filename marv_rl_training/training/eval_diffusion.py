@@ -1,0 +1,689 @@
+# ============================================================
+# BLOCK 1 — AppLauncher MUST be initialised before any omni.* imports
+# ============================================================
+import argparse
+import os
+from omni.isaac.lab.app import AppLauncher
+
+parser = argparse.ArgumentParser(
+    description="Evaluate a trained FTR PPO policy (Isaac Sim backend)."
+)
+parser.add_argument(
+    "--rundir", type=str, required=True,
+    metavar="RUN_DIR",
+    help="Path to the run directory (must contain config.yaml and weights/).",
+)
+parser.add_argument(
+    "--policy", type=str, default="policy_final.pth",
+    help="Policy checkpoint filename inside <run>/weights/. (default: policy_final.pth)",
+)
+parser.add_argument(
+    "--vecnorm", type=str, default="vecnorm_final.pth",
+    help="VecNorm checkpoint filename inside <run>/weights/. (default: vecnorm_final.pth)",
+)
+parser.add_argument(
+    "--num_envs", type=int, default=None,
+    help="Override num_robots from config.",
+)
+parser.add_argument(
+    "--repeats", type=int, default=1,
+    help="Number of independent eval rollouts to run and average. (default: 1)",
+)
+parser.add_argument(
+    "--max_steps", type=int, default=None,
+    help="Override max_eval_steps from config.",
+)
+parser.add_argument(
+    "--plot_heightmap", action="store_true",
+    help="Save heightmap plots to /tmp/ftr_eval_<timestamp>/. Requires num_envs=1.",
+)
+parser.add_argument(
+    "--plot_interval", type=int, default=1,
+    help="Save a heightmap every N steps (default: 1 = every step).",
+)
+parser.add_argument(
+    "--const_linear_vel", type=float, default=None,
+    help="Override action[:,0] (linear velocity) with this constant value in [-1,1]. "
+         "Use for policies trained without forward command control.",
+)
+parser.add_argument(
+    "--invert_rear_flippers", action="store_true",
+    help="Multiply rear flipper actions (action[:,4:]) by -1.",
+)
+parser.add_argument(
+    "--map", type=str, default=None,
+    metavar="TERRAIN",
+    help="Override the terrain from the saved config (e.g. ground, cur_mixed, cur_stairs_up, exp_stair33_up).",
+)
+parser.add_argument(
+    "--output_dir", type=str, default=None,
+    metavar="DIR",
+    help="Directory to save CSV results (eval_summary.csv, eval_per_env.csv, eval_episodes.csv). "
+         "Enables per-robot tracking via a manual step loop. If omitted, prints only (fast path).",
+)
+parser.add_argument(
+    "--num_env_types", type=int, default=None,
+    help="Number of distinct env types cycling across robots. Default: looked up from the "
+         "terrain's registered layout (env_type_registry.py); 16 if the terrain is unregistered.",
+)
+parser.add_argument(
+    "--env_names_yaml", type=str, default=None,
+    metavar="YAML",
+    help="Path to YAML file mapping env-type index → name (list or dict), overriding the "
+         "terrain's registered default names.",
+)
+parser.add_argument(
+    "--eval_id", type=str, default=None,
+    help="Identifier for this eval run (default: auto UTC timestamp).",
+)
+parser.add_argument(
+    "--print_actions", action="store_true",
+    help="Print the policy's action vector each step for env 0. Requires num_envs=1.",
+)
+AppLauncher.add_app_launcher_args(parser)
+args, unknown_args = parser.parse_known_args()
+app_launcher = AppLauncher(args)
+simulation_app = app_launcher.app
+
+
+# ============================================================
+# BLOCK 2 — All other imports (Isaac Sim is now running)
+# ============================================================
+import importlib
+from pathlib import Path
+
+import torch
+from omegaconf import OmegaConf
+from torchrl.envs.utils import ExplorationType, set_exploration_type
+
+import marv_rl_training  # registers OmegaConf resolvers
+from torchrl.envs import CatFrames
+
+from marv_rl_training.environment.chunked_env import ActionChunkEnv
+from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv, OBS_KEY
+from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_type_registry import default_num_depth_cols, default_num_env_types
+from marv_rl_training.training.terrain_assets import write_terrain_manifest
+from marv_rl_training.training.eval_data import (
+    EpisodeRecord,
+    PerSpotRow,
+    SummaryRow,
+    _OBS_SLICES,
+    _compute_obs_stats,
+    aggregate_per_env,
+    aggregate_per_spot,
+    load_env_type_names,
+    make_eval_id,
+    run_tracked_rollout,
+    save_eval_csvs,
+)
+from marv_rl_training.training.train_diffusion import FtrDiffusionConfig
+from marv_rl_training.utils.logutils import get_terminal_logger
+from marv_rl_training.utils.torch_utils import seed_all, set_device
+
+import gymnasium
+
+
+# ============================================================
+# BLOCK 3 — Eval logic
+# ============================================================
+
+logger = get_terminal_logger("eval_ftr")
+
+
+def _remap_native_to_ftr_weights(state_dict: dict) -> dict:
+    """Remap native flipper_training encoder key names to MarvRLFlatObservation naming.
+
+    Native models have two separate observation encoders keyed by class name
+    (LocalStateVector, Heightmap).  FTR uses a single MarvRLFlatObservation with a
+    FtrFlipperStyleEncoder that has matching sub-modules under different names.
+    Actor/critic MLP heads have identical paths and transfer without remapping.
+    """
+    remapped = {}
+    for k, v in state_dict.items():
+        k = k.replace(
+            "encoders.LocalStateVector.mlp.mlp.",
+            "encoders.MarvRLFlatObservation.state_encoder.mlp.",
+        )
+        k = k.replace(
+            "encoders.Heightmap.encoder.",
+            "encoders.MarvRLFlatObservation.cnn.encoder.",
+        )
+        remapped[k] = v
+    return remapped
+
+
+class _ActionOverrideWrapper(torch.nn.Module):
+    """Wraps a TensorDict policy operator to override action components."""
+
+    def __init__(self, actor, const_linear_vel: float | None = None, invert_rear_flippers: bool = False):
+        super().__init__()
+        self.actor = actor
+        self.const_linear_vel = const_linear_vel
+        self.invert_rear_flippers = invert_rear_flippers
+
+    def forward(self, td):
+        td = self.actor(td)
+        if self.const_linear_vel is not None:
+            td["action"][..., 0] = self.const_linear_vel
+        if self.invert_rear_flippers:
+            td["action"][..., 4:] = -td["action"][..., 4:]
+        return td
+
+
+
+
+def _save_heightmap(ftr_gym_env, step: int, out_dir: "Path") -> None:
+    import matplotlib.pyplot as plt
+
+    unwrapped = ftr_gym_env.unwrapped
+    hmap = unwrapped.current_frame_height_maps[0].cpu().numpy()  # (45, 21)
+    pos = unwrapped.positions[0].cpu()
+    lin_vel = unwrapped.robot_lin_velocities[0].cpu().norm().item()
+    ang_vel = unwrapped.robot_ang_velocities[0].cpu().norm().item()
+    dist = (unwrapped.target_positions[0, :2] - unwrapped.positions[0, :2]).cpu().norm().item()
+
+    fig, ax = plt.subplots(figsize=(5, 9))
+    # origin="upper": row 0 at top = front (+x); row N at bottom = rear (−x).
+    im = ax.imshow(hmap, origin="upper", cmap="terrain", aspect="auto")
+    plt.colorbar(im, ax=ax, label="height (m)")
+    # mark robot position (center of map)
+    cy, cx = hmap.shape[0] // 2, hmap.shape[1] // 2
+    ax.plot(cx, cy, "r^", markersize=10, label="robot")
+    ax.set_title(
+        f"step={step:04d}  pos=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})\n"
+        f"lin_vel={lin_vel:.2f}m/s  ang_vel={ang_vel:.2f}rad/s  dist_goal={dist:.2f}m"
+    )
+    ax.set_xlabel("← −y (left)   +y (right) →")
+    ax.set_ylabel("rear (bottom) ↑ front (top)")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"heightmap.png", dpi=80)
+    fig.savefig(out_dir / f"step_{step:04d}.png", dpi=80)
+    plt.close(fig)
+
+def _print_lin_vels(ftr_gym_env, label: str = "Linear velocities") -> None:
+    """Print a per-robot linear velocity table with vx, vy, vz, speed and aggregate stats."""
+    unwrapped = ftr_gym_env.unwrapped
+    vels = unwrapped.robot_lin_velocities.cpu()   # [N, 3]
+    speeds = vels.norm(dim=-1)                    # [N]
+
+    logger.info(f"{label}:")
+    logger.info(f"  {'Robot':>5}  {'vx (m/s)':>9}  {'vy (m/s)':>9}  {'vz (m/s)':>9}  {'speed':>7}")
+    for i in range(vels.shape[0]):
+        logger.info(
+            f"  {i:>5}  {vels[i, 0]:>9.4f}  {vels[i, 1]:>9.4f}  {vels[i, 2]:>9.4f}  {speeds[i]:>7.4f}"
+        )
+    logger.info(
+        f"  Summary — mean={speeds.mean():.4f}  max={speeds.max():.4f}  "
+        f"min={speeds.min():.4f}  std={speeds.std():.4f} m/s"
+    )
+
+
+
+_ACTION_LABELS_6 = ["lin_vel", "ang_vel", "fl_flip", "fr_flip", "rl_flip", "rr_flip"]
+_ACTION_LABELS_8 = ["track_fl", "track_fr", "track_rl", "track_rr", "flip_fl", "flip_fr", "flip_rl", "flip_rr"]
+
+
+def _run_single_rollout_print_actions(
+    env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor, max_steps: int,
+) -> dict[str, float]:
+    """Manual step loop that prints the policy action vector each step for env 0."""
+    td = env.reset()
+    action_dim: int | None = None
+    labels: list[str] | None = None
+    total_reward = 0.0
+    n_steps = 0
+
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
+        for step in range(max_steps):
+            td = actor(td)
+
+            if action_dim is None:
+                action_dim = td["action"].shape[-1]
+                if action_dim == 6:
+                    labels = _ACTION_LABELS_6
+                elif action_dim == 8:
+                    labels = _ACTION_LABELS_8
+                else:
+                    labels = [f"a[{i}]" for i in range(action_dim)]
+                header = "  ".join(f"{l:>9}" for l in labels)
+                logger.info(f"step   {header}")
+                logger.info("-" * (7 + 11 * action_dim))
+
+            a = td["action"][0].cpu()
+            vals = "  ".join(f"{v:>9.4f}" for v in a.tolist())
+            logger.info(f"{step:>5}  {vals}")
+
+            td = env.step(td)
+            total_reward += td["next", "reward"].mean().item()
+            n_steps += 1
+
+            if td["next", "done"].all():
+                break
+            td = td["next"]
+
+    results: dict[str, float] = {
+        "eval/mean_step_reward": total_reward / max(n_steps, 1),
+        "eval/rollout_steps": float(n_steps),
+    }
+    term_info = ftr_torchrl_env.pop_termination_info()
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
+    results.update(ftr_torchrl_env.pop_reward_info())
+    return results
+
+
+def _run_single_rollout_with_heightmap(
+    env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor, max_steps: int,
+    out_dir: "Path", plot_interval: int,
+) -> dict[str, float]:
+    """Manual step loop that saves a heightmap image every plot_interval steps."""
+    import matplotlib.pyplot as plt
+
+    logger.info(f"Saving heightmap plots to {out_dir} every {plot_interval} step(s)")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    td = env.reset()
+    total_reward = 0.0
+    n_steps = 0
+    obs_list: list[torch.Tensor] = []
+
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
+        for step in range(max_steps):
+            if plot_interval > 0 and step % plot_interval == 0:
+                _save_heightmap(ftr_gym_env, step, out_dir)
+
+            obs_list.append(td[OBS_KEY].detach())
+            td = actor(td)
+            td = env.step(td)
+            total_reward += td["next", "reward"].mean().item()
+            n_steps += 1
+
+            if td["next", "done"].all():
+                break
+            td = td["next"]
+
+    # save final frame
+    _save_heightmap(ftr_gym_env, n_steps, out_dir)
+
+    # try to stitch into a GIF
+    try:
+        import imageio.v2 as imageio
+        frames = sorted(out_dir.glob("step_*.png"))
+        gif_path = out_dir / "heightmap.gif"
+        imgs = [imageio.imread(str(f)) for f in frames]
+        imageio.mimsave(str(gif_path), imgs, fps=10)
+        logger.info(f"Saved GIF: {gif_path}")
+    except Exception as e:
+        logger.info(f"Could not create GIF (imageio not available or error: {e}). Individual PNGs are in {out_dir}")
+
+    results: dict[str, float] = {
+        "eval/mean_step_reward": total_reward / max(n_steps, 1),
+        "eval/rollout_steps": float(n_steps),
+    }
+    if obs_list:
+        results.update(_compute_obs_stats(torch.stack(obs_list)))
+    term_info = ftr_torchrl_env.pop_termination_info()
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
+    results.update(ftr_torchrl_env.pop_reward_info())
+    return results
+
+
+def _run_single_rollout(env, ftr_torchrl_env: FtrTorchRLEnv, ftr_gym_env, actor, max_steps: int) -> dict[str, float]:
+    """Run one deterministic rollout and return a flat dict of metrics."""
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
+        rollout = env.rollout(max_steps, actor, auto_reset=True, break_when_all_done=True)
+    results: dict[str, float] = {
+        "eval/mean_step_reward": rollout["next", "reward"].mean().item(),
+        "eval/max_step_reward":  rollout["next", "reward"].max().item(),
+        "eval/min_step_reward":  rollout["next", "reward"].min().item(),
+        "eval/pct_terminated":   rollout["next", "terminated"].float().mean().item(),
+        "eval/pct_truncated":    rollout["next", "truncated"].float().mean().item(),
+        "eval/rollout_steps":    float(rollout.shape[1]),
+    }
+    results.update(_compute_obs_stats(rollout[OBS_KEY]))
+    del rollout
+
+    # Termination stats (success / failure rates per episode)
+    term_info = ftr_torchrl_env.pop_termination_info()
+    results.update({("eval/explosion_rate" if k == "explosions/rate" else "eval/" + k.split("/", 1)[-1]): v for k, v in term_info.items()})
+
+    # Per-component reward means
+    results.update(ftr_torchrl_env.pop_reward_info())
+
+    return results
+
+
+def _print_results(results: dict[str, float], header: str) -> None:
+    print(f"\n{'=' * 60}")
+    print(header)
+    print('=' * 60)
+    # Group by prefix for readability
+    groups: dict[str, list[tuple[str, float]]] = {}
+    for k, v in sorted(results.items()):
+        prefix = k.split("/")[0]
+        groups.setdefault(prefix, []).append((k, v))
+    for prefix, items in groups.items():
+        for k, v in items:
+            print(f"  {k:<45} {v:.6f}")
+
+
+def run_eval(
+    raw_cfg: OmegaConf,
+    ftr_gym_env: gymnasium.Env,
+    max_steps: int,
+    repeats: int,
+    plot_heightmap: bool = False,
+    plot_interval: int = 1,
+    const_linear_vel: float | None = None,
+    invert_rear_flippers: bool = False,
+    output_dir: "Path | None" = None,
+    num_env_types: "int | None" = None,
+    env_names_yaml: "str | None" = None,
+    eval_id: "str | None" = None,
+    policy_label: "str | None" = None,
+    print_actions: bool = False,
+) -> None:
+    cfg = FtrDiffusionConfig(**raw_cfg)
+    device = set_device(cfg.device)
+    seed_all(cfg.seed)
+    logger.info(f"Seed: {cfg.seed}  (random ✓  numpy ✓  torch ✓  cuda ✓)")
+
+    # Build TorchRL env + transforms + policy (mirrors FtrPPOTrainer.__init__)
+    # Same wrapping as FtrDiffusionTrainer: one step here is T_a control steps, and the
+    # policy reads the CatFrames observation window rather than the raw observation.
+    # Evaluating a chunked policy through the un-chunked env would fail on the action spec
+    # (T_p x A, not A) and on the missing obs_history key.
+    inner_env = FtrTorchRLEnv(ftr_gym_env, encoder_opts=cfg.ftr_obs_encoder_opts, device=device)
+    ftr_torchrl_env = ActionChunkEnv(
+        inner_env,
+        prediction_horizon=cfg.prediction_horizon,
+        execution_horizon=cfg.execution_horizon,
+        control_gamma=cfg.control_gamma,
+    )
+
+    if max_steps == 0:
+        # max_episode_length is in CONTROL steps; the rollout loop counts macro steps.
+        max_steps = max(1, (ftr_gym_env.unwrapped.max_episode_length * 2) // cfg.execution_horizon)
+    logger.info(
+        f"T_p={cfg.prediction_horizon} T_a={cfg.execution_horizon} T_o={cfg.history_len} | "
+        f"{max_steps} macro steps ({max_steps * cfg.execution_horizon} control steps)"
+    )
+
+    policy_cfg = cfg.policy_config(**cfg.policy_opts)
+    flipper_style = (cfg.ftr_obs_encoder_opts or {}).get("flipper_style", False)
+    actor_value_wrapper, _, policy_transforms = policy_cfg.create(
+        env=ftr_torchrl_env,
+        weights_path=cfg.policy_weights_path,
+        device=device,
+        key_remapper=_remap_native_to_ftr_weights if flipper_style else None,
+    )
+    actor = actor_value_wrapper.get_policy_operator()
+
+    if const_linear_vel is not None or invert_rear_flippers:
+        # These index actions as [v, w, flippers...]. A chunked action is a flattened
+        # T_p x A trajectory, so the same indices hit step 0's v/w and then arbitrary later
+        # steps — silently producing a different policy rather than the intended override.
+        raise NotImplementedError(
+            "--const_linear_vel / --invert_rear_flippers are not supported for a chunked "
+            "policy: they assume a 6-D action, but this one is a flattened "
+            f"{cfg.prediction_horizon} x action_dim chunk."
+        )
+
+    env, vecnorm = make_transformed_env(
+        ftr_torchrl_env, cfg, policy_transforms,
+        post_vecnorm_transforms=[CatFrames(
+            N=cfg.history_len, dim=-1, in_keys=[OBS_KEY], out_keys=["obs_history"], padding="same")],
+    )
+
+    # Prime VecNorm's internal tensordict before loading weights or calling env.eval().
+    # Without this, _td is empty when env.eval() locks it, and the first rollout reset
+    # crashes trying to initialise _td against a locked tensordict.
+    env.reset()
+
+    if cfg.vecnorm_weights_path:
+        try:
+            vecnorm.load_state_dict(
+                torch.load(cfg.vecnorm_weights_path, map_location=device), strict=False
+            )
+            logger.info("Loaded vecnorm weights.")
+        except (KeyError, RuntimeError) as e:
+            logger.warning(f"Skipping vecnorm weights (incompatible keys — native→FTR transfer?): {e}")
+
+    actor.eval()
+    env.eval()
+
+    if plot_heightmap and ftr_gym_env.unwrapped.num_envs != 1:
+        raise ValueError("--plot_heightmap requires num_envs=1 (pass --num_envs 1)")
+    if print_actions and ftr_gym_env.unwrapped.num_envs != 1:
+        raise ValueError("--print_actions requires num_envs=1 (pass --num_envs 1)")
+
+    # Resolve CSV-output settings
+    _output_dir = Path(output_dir) if output_dir else None
+    _eval_id    = eval_id or make_eval_id()
+    _terrain    = cfg.terrain
+    num_env_types = num_env_types if num_env_types is not None else default_num_env_types(_terrain)
+    _env_names  = load_env_type_names(_terrain, env_names_yaml, num_env_types)
+    _depth_cols = default_num_depth_cols(_terrain)
+    _policy_lbl = policy_label or (cfg.policy_weights_path or "unknown")
+
+    if _output_dir:
+        ftr_torchrl_env.enable_per_env_tracking()
+        logger.info(f"Per-env tracking enabled → CSV output: {_output_dir}  eval_id={_eval_id}")
+        # Record the terrain (and copy its gen_config / preview plot) before the
+        # first rollout, so the results are self-describing even if eval crashes.
+        write_terrain_manifest(
+            _output_dir, _eval_id, _terrain, _env_names, _depth_cols, policy=_policy_lbl,
+        )
+        logger.info(f"Terrain '{_terrain}': {num_env_types} env types x {_depth_cols} depth cols "
+                    f"→ assets copied to {_output_dir}/terrain")
+
+    all_results: list[dict[str, float]] = []
+    all_episodes: list[EpisodeRecord]   = []
+    all_per_env_rows: list = []
+    all_per_spot_rows: list = []
+
+    for r in range(repeats):
+        logger.info(f"Running eval rollout {r + 1}/{repeats} (max_steps={max_steps}) ...")
+        if print_actions:
+            results = _run_single_rollout_print_actions(env, ftr_torchrl_env, ftr_gym_env, actor, max_steps)
+            episode_records: list[EpisodeRecord] = []
+        elif plot_heightmap:
+            from datetime import datetime
+            out_dir = Path(f"/tmp/ftr_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}_r{r+1}")
+            results = _run_single_rollout_with_heightmap(
+                env, ftr_torchrl_env, ftr_gym_env, actor, max_steps,
+                out_dir=out_dir, plot_interval=plot_interval,
+            )
+            episode_records: list[EpisodeRecord] = []
+        elif _output_dir:
+            results, episode_records = run_tracked_rollout(
+                env, ftr_torchrl_env, ftr_gym_env, actor, max_steps,
+                repeat=r + 1,
+                eval_id=_eval_id,
+                policy_label=_policy_lbl,
+                terrain=_terrain,
+                num_env_types=num_env_types,
+                env_type_names=_env_names,
+            )
+        else:
+            results = _run_single_rollout(env, ftr_torchrl_env, ftr_gym_env, actor, max_steps)
+            episode_records = []
+
+        _print_results(results, f"Repeat {r + 1}/{repeats}")
+        all_results.append(results)
+        all_episodes.extend(episode_records)
+
+        if _output_dir and episode_records:
+            from datetime import datetime, timezone
+            timestamp = datetime.now(timezone.utc).isoformat()
+            summary = SummaryRow(
+                eval_id=_eval_id,
+                policy=_policy_lbl,
+                terrain=_terrain,
+                num_envs=ftr_gym_env.unwrapped.num_envs,
+                num_env_types=num_env_types,
+                repeat=r + 1,
+                timestamp=timestamp,
+                success_rate=results.get("eval/success_rate", float("nan")),
+                failure_rate=results.get("eval/failure_rate", float("nan")),
+                explosion_rate=results.get("eval/explosion_rate", float("nan")),
+                mean_step_reward=results.get("eval/mean_step_reward", float("nan")),
+                shock_mean=results.get("shock/accel_magnitude", float("nan")),
+                shock_p90=results.get("shock/accel_p90", float("nan")),
+                shock_p95=results.get("shock/accel_p95", float("nan")),
+                shock_p99=results.get("shock/accel_p99", float("nan")),
+            )
+            per_env_rows = aggregate_per_env(
+                episode_records=episode_records,
+                env_type_names=_env_names,
+                eval_id=_eval_id,
+                policy=_policy_lbl,
+                terrain=_terrain,
+                repeat=r + 1,
+                obs_stats=results,
+            )
+            per_spot_rows = aggregate_per_spot(
+                episode_records=episode_records,
+                env_type_names=_env_names,
+                num_depth_cols=_depth_cols,
+                eval_id=_eval_id,
+                policy=_policy_lbl,
+                terrain=_terrain,
+                repeat=r + 1,
+            )
+            all_per_env_rows.extend(per_env_rows)
+            all_per_spot_rows.extend(per_spot_rows)
+            save_eval_csvs(_output_dir, [summary], per_env_rows, per_spot_rows, episode_records)
+            logger.info(f"Saved repeat {r+1} CSV → {_output_dir}")
+
+    if repeats > 1:
+        averaged = {k: sum(d[k] for d in all_results) / repeats for k in all_results[0]}
+        _print_results(averaged, f"AVERAGE over {repeats} repeats")
+
+    if _output_dir:
+        logger.info(f"Eval complete. Results saved to {_output_dir}  (eval_id={_eval_id})")
+
+
+# ============================================================
+# BLOCK 4 — Entry point
+# ============================================================
+
+if __name__ == "__main__":
+    import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
+
+    run_dir = Path(args.rundir)
+    saved_cfg_path = run_dir / "config.yaml"
+    if not saved_cfg_path.exists():
+        # RunLogger writes config.yaml, but a run directory copied out of logs/ (or an
+        # experiments/ snapshot) may carry only the original config under its own name.
+        alts = sorted(run_dir.glob("*diffusion*.yaml")) + sorted(run_dir.glob("marv_config*.yaml"))
+        if not alts:
+            raise FileNotFoundError(
+                f"No config.yaml (or marv_config*.yaml) found in {run_dir}"
+            )
+        saved_cfg_path = alts[0]
+        logger.warning(f"No config.yaml; falling back to {saved_cfg_path.name}")
+
+    raw_cfg = OmegaConf.load(saved_cfg_path)
+    if unknown_args:
+        raw_cfg = OmegaConf.merge(raw_cfg, OmegaConf.from_dotlist(unknown_args))
+
+    # Point weights paths at the requested checkpoints
+    weights_dir = run_dir / "weights"
+    raw_cfg.policy_weights_path = str(weights_dir / args.policy)
+    raw_cfg.vecnorm_weights_path = str(weights_dir / args.vecnorm)
+
+    # Disable logging backends — this is eval only
+    raw_cfg.use_wandb = False
+    raw_cfg.use_tensorboard = False
+
+    if args.num_envs is not None:
+        raw_cfg.num_robots = args.num_envs
+
+    if args.map is not None:
+        raw_cfg.terrain = args.map
+        logger.info(f"Terrain overridden: {args.map}")
+
+    max_steps = args.max_steps if args.max_steps is not None else raw_cfg.get("max_eval_steps", 0)
+
+    # Build FtrDiffusionConfig just to read task/terrain/env fields for gymnasium.make
+    _cfg = FtrDiffusionConfig(**raw_cfg)
+
+    spec = gymnasium.spec(_cfg.task)
+    _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
+    if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
+        _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
+        _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
+    elif isinstance(_env_cfg_entry, type):
+        _EnvCfgClass = _env_cfg_entry
+    else:
+        from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
+        _EnvCfgClass = CrossingEnvCfg
+
+    env_cfg = _EnvCfgClass()
+    env_cfg.scene.num_envs = _cfg.num_robots
+    env_cfg.terrain_name = _cfg.terrain
+
+    # --- Simulation timestep ---
+    env_cfg.sim.dt = _cfg.sim_dt
+
+    # --- Rigid body properties ---
+    env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
+    env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
+    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
+    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
+    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
+
+    # --- Per-articulation solver iterations ---
+    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
+    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
+
+    # --- Scene-wide PhysX solver (matched to per-articulation values) ---
+    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
+    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
+    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
+    env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
+    env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
+    env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
+
+    # Scale down GPU PhysX buffers for small env counts (e.g. local eval on laptop GPUs).
+    # The defaults in FTR_SIM_CFG are sized for 4096 envs on server GPUs.
+    if _cfg.num_robots <= 64:
+        env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
+        env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
+        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
+        env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
+        env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
+    elif _cfg.num_robots > 512:
+        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
+    for k, v in (_cfg.env_cfg_overrides or {}).items():
+        setattr(env_cfg, k, v)
+
+    if _cfg.log_raw_accel:
+        env_cfg.log_raw_accel = True
+        env_cfg.log_raw_accel_interval = _cfg.log_raw_accel_interval
+
+    ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
+
+    if _cfg.log_raw_accel:
+        accel_path = run_dir / "raw_accel_eval.npz"
+        accel_path.unlink(missing_ok=True)  # remove stale/corrupted file from a previous run
+        ftr_gym_env.unwrapped.cfg.log_raw_accel_path = str(accel_path)
+
+    run_eval(
+        raw_cfg, ftr_gym_env,
+        max_steps=max_steps,
+        repeats=args.repeats,
+        plot_heightmap=args.plot_heightmap,
+        plot_interval=args.plot_interval,
+        const_linear_vel=args.const_linear_vel,
+        invert_rear_flippers=args.invert_rear_flippers,
+        output_dir=args.output_dir,
+        num_env_types=args.num_env_types,
+        env_names_yaml=args.env_names_yaml,
+        eval_id=args.eval_id,
+        print_actions=args.print_actions,
+    )
+
+    os._exit(0)
