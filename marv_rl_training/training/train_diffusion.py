@@ -634,6 +634,27 @@ class FtrDiffusionTrainer:
                     "Optimizer momentum will be reset; training may be noisy for first few iterations."
                 )
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            # ⚠ Re-apply the CONFIGURED learning rates after restoring.
+            #
+            # optim.load_state_dict() restores param_groups including "lr", and an
+            # LRScheduler's state_dict restores "base_lrs" — so a resume silently reverts any
+            # learning-rate change made in the config, and the run continues at the old rate
+            # while the config says otherwise. That turns "resume with a different LR", the
+            # main reason to resume at all, into a no-op with no error and no warning.
+            _cfg_lr = {gp.get("name"): gp.get("lr") for gp in self.optim_groups if gp.get("lr") is not None}
+            for _pg in self.optim.param_groups:
+                _want = _cfg_lr.get(_pg.get("name"))
+                if _want is not None and _pg.get("lr") != _want:
+                    self.term_logger.info(
+                        f"Resume: config lr for {_pg.get('name')} is {_want:.3g}, checkpoint had "
+                        f"{_pg.get('lr'):.3g} — using the config value."
+                    )
+                    _pg["lr"] = _want
+                    _pg["initial_lr"] = _want
+            if hasattr(self.scheduler, "base_lrs"):
+                self.scheduler.base_lrs = [
+                    _cfg_lr.get(_pg.get("name"), _pg["lr"]) for _pg in self.optim.param_groups
+                ]
             if "step_penalty_scheduler_state_dict" in checkpoint and self.step_penalty_scheduler is not None:
                 self.step_penalty_scheduler.load_state_dict(checkpoint["step_penalty_scheduler_state_dict"])
             if "action_bonus_scheduler_state_dict" in checkpoint and self.action_bonus_scheduler is not None:
