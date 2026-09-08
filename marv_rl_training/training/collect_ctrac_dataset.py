@@ -51,6 +51,7 @@ from tqdm import tqdm
 import gymnasium
 
 import marv_rl_training  # noqa: F401 — registers OmegaConf resolvers
+from marv_rl_training.training.env_setup import import_ftr_tasks, require_cuda
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.policies.mlp_policy import MLPPolicyConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
@@ -180,10 +181,8 @@ if __name__ == "__main__":
         raw_cfg.shard_size_steps = args.shard_size_steps
 
     import os
-    if not torch.cuda.is_available():
-        print("FATAL: torch.cuda.is_available() returned False after AppLauncher init.", flush=True)
-        os._exit(1)
-    import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
+    require_cuda()
+    import_ftr_tasks()
 
     cfg = CTRACDatasetCollectionConfig(**raw_cfg)
     device = set_device(cfg.device)

@@ -25,18 +25,17 @@ simulation_app = app_launcher.app  # noqa: F841
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
 import datetime
-import importlib
 import sqlite3
 import traceback
 from pathlib import Path
 
 import optuna
-import torch
 from omegaconf import OmegaConf
 from optuna.storages import RDBStorage
 
 import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training import ROOT
+from marv_rl_training.training.env_setup import import_ftr_tasks, require_cuda, resolve_env_cfg_class
 from marv_rl_training.training.train_ftr import FtrPPOConfig, FtrPPOTrainer
 from marv_rl_training.utils.logutils import get_terminal_logger
 
@@ -212,16 +211,7 @@ def recover_trial(trial_num: int, optuna_cfg_path: str, ws_root: Path) -> bool:
     task = trial_cfg.task
 
     # ---- recreate gymnasium env (mirrors objective() in optuna_train_ftr.py) ----
-    spec = gymnasium.spec(task)
-    _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-    if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-        _mod, _cls = _env_cfg_entry.rsplit(":", 1)
-        EnvCfgClass = getattr(importlib.import_module(_mod), _cls)
-    elif isinstance(_env_cfg_entry, type):
-        EnvCfgClass = _env_cfg_entry
-    else:
-        from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-        EnvCfgClass = CrossingEnvCfg
+    EnvCfgClass = resolve_env_cfg_class(task)
 
     env_cfg = EnvCfgClass()
     env_cfg.scene.num_envs = trial_cfg.num_robots
@@ -350,19 +340,8 @@ def recover_trial(trial_num: int, optuna_cfg_path: str, ws_root: Path) -> bool:
 if __name__ == "__main__":
     import os
 
-    if not torch.cuda.is_available():
-        print(
-            "FATAL: torch.cuda.is_available() returned False.\n"
-            "Isaac Sim failed to create a CUDA context — check .err for 'CUDA error 46'.",
-            flush=True,
-        )
-        os._exit(1)
-
-    try:
-        import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
-    except Exception as _e:
-        print(f"FATAL: failed to import ftr_envs.tasks: {_e}", flush=True)
-        os._exit(1)
+    require_cuda()
+    import_ftr_tasks()
 
     # Inside the Apptainer container the workspace is mounted at /ws
     ws_root = Path("/ws") if Path("/ws").exists() else Path(ROOT).parent.parent.parent

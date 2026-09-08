@@ -18,7 +18,6 @@ simulation_app = app_launcher.app
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
 import copy
-import importlib
 import os
 import traceback
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ from optuna.study import MaxTrialsCallback
 
 import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training import ROOT
+from marv_rl_training.training.env_setup import import_ftr_tasks, require_cuda, resolve_env_cfg_class
 from marv_rl_training.training.train_ftr import FtrPPOConfig, FtrPPOTrainer
 from marv_rl_training.utils.logutils import get_terminal_logger
 
@@ -319,28 +319,8 @@ def perform_study(
 # ============================================================
 
 if __name__ == "__main__":
-    import os
-    import torch
-
-    # Verify CUDA is accessible before importing FTR tasks.
-    # Importing ftr_envs.tasks triggers wp.init() (via omni.isaac.lab.envs chain),
-    # which crashes with an unhelpful RuntimeError if the CUDA context is dead.
-    # Use os._exit() — not sys.exit/raise — so Isaac Sim's atexit handlers are bypassed
-    # and the apptainer process terminates immediately instead of hanging for minutes.
-    if not torch.cuda.is_available():
-        print(
-            "FATAL: torch.cuda.is_available() returned False after AppLauncher init.\n"
-            "Isaac Sim failed to create a CUDA context (check .err for 'CUDA error 46').\n"
-            "This is usually a node-level GPU issue — try a different compute node.",
-            flush=True,
-        )
-        os._exit(1)
-
-    try:
-        import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
-    except Exception as _e:
-        print(f"FATAL: failed to import ftr_envs.tasks: {_e}", flush=True)
-        os._exit(1)
+    require_cuda()
+    import_ftr_tasks()
 
     try:
         # ---- load configs ----
@@ -374,16 +354,7 @@ if __name__ == "__main__":
 
         # ---- resolve env cfg class from task registry ----
         _cfg = FtrPPOConfig(**train_config)
-        spec = gymnasium.spec(_cfg.task)
-        _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-        if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-            _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
-            _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
-        elif isinstance(_env_cfg_entry, type):
-            _EnvCfgClass = _env_cfg_entry
-        else:
-            from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-            _EnvCfgClass = CrossingEnvCfg
+        _EnvCfgClass = resolve_env_cfg_class(_cfg.task)
 
         # ---- build base env_cfg ----
         # Only set structural params (num_envs, terrain, GPU buffers) here.

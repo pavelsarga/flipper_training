@@ -17,12 +17,9 @@ simulation_app = app_launcher.app
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
-import copy
-import importlib
 import os
 import traceback
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import optuna
 from omegaconf import OmegaConf
@@ -30,6 +27,7 @@ from optuna.storages import RDBStorage
 from optuna.study import MaxTrialsCallback
 
 import marv_rl_training  # registers OmegaConf resolvers
+from marv_rl_training.training.env_setup import import_ftr_tasks, require_cuda, resolve_env_cfg_class
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.train_ftr import FtrPPOConfig
@@ -303,25 +301,10 @@ def perform_study(
 # ============================================================
 
 if __name__ == "__main__":
-    import torch
-
-    if not torch.cuda.is_available():
-        print(
-            "FATAL: torch.cuda.is_available() returned False after AppLauncher init.\n"
-            "Isaac Sim failed to create a CUDA context — try a different compute node.",
-            flush=True,
-        )
-        os._exit(1)
+    require_cuda()
+    import_ftr_tasks()
 
     try:
-        import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
-    except Exception as _e:
-        print(f"FATAL: failed to import ftr_envs.tasks: {_e}", flush=True)
-        os._exit(1)
-
-    try:
-        from pathlib import Path
-
         # ---- load configs ----
         optuna_cfg_raw = OmegaConf.load(args.optuna_config)
         if unknown_args:
@@ -346,16 +329,7 @@ if __name__ == "__main__":
 
         # ---- build env (created once; reused across trials) ----
         _cfg = FtrPPOConfig(**raw_cfg)
-        spec = gymnasium.spec(_cfg.task)
-        _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-        if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-            _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
-            _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
-        elif isinstance(_env_cfg_entry, type):
-            _EnvCfgClass = _env_cfg_entry
-        else:
-            from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-            _EnvCfgClass = CrossingEnvCfg
+        _EnvCfgClass = resolve_env_cfg_class(_cfg.task)
 
         env_cfg = _EnvCfgClass()
         env_cfg.scene.num_envs = _cfg.num_robots
