@@ -13,7 +13,6 @@ if __name__ == "__main__":
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
 import copy
-import sys
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +23,6 @@ if TYPE_CHECKING:
 
 import torch
 import torch.nn.functional as F
-from omegaconf import OmegaConf
 from tensordict.nn import TensorDictModule
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import LazyTensorStorage, RandomSampler, TensorDictReplayBuffer
@@ -37,6 +35,8 @@ import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks, require_cuda
+from marv_rl_training.training.entrypoint import resolve_train_config, run_trainer
+from marv_rl_training.training.eval_common import exit_flushed
 from marv_rl_training.training.env_type_registry import default_num_env_types
 from marv_rl_training.training.eval_data import (
     aggregate_per_env,
@@ -161,17 +161,35 @@ class FtrD3QNTrainer:
     + epsilon-greedy TD loop, since D3QN is off-policy value-based rather than actor-critic.
     No step_penalty/action_bonus schedulers here: neither is read by
     ATD3QNModule.get_reward_components() at all.
+
+    ICM-D3QN (train_icmd3qn.py) subclasses this. Everything it adds — the curiosity module,
+    its optimizer, and the intrinsic reward folded into the TD target — hangs off four
+    extension points, so the two trainers cannot drift apart the way two copies did:
+
+      CONFIG_CLASS / POLICY_CLASS / RUN_CATEGORY / TERM_LOGGER_NAME
+                                 what to parse, build and log as
+      _build_aux_modules()       extra nn.Modules to construct, checkpoint and resume; each
+                                 is saved as <name>_{crash,step_N,final}.pth beside the
+                                 policy, and reloaded from whichever checkpoint the resume
+                                 picked
+      _build_aux_optimizers()    extra optimizers, stored in training_state.pth
+      _augment_reward()          the chance to modify the reward before the TD target
     """
+
+    CONFIG_CLASS = FtrD3QNConfig
+    POLICY_CLASS = ATD3QNPolicy
+    RUN_CATEGORY = "d3qn"
+    TERM_LOGGER_NAME = "ftr_d3qn_train"
 
     def __init__(self, raw_config: "DictConfig", ftr_gym_env: gymnasium.Env, optuna_trial=None):
         self.optuna_trial = optuna_trial
-        self.config = FtrD3QNConfig(**raw_config)
+        self.config = self.CONFIG_CLASS(**raw_config)
         self.device = set_device(self.config.device)
         self.rng = seed_all(self.config.seed)
 
         self.run_logger = RunLogger(
             train_config=raw_config,
-            category="d3qn",
+            category=self.RUN_CATEGORY,
             use_wandb=self.config.use_wandb,
             use_tensorboard=self.config.use_tensorboard,
             step_metric_name="collected_frames",
@@ -181,7 +199,7 @@ class FtrD3QNTrainer:
         self._eval_per_spot_csv = self.run_logger.logpath / "eval_per_spot.csv"
         if self.optuna_trial is not None:
             self.optuna_trial.set_user_attr("logpath", str(self.run_logger.logpath))
-        self.term_logger = get_terminal_logger("ftr_d3qn_train")
+        self.term_logger = get_terminal_logger(self.TERM_LOGGER_NAME)
         self.term_logger.info(f"Seed: {self.config.seed}  (random check numpy check torch check cuda check)")
 
         # ---- environment ----
@@ -194,7 +212,7 @@ class FtrD3QNTrainer:
         self.env = self.ftr_torchrl_env
 
         # ---- policy (Q-network + epsilon-greedy action decode) ----
-        self.policy = ATD3QNPolicy(epsilon=self.config.epsilon_start, **self.config.policy_opts).to(self.device)
+        self.policy = self.POLICY_CLASS(epsilon=self.config.epsilon_start, **self.config.policy_opts).to(self.device)
         if self.config.policy_weights_path is not None:
             self.policy.q_network.load_state_dict(
                 torch.load(self.config.policy_weights_path, map_location=self.device), strict=False
@@ -207,6 +225,9 @@ class FtrD3QNTrainer:
         self.target_q_network.eval()
         for p in self.target_q_network.parameters():
             p.requires_grad_(False)
+
+        # ---- subclass-supplied modules (ICM-D3QN's curiosity module) ----
+        self.aux_modules: dict[str, torch.nn.Module] = self._build_aux_modules()
 
         # ---- transforms + VecNorm ----
         self.env, self.vecnorm = make_transformed_env(self.ftr_torchrl_env, self.config, policy_transforms=[])
@@ -240,6 +261,7 @@ class FtrD3QNTrainer:
 
         # ---- optimizer + scheduler ----
         self.optim = self.config.optimizer(self.policy.q_network.parameters(), **(self.config.optimizer_opts or {}))
+        self.aux_optimizers: dict[str, Any] = self._build_aux_optimizers()
         self.scheduler = self.config.scheduler(self.optim, **(self.config.scheduler_opts or {}))
 
         _total_iters = self.config.total_frames // iteration_size
@@ -265,7 +287,29 @@ class FtrD3QNTrainer:
             )
 
         self._grad_steps = 0
-        self.term_logger.info("Initialized FtrD3QNTrainer.")
+        self.term_logger.info(f"Initialized {type(self).__name__}.")
+
+    # ------------------------------------------------------------------
+    # Extension points — no-ops for AT-D3QN, implemented by FtrICMD3QNTrainer.
+    # ------------------------------------------------------------------
+    def _build_aux_modules(self) -> dict[str, torch.nn.Module]:
+        """Extra networks to build, checkpoint and resume alongside the Q-network."""
+        return {}
+
+    def _build_aux_optimizers(self) -> dict[str, Any]:
+        """Extra optimizers, stored in and restored from training_state.pth."""
+        return {}
+
+    def _augment_reward(self, obs, action_idx, next_obs, reward):
+        """Hook to modify the reward before the TD target. Returns (reward, extra log fields)."""
+        return reward, {}
+
+    def _save_checkpoint_weights(self, suffix: str) -> None:
+        """Write policy_<suffix>.pth, vecnorm_<suffix>.pth and one file per aux module."""
+        self.run_logger.save_weights(self.policy.q_network.state_dict(), f"policy_{suffix}")
+        self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_{suffix}")
+        for name, module in self.aux_modules.items():
+            self.run_logger.save_weights(module.state_dict(), f"{name}_{suffix}")
 
     # ------------------------------------------------------------------
     # Crash recovery — mirrors FtrPPOTrainer, but only the Q-network needs
@@ -278,11 +322,14 @@ class FtrD3QNTrainer:
         vecnorm_to_load = None
         checkpoint_source = None
 
+        aux_to_load: dict[str, Path] = {}
+
         for weights_dir in candidate_dirs:
             policy_crash = weights_dir / "policy_crash.pth"
             vecnorm_crash = weights_dir / "vecnorm_crash.pth"
             if policy_crash.exists() and vecnorm_crash.exists():
                 policy_to_load, vecnorm_to_load = policy_crash, vecnorm_crash
+                aux_to_load = {n: weights_dir / f"{n}_crash.pth" for n in self.aux_modules}
                 checkpoint_source = f"crash ({weights_dir.parent.name})"
                 break
 
@@ -290,6 +337,10 @@ class FtrD3QNTrainer:
             step_vecnorms = sorted(weights_dir.glob("vecnorm_step_*.pth"), key=lambda p: int(p.stem.split("_")[-1]))
             if step_policies and step_vecnorms:
                 policy_to_load, vecnorm_to_load = step_policies[-1], step_vecnorms[-1]
+                for name in self.aux_modules:
+                    steps = sorted(weights_dir.glob(f"{name}_step_*.pth"), key=lambda p: int(p.stem.split("_")[-1]))
+                    if steps:
+                        aux_to_load[name] = steps[-1]
                 checkpoint_source = f"step ({weights_dir.parent.name})"
                 break
 
@@ -306,6 +357,14 @@ class FtrD3QNTrainer:
                 self.term_logger.info(f"Loaded vecnorm from {checkpoint_source} checkpoint")
             except Exception as e:
                 self.term_logger.error(f"Failed to load vecnorm: {e}")
+            for name, path in aux_to_load.items():
+                if not path.exists():
+                    continue
+                try:
+                    self.aux_modules[name].load_state_dict(torch.load(path, map_location=self.device), strict=False)
+                    self.term_logger.info(f"Loaded {name} from {checkpoint_source} checkpoint")
+                except Exception as e:
+                    self.term_logger.error(f"Failed to load {name}: {e}")
 
             self.crash_checkpoint = True
             self.term_logger.warning(f"Resuming from {checkpoint_source} checkpoint — training may have inconsistent metrics.")
@@ -337,6 +396,8 @@ class FtrD3QNTrainer:
             "epsilon_scheduler_state_dict": self.epsilon_scheduler.state_dict(),
             "grad_steps": self._grad_steps,
         }
+        for name, optim in self.aux_optimizers.items():
+            checkpoint[f"{name}_optimizer_state_dict"] = optim.state_dict()
         self.run_logger.save_weights(checkpoint, "training_state")
 
     def _load_training_checkpoint(self):
@@ -355,6 +416,14 @@ class FtrD3QNTrainer:
                     self.optim.load_state_dict(checkpoint["optimizer_state_dict"])
                 except (KeyError, RuntimeError) as e:
                     self.term_logger.warning(f"Failed to load optimizer state: {e}. Optimizer will restart fresh.")
+            for name, optim in self.aux_optimizers.items():
+                state = checkpoint.get(f"{name}_optimizer_state_dict")
+                if not state:
+                    continue
+                try:
+                    optim.load_state_dict(state)
+                except (KeyError, RuntimeError) as e:
+                    self.term_logger.warning(f"Failed to load {name} optimizer state: {e}. It will restart fresh.")
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             if "epsilon_scheduler_state_dict" in checkpoint:
                 self.epsilon_scheduler.load_state_dict(checkpoint["epsilon_scheduler_state_dict"])
@@ -384,8 +453,7 @@ class FtrD3QNTrainer:
                 import os as _os
                 _os._exit(75)
             try:
-                self.run_logger.save_weights(self.policy.q_network.state_dict(), "policy_crash")
-                self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_crash")
+                self._save_checkpoint_weights("crash")
                 _crash_iter = getattr(self, "_current_iteration", 0)
                 _crash_frames = getattr(self, "_current_total_frames", 0)
                 self._save_training_checkpoint(_crash_iter, _crash_frames)
@@ -405,6 +473,7 @@ class FtrD3QNTrainer:
         action_idx = batch["action_idx"].long()
         reward = batch[("next", "reward")].reshape(-1)
         terminated = batch[("next", "terminated")].reshape(-1).float()
+        reward, aux_log = self._augment_reward(obs, action_idx, next_obs, reward)
 
         q_values = self.policy.q_network(obs)  # (B, 9)
         q_sa = q_values.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
@@ -439,6 +508,7 @@ class FtrD3QNTrainer:
             "grad_norm": grad_norm.item() if grad_norm.isfinite() else float("nan"),
             "q_mean": q_values.mean().item(),
             "target_q_mean": target.mean().item(),
+            **aux_log,
         }
 
     def _train(self):
@@ -546,8 +616,7 @@ class FtrD3QNTrainer:
 
             save_every = self.config.save_weights_every or self.config.eval_and_save_every
             if effective_i % save_every == 0:
-                self.run_logger.save_weights(self.policy.q_network.state_dict(), f"policy_step_{total_collected_frames}")
-                self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
+                self._save_checkpoint_weights(f"step_{total_collected_frames}")
                 self._save_training_checkpoint(effective_i, total_collected_frames)
                 if self.config.replay_buffer_save_fraction > 0:
                     save_replay_subset(
@@ -586,10 +655,36 @@ class FtrD3QNTrainer:
 
             self.run_logger.log_data(log, total_collected_frames)
 
-        self.run_logger.save_weights(self.policy.q_network.state_dict(), "policy_final")
-        self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_final")
-        self.run_logger.save_weights(self.policy.q_network.state_dict(), f"policy_step_{self.config.total_frames}")
-        self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{self.config.total_frames}")
+        self._save_checkpoint_weights("final")
+        self._save_checkpoint_weights(f"step_{self.config.total_frames}")
+
+    @classmethod
+    def play(cls, cfg, ftr_gym_env, simulation_app) -> None:
+        """Visualise a trained checkpoint: greedy Q-network, deterministic, until the window closes."""
+        env = FtrTorchRLEnv(
+            ftr_gym_env,
+            encoder_opts=cfg.ftr_obs_encoder_opts,
+            device=cfg.device,
+            shock_scale=cfg.env_cfg_overrides.get("shock_scale"),
+        )
+        policy = cls.POLICY_CLASS(epsilon=0.0, **cfg.policy_opts).to(cfg.device)
+        policy.q_network.load_state_dict(
+            torch.load(cfg.policy_weights_path, map_location=cfg.device), strict=False
+        )
+        policy_operator = TensorDictModule(policy, in_keys=[OBS_KEY], out_keys=["action", "action_idx"])
+        env, vecnorm = make_transformed_env(env, cfg, policy_transforms=[])
+        if cfg.vecnorm_weights_path:
+            vecnorm.load_state_dict(
+                torch.load(cfg.vecnorm_weights_path, map_location=cfg.device), strict=False
+            )
+        policy.eval()
+        print("Running policy — close the Isaac Sim window to stop.")
+        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
+            td = env.reset()
+            while simulation_app.is_running():
+                td = policy_operator(td)
+                td = env.step(td)
+                td = td["next"]
 
     def _get_eval_rollout_results(self) -> dict[str, float]:
         self.env.eval()
@@ -640,42 +735,8 @@ class FtrD3QNTrainer:
 # BLOCK 5 — Entry point
 # ============================================================
 
-def _load_raw_config(config_path: str, cli_overrides: list[str]):
-    parsed = OmegaConf.load(config_path)
-    if cli_overrides:
-        parsed = OmegaConf.merge(parsed, OmegaConf.from_dotlist(cli_overrides))
-    return parsed
-
-
 if __name__ == "__main__":
-    if args.play is not None:
-        play_dir = Path(args.play)
-        saved_cfg_path = play_dir / "config.yaml"
-        if not saved_cfg_path.exists():
-            raise FileNotFoundError(f"No config.yaml found in {play_dir}")
-        raw_cfg = _load_raw_config(str(saved_cfg_path), unknown_args)
-        weights_dir = play_dir / "weights"
-        raw_cfg.policy_weights_path = str(weights_dir / "policy_final.pth")
-        raw_cfg.vecnorm_weights_path = str(weights_dir / "vecnorm_final.pth")
-        raw_cfg.use_wandb = False
-        raw_cfg.use_tensorboard = False
-    else:
-        prev_cfg_path = RunLogger.latest_attempt_config()
-        if prev_cfg_path is not None:
-            print(f"[INFO] Respawn detected — loading config from previous attempt: {prev_cfg_path}", flush=True)
-            raw_cfg = _load_raw_config(str(prev_cfg_path), unknown_args)
-            if not raw_cfg:
-                print(f"[WARNING] Previous attempt config at {prev_cfg_path} is empty — falling back to {args.config}", flush=True)
-                raw_cfg = _load_raw_config(args.config, unknown_args)
-        else:
-            raw_cfg = _load_raw_config(args.config, unknown_args)
-
-    if args.num_envs is not None:
-        raw_cfg.num_robots = args.num_envs
-    if args.terrain is not None:
-        raw_cfg.terrain = args.terrain
-    if args.task is not None:
-        raw_cfg.task = args.task
+    raw_cfg = resolve_train_config(args, unknown_args)
 
     require_cuda()
     import_ftr_tasks()
@@ -687,42 +748,10 @@ if __name__ == "__main__":
     ftr_gym_env = build_ftr_gym_env(_cfg)
 
     if args.play is not None:
-        env = FtrTorchRLEnv(
-            ftr_gym_env,
-            encoder_opts=_cfg.ftr_obs_encoder_opts,
-            device=_cfg.device,
-            shock_scale=_cfg.env_cfg_overrides.get("shock_scale"),
-        )
-        policy = ATD3QNPolicy(epsilon=0.0, **_cfg.policy_opts).to(_cfg.device)
-        policy.q_network.load_state_dict(torch.load(_cfg.policy_weights_path, map_location=_cfg.device), strict=False)
-        policy_operator = TensorDictModule(policy, in_keys=[OBS_KEY], out_keys=["action", "action_idx"])
-        env, vecnorm = make_transformed_env(env, _cfg, policy_transforms=[])
-        if _cfg.vecnorm_weights_path:
-            vecnorm.load_state_dict(torch.load(_cfg.vecnorm_weights_path, map_location=_cfg.device), strict=False)
-        policy.eval()
-        print("Running policy — close the Isaac Sim window to stop.")
-        with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
-            td = env.reset()
-            while simulation_app.is_running():
-                td = policy_operator(td)
-                td = env.step(td)
-                td = td["next"]
+        FtrD3QNTrainer.play(_cfg, ftr_gym_env, simulation_app)
     else:
-        trainer = FtrD3QNTrainer(raw_cfg, ftr_gym_env)
-        try:
-            trainer.train()
-        except BaseException as _exc:  # noqa: BLE001 — must catch everything, see below
-            # Isaac Sim's atexit handlers deadlock on normal interpreter shutdown, so an
-            # exception escaping train() leaves the job holding its node until walltime
-            # instead of failing it (observed: a crashed run sat on a GPU for 15 minutes
-            # doing nothing). train() already force-exits on CUDA/W&B errors; this covers
-            # every other cause. Same guard optuna_train_ftr.py has had all along.
-            # Exit 1, not 75 — 75 means "transient, respawn me" to the sbatch loop.
-            traceback.print_exc()
-            sys.stdout.flush()
-            sys.stderr.flush()
-            import os as _os
-            _os._exit(_exc.code if isinstance(_exc, SystemExit) and isinstance(_exc.code, int) else 1)
+        run_trainer(FtrD3QNTrainer, raw_cfg, ftr_gym_env)
 
-    import os as _os
-    _os._exit(0)
+    # Skip simulation_app.close() — Isaac Sim's shutdown re-initialises GPU foundation and
+    # frequently deadlocks, keeping the SLURM slot busy for hours.
+    exit_flushed()

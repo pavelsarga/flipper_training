@@ -12,17 +12,14 @@ if __name__ == "__main__":
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
-import sys
 import traceback
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
 import torch
-from omegaconf import OmegaConf
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import LazyTensorStorage, SamplerWithoutReplacement, TensorDictReplayBuffer
 from torchrl.envs.utils import ExplorationType, set_exploration_type
@@ -37,6 +34,8 @@ import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks, require_cuda
+from marv_rl_training.training.entrypoint import resolve_train_config, run_trainer
+from marv_rl_training.training.eval_common import exit_flushed
 from marv_rl_training.training.env_type_registry import default_num_env_types
 from marv_rl_training.training.eval_data import (
     aggregate_per_env,
@@ -766,7 +765,7 @@ class FtrPPOTrainer:
                     raise  # must propagate — don't catch in RuntimeError handler
                 except RuntimeError as e:
                     if "CUDA" in str(e):
-                        self.term_logger.warning(f"Eval CUDA error — GPU context corrupted. Exiting immediately to avoid cleanup hang.")
+                        self.term_logger.warning("Eval CUDA error — GPU context corrupted. Exiting immediately to avoid cleanup hang.")
                         import os as _os
                         _os._exit(75)
                     self.term_logger.warning(f"Eval rollout failed (physics explosion): {e}. Skipping eval metrics this checkpoint.")
@@ -835,52 +834,8 @@ class FtrPPOTrainer:
 # BLOCK 5 — Entry point
 # ============================================================
 
-def _load_raw_config(config_path: str, cli_overrides: list[str]):
-    """Load and merge config YAML, returning a raw OmegaConf DictConfig."""
-    parsed = OmegaConf.load(config_path)
-    if cli_overrides:
-        parsed = OmegaConf.merge(parsed, OmegaConf.from_dotlist(cli_overrides))
-    return parsed
-
-
 if __name__ == "__main__":
-    # --play mode: load weights from a finished run directory and visualise
-    if args.play is not None:
-        play_dir = Path(args.play)
-        # Load the config that was saved alongside that run
-        saved_cfg_path = play_dir / "config.yaml"
-        if not saved_cfg_path.exists():
-            raise FileNotFoundError(f"No config.yaml found in {play_dir}")
-        raw_cfg = _load_raw_config(str(saved_cfg_path), unknown_args)
-        # Override weights paths to point at the saved weights
-        weights_dir = play_dir / "weights"
-        raw_cfg.policy_weights_path = str(weights_dir / "policy_final.pth")
-        raw_cfg.vecnorm_weights_path = str(weights_dir / "vecnorm_final.pth")
-        # Sensible play defaults: few envs, no logging
-        raw_cfg.use_wandb = False
-        raw_cfg.use_tensorboard = False
-    else:
-        # On SLURM respawn, prefer the config saved by the previous attempt so that
-        # reward weights, LR schedule, and all other hyperparameters are identical
-        # to what the checkpoint was trained with. Fall back to args.config only when
-        # no previous attempt exists (i.e. this is the first run of the job).
-        prev_cfg_path = RunLogger.latest_attempt_config()
-        if prev_cfg_path is not None:
-            print(f"[INFO] Respawn detected — loading config from previous attempt: {prev_cfg_path}", flush=True)
-            raw_cfg = _load_raw_config(str(prev_cfg_path), unknown_args)
-            if not raw_cfg:
-                print(f"[WARNING] Previous attempt config at {prev_cfg_path} is empty — falling back to {args.config}", flush=True)
-                raw_cfg = _load_raw_config(args.config, unknown_args)
-        else:
-            raw_cfg = _load_raw_config(args.config, unknown_args)
-
-    # Apply CLI overrides for num_envs / terrain / task before constructing FtrPPOConfig
-    if args.num_envs is not None:
-        raw_cfg.num_robots = args.num_envs
-    if args.terrain is not None:
-        raw_cfg.terrain = args.terrain
-    if args.task is not None:
-        raw_cfg.task = args.task
+    raw_cfg = resolve_train_config(args, unknown_args)
 
     require_cuda()
     import_ftr_tasks()
@@ -917,23 +872,8 @@ if __name__ == "__main__":
                 td = env.step(td)
                 td = td["next"]
     else:
-        trainer = FtrPPOTrainer(raw_cfg, ftr_gym_env)
-        try:
-            trainer.train()
-        except BaseException as _exc:  # noqa: BLE001 — must catch everything, see below
-            # Isaac Sim's atexit handlers deadlock on normal interpreter shutdown, so an
-            # exception escaping train() leaves the job holding its node until walltime
-            # instead of failing it (observed: a crashed run sat on a GPU for 15 minutes
-            # doing nothing). train() already force-exits on CUDA/W&B errors; this covers
-            # every other cause. Same guard optuna_train_ftr.py has had all along.
-            # Exit 1, not 75 — 75 means "transient, respawn me" to the sbatch loop.
-            traceback.print_exc()
-            sys.stdout.flush()
-            sys.stderr.flush()
-            import os as _os
-            _os._exit(_exc.code if isinstance(_exc, SystemExit) and isinstance(_exc.code, int) else 1)
+        run_trainer(FtrPPOTrainer, raw_cfg, ftr_gym_env)
 
     # Skip simulation_app.close() — Isaac Sim's shutdown re-initialises GPU foundation
     # and frequently deadlocks, keeping the SLURM slot busy for hours.
-    import os as _os
-    _os._exit(0)
+    exit_flushed()

@@ -10,10 +10,8 @@ if __name__ == "__main__":
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
-import sys
 import traceback
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -21,7 +19,6 @@ if TYPE_CHECKING:
 
 import numpy as np
 import torch
-from omegaconf import OmegaConf
 from tensordict.nn import TensorDictModule
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
@@ -30,6 +27,8 @@ import gymnasium
 import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks, require_cuda
+from marv_rl_training.training.entrypoint import resolve_train_config, run_trainer
+from marv_rl_training.training.eval_common import exit_flushed
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
 
@@ -421,40 +420,8 @@ class FtrCREPSTrainer:
 # BLOCK 5 — Entry point
 # ============================================================
 
-def _load_raw_config(config_path: str, cli_overrides: list[str]):
-    parsed = OmegaConf.load(config_path)
-    if cli_overrides:
-        parsed = OmegaConf.merge(parsed, OmegaConf.from_dotlist(cli_overrides))
-    return parsed
-
-
 if __name__ == "__main__":
-    if args.play is not None:
-        play_dir = Path(args.play)
-        saved_cfg_path = play_dir / "config.yaml"
-        if not saved_cfg_path.exists():
-            raise FileNotFoundError(f"No config.yaml found in {play_dir}")
-        raw_cfg = _load_raw_config(str(saved_cfg_path), unknown_args)
-        raw_cfg.omega_weights_path = str(play_dir / "weights" / "creps_state_final.pth")
-        raw_cfg.use_wandb = False
-        raw_cfg.use_tensorboard = False
-    else:
-        prev_cfg_path = RunLogger.latest_attempt_config()
-        if prev_cfg_path is not None:
-            print(f"[INFO] Respawn detected — loading config from previous attempt: {prev_cfg_path}", flush=True)
-            raw_cfg = _load_raw_config(str(prev_cfg_path), unknown_args)
-            if not raw_cfg:
-                print(f"[WARNING] Previous attempt config at {prev_cfg_path} is empty — falling back to {args.config}", flush=True)
-                raw_cfg = _load_raw_config(args.config, unknown_args)
-        else:
-            raw_cfg = _load_raw_config(args.config, unknown_args)
-
-    if args.num_envs is not None:
-        raw_cfg.num_robots = args.num_envs
-    if args.terrain is not None:
-        raw_cfg.terrain = args.terrain
-    if args.task is not None:
-        raw_cfg.task = args.task
+    raw_cfg = resolve_train_config(args, unknown_args)
 
     require_cuda()
     import_ftr_tasks()
@@ -485,21 +452,8 @@ if __name__ == "__main__":
                 td = env.step(td)
                 td = td["next"]
     else:
-        trainer = FtrCREPSTrainer(raw_cfg, ftr_gym_env)
-        try:
-            trainer.train()
-        except BaseException as _exc:  # noqa: BLE001 — must catch everything, see below
-            # Isaac Sim's atexit handlers deadlock on normal interpreter shutdown, so an
-            # exception escaping train() leaves the job holding its node until walltime
-            # instead of failing it (observed: a crashed run sat on a GPU for 15 minutes
-            # doing nothing). train() already force-exits on CUDA/W&B errors; this covers
-            # every other cause. Same guard optuna_train_ftr.py has had all along.
-            # Exit 1, not 75 — 75 means "transient, respawn me" to the sbatch loop.
-            traceback.print_exc()
-            sys.stdout.flush()
-            sys.stderr.flush()
-            import os as _os
-            _os._exit(_exc.code if isinstance(_exc, SystemExit) and isinstance(_exc.code, int) else 1)
+        run_trainer(FtrCREPSTrainer, raw_cfg, ftr_gym_env)
 
-    import os as _os
-    _os._exit(0)
+    # Skip simulation_app.close() — Isaac Sim's shutdown re-initialises GPU foundation and
+    # frequently deadlocks, keeping the SLURM slot busy for hours.
+    exit_flushed()
