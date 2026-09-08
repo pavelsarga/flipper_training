@@ -36,12 +36,11 @@ from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_ta
 from marv_rl_training.training.entrypoint import resolve_train_config, run_trainer
 from marv_rl_training.training.eval_common import exit_flushed
 from marv_rl_training.training.env_type_registry import default_num_env_types
-from marv_rl_training.training.eval_data import (
-    aggregate_per_env,
-    aggregate_per_spot,
-    load_env_type_names,
-    run_tracked_rollout,
-    save_per_spot_csv,
+from marv_rl_training.training.eval_data import load_env_type_names, run_tracked_rollout
+from marv_rl_training.training.trainer_common import (
+    attach_per_env_eval_rows,
+    average_eval_repeats,
+    is_unrecoverable_gpu_error,
 )
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
@@ -573,7 +572,7 @@ class FtrSACTrainer:
         except Exception as e:
             self.term_logger.error(f"Training failed: {e}")
             traceback.print_exception(e)
-            if "CUDA error" in str(e) or "CUDA out of memory" in str(e) or "CommError" in str(type(e).__name__):
+            if is_unrecoverable_gpu_error(e):
                 # No checkpoint is written on this path, deliberately: the GPU context is
                 # already corrupted, so every state_dict() below would fault or hang. This
                 # is the dominant crash mode for this trainer (all 14 respawns of SLURM job
@@ -959,32 +958,21 @@ class FtrSACTrainer:
         # anywhere in this trainer either, matching D3QN's own usage).
         self._eval_reward_info = {k: results.pop(k) for k in list(results) if k.startswith("rew/") or k.startswith("shock/")}
 
-        if episode_records:
-            per_env_rows = aggregate_per_env(
-                episode_records=episode_records, env_type_names=self._eval_env_type_names,
-                eval_id="train", policy=self.run_logger.run_name, terrain=self.config.terrain, repeat=1, obs_stats=results,
-            )
-            for row in per_env_rows:
-                results[f"eval_per_env/{row.env_type_name}_success_rate"] = row.success_rate
-            per_spot_rows = aggregate_per_spot(
-                episode_records=episode_records, env_type_names=self._eval_env_type_names,
-                num_depth_cols=10, eval_id="train", policy=self.run_logger.run_name, terrain=self.config.terrain, repeat=1,
-            )
-            save_per_spot_csv(self._eval_per_spot_csv, per_spot_rows)
+        attach_per_env_eval_rows(
+            results, episode_records,
+            env_type_names=self._eval_env_type_names,
+            run_name=self.run_logger.run_name,
+            terrain=self.config.terrain,
+            per_spot_csv=self._eval_per_spot_csv,
+        )
         return results
 
     def _post_training_evaluation(self) -> dict[str, float]:
-        self.term_logger.info(f"Training finished. Running {self.config.eval_repeats_after_training} final eval(s).")
-        avg = self._get_eval_rollout_results()
-        for _ in range(self.config.eval_repeats_after_training - 1):
-            for k, v in self._get_eval_rollout_results().items():
-                avg[k] += v
-        for k in avg:
-            avg[k] /= self.config.eval_repeats_after_training
-        print("\nFinal evaluation results:")
-        for k, v in avg.items():
-            print(f"  {k}: {v:.4f}")
-        return avg
+        self.term_logger.info(
+            f"Training finished. Running {self.config.eval_repeats_after_training} final eval(s)."
+        )
+        return average_eval_repeats(self._get_eval_rollout_results,
+                                    self.config.eval_repeats_after_training)
 
 
 # ============================================================
