@@ -2,7 +2,8 @@
 # BLOCK 1 — AppLauncher MUST be initialised before any omni.* imports
 # ============================================================
 import argparse
-from omni.isaac.lab.app import AppLauncher
+
+from marv_rl_training.training.cli import launch_isaac_app
 
 parser = argparse.ArgumentParser(
     description="Evaluate top-K Optuna trials and compare their performance."
@@ -12,51 +13,39 @@ parser.add_argument("--top", type=int, default=10, help="Number of top trials to
 parser.add_argument("--repeats", type=int, default=20, help="Eval rollouts per trial (default: 20).")
 parser.add_argument("--num_envs", type=int, default=128, help="Override num_robots from config.")
 parser.add_argument("--max_steps", type=int, default=100000, help="Override max_eval_steps from config.")
-parser.add_argument(
-    "--policy", type=str, default="policy_final.pth",
-    help="Policy checkpoint filename inside <run>/weights/.",
-)
-parser.add_argument(
-    "--vecnorm", type=str, default="vecnorm_final.pth",
-    help="VecNorm checkpoint filename inside <run>/weights/.",
-)
+parser.add_argument("--policy", type=str, default="policy_final.pth",
+                    help="Policy checkpoint filename inside <run>/weights/.")
+parser.add_argument("--vecnorm", type=str, default="vecnorm_final.pth",
+                    help="VecNorm checkpoint filename inside <run>/weights/.")
 parser.add_argument("--output", type=str, default=None, help="Path to save results CSV (optional).")
-parser.add_argument("--db", type=str, default=None, help="Optuna DB URL (e.g. sqlite:///path/to/optuna.db). Overrides optuna_db.yaml.")
-parser.add_argument(
-    "--runs-dir", type=str, default=None,
-    help="Directory to scan for run subdirs (fallback when trials lack logpath). "
-         "Defaults to logs/ and runs/ppo/ under the workspace root.",
-)
-AppLauncher.add_app_launcher_args(parser)
-args, unknown_args = parser.parse_known_args()
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
-
+parser.add_argument("--db", type=str, default=None,
+                    help="Optuna DB URL (e.g. sqlite:///path/to/optuna.db). Overrides optuna_db.yaml.")
+parser.add_argument("--runs-dir", type=str, default=None,
+                    help="Directory to scan for run subdirs (fallback when trials lack logpath). "
+                         "Defaults to logs/ and runs/ppo/ under the workspace root.")
+args, unknown_args, simulation_app = launch_isaac_app(parser)
 
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
 import csv
-import importlib
 import os
-import sys
 import traceback
 from pathlib import Path
 
 import optuna
 import torch
 from omegaconf import OmegaConf
-from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-import marv_rl_training  # registers OmegaConf resolvers
+import marv_rl_training  # noqa: F401 — registers OmegaConf resolvers
 from marv_rl_training import ROOT
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks, require_cuda
+from marv_rl_training.training.eval_common import run_single_rollout
 from marv_rl_training.training.train_ftr import FtrPPOConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
-
-import gymnasium
 
 logger = get_terminal_logger("eval_optuna_top")
 
@@ -175,27 +164,6 @@ def find_run_dir(trial: optuna.trial.FrozenTrial, search_dirs: list[Path] | None
     return None
 
 
-def _run_single_rollout(env, ftr_torchrl_env: FtrTorchRLEnv, actor, max_steps: int) -> dict[str, float]:
-    """Run one deterministic rollout and return a flat dict of metrics."""
-    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.inference_mode():
-        rollout = env.rollout(max_steps, actor, auto_reset=True, break_when_all_done=True)
-
-    results: dict[str, float] = {
-        "eval/mean_step_reward": rollout["next", "reward"].mean().item(),
-        "eval/max_step_reward":  rollout["next", "reward"].max().item(),
-        "eval/min_step_reward":  rollout["next", "reward"].min().item(),
-        "eval/pct_terminated":   rollout["next", "terminated"].float().mean().item(),
-        "eval/pct_truncated":    rollout["next", "truncated"].float().mean().item(),
-        "eval/rollout_steps":    float(rollout.shape[1]),
-    }
-    del rollout
-
-    term_info = ftr_torchrl_env.pop_termination_info()
-    results.update({"eval/" + k.split("/", 1)[-1]: v for k, v in term_info.items()})
-    results.update(ftr_torchrl_env.pop_reward_info())
-    return results
-
-
 def eval_trial(
     run_dir: Path,
     repeats: int,
@@ -227,48 +195,9 @@ def eval_trial(
 
     max_steps = max_steps_override if max_steps_override is not None else raw_cfg.get("max_eval_steps", 100000)
 
+    # FtrPPOConfig is built here only to read the env fields build_ftr_gym_env needs.
     _cfg = FtrPPOConfig(**raw_cfg)
-
-    spec = gymnasium.spec(_cfg.task)
-    _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-    if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-        _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
-        _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
-    elif isinstance(_env_cfg_entry, type):
-        _EnvCfgClass = _env_cfg_entry
-    else:
-        from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-        _EnvCfgClass = CrossingEnvCfg
-
-    env_cfg = _EnvCfgClass()
-    env_cfg.scene.num_envs = _cfg.num_robots
-    env_cfg.terrain_name = _cfg.terrain
-    env_cfg.sim.dt = _cfg.sim_dt
-    env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
-    env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
-    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
-    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
-    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
-    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
-    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
-    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
-    env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
-    env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
-    env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
-    if _cfg.num_robots <= 64:
-        env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
-        env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
-        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
-        env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
-        env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
-    elif _cfg.num_robots > 512:
-        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
-    for k, v in (_cfg.env_cfg_overrides or {}).items():
-        setattr(env_cfg, k, v)
-
-    ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
+    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_buffers="auto")
     device = set_device(_cfg.device)
     seed_all(_cfg.seed)
 
@@ -289,7 +218,7 @@ def eval_trial(
     for r in range(repeats):
         logger.info(f"  Rollout {r + 1}/{repeats} ...")
         try:
-            results = _run_single_rollout(env, ftr_torchrl_env, actor, max_steps)
+            results = run_single_rollout(env, ftr_torchrl_env, actor, max_steps, collect_obs_stats=False)
             all_results.append(results)
         except RuntimeError as e:
             if "CUDA" in str(e):
@@ -322,15 +251,8 @@ def eval_trial(
 # ============================================================
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        print("FATAL: CUDA not available.", flush=True)
-        os._exit(1)
-
-    try:
-        import ftr_envs.tasks  # noqa: F401
-    except Exception as _e:
-        print(f"FATAL: failed to import ftr_envs.tasks: {_e}", flush=True)
-        os._exit(1)
+    require_cuda()
+    import_ftr_tasks()
 
     try:
         # ---- Build search directories for fallback run discovery ----

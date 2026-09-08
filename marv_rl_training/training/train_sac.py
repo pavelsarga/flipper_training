@@ -1,35 +1,13 @@
 # ============================================================
 # BLOCK 1 — AppLauncher MUST be initialised before any omni.* imports
 # ============================================================
-import argparse
-from omni.isaac.lab.app import AppLauncher
 import optuna
 
+from marv_rl_training.training.cli import launch_isaac_app, train_arg_parser
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train C-TRAC (Pan et al. 2025) asymmetric SAC + C-VAE policy inside FTR-Benchmark (Isaac Sim)")
-    parser.add_argument("--config", type=str, required=True, help="Path to a SAC config yaml (see FtrSACConfig)")
-    parser.add_argument("--num_envs", type=int, default=None, help="Override num_robots in config")
-    parser.add_argument("--terrain", type=str, default=None, help="Override terrain in config")
-    parser.add_argument("--task", type=str, default=None, help="Override task in config (e.g. Ftr-Crossing-Direct-v0)")
-    AppLauncher.add_app_launcher_args(parser)
-    args, unknown_args = parser.parse_known_args()
-
-    # AppLauncher processes some flags (e.g. --gpu) from sys.argv directly without
-    # removing them from unknown_args, so they leak into OmegaConf overrides and crash.
-    # Strip any --flag / value pairs that are not OmegaConf key=value overrides.
-    _filtered, _skip = [], False
-    for _a in unknown_args:
-        if _skip:
-            _skip = False
-            continue
-        if _a.startswith("--") and "=" not in _a:
-            _skip = True
-            continue
-        _filtered.append(_a)
-    unknown_args = _filtered
-
-    app_launcher = AppLauncher(args)
-    simulation_app = app_launcher.app
+    parser = train_arg_parser("Train C-TRAC (Pan et al. 2025) asymmetric SAC + C-VAE policy inside FTR-Benchmark (Isaac Sim)", play=False)
+    args, unknown_args, simulation_app = launch_isaac_app(parser)
 
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
@@ -56,6 +34,7 @@ import gymnasium
 import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks, require_cuda
 from marv_rl_training.training.env_type_registry import default_num_env_types
 from marv_rl_training.training.eval_data import (
     aggregate_per_env,
@@ -1037,76 +1016,14 @@ if __name__ == "__main__":
     if args.task is not None:
         raw_cfg.task = args.task
 
-    import os
-    if not torch.cuda.is_available():
-        print("FATAL: torch.cuda.is_available() returned False after AppLauncher init.", flush=True)
-        os._exit(1)
+    require_cuda()
+    import_ftr_tasks()
 
-    try:
-        import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
-    except Exception as _e:
-        print(f"FATAL: failed to import ftr_envs.tasks: {_e}", flush=True)
-        os._exit(1)
-
+    # FtrSACConfig is built here only to read the env fields build_ftr_gym_env needs.
+    # env_cfg_overrides must set module_name: ctrac so FtrEnv routes observations
+    # and rewards through CTRACModule instead of the default marv_rl one.
     _cfg = FtrSACConfig(**raw_cfg)
-
-    spec = gymnasium.spec(_cfg.task)
-    _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-    if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-        import importlib
-        _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
-        _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
-    elif isinstance(_env_cfg_entry, type):
-        _EnvCfgClass = _env_cfg_entry
-    else:
-        from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-        _EnvCfgClass = CrossingEnvCfg
-
-    env_cfg = _EnvCfgClass()
-    env_cfg.scene.num_envs = _cfg.num_robots
-    env_cfg.terrain_name = _cfg.terrain
-
-    env_cfg.sim.dt = _cfg.sim_dt
-    env_cfg.decimation = _cfg.decimation
-
-    env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
-    env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
-    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
-    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
-    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
-
-    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
-
-    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
-    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
-    env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
-    env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
-    env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
-    env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
-
-    # Scale down GPU PhysX buffers for small env counts (e.g. local debug runs on laptop
-    # GPUs) — mirrors eval_ftr.py's own scaling exactly, never carried over into this file
-    # originally. FTR_SIM_CFG's defaults are sized for 4096 envs on server GPUs; this is
-    # what actually caused local ctrac runs to fail scene creation regardless of env count
-    # or ContactSensor/terrain settings (confirmed by direct comparison against
-    # eval_ftr.py, which already scales these and works locally).
-    if _cfg.num_robots <= 64:
-        env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
-        env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
-        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
-        env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
-        env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
-    elif _cfg.num_robots > 512:
-        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
-
-    # Must set module_name: ctrac here (via env_cfg_overrides in the yaml) so FtrEnv routes
-    # observations/rewards through CTRACModule and attaches the ContactSensor (ftr_env.py).
-    for k, v in (_cfg.env_cfg_overrides or {}).items():
-        setattr(env_cfg, k, v)
-
-    ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
+    ftr_gym_env = build_ftr_gym_env(_cfg, physx_buffers="auto")
 
     trainer = FtrSACTrainer(raw_cfg, ftr_gym_env)
     try:

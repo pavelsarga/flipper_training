@@ -1,37 +1,13 @@
 # ============================================================
 # BLOCK 1 — AppLauncher MUST be initialised before any omni.* imports
 # ============================================================
-import argparse
-from omni.isaac.lab.app import AppLauncher
+from marv_rl_training.training.cli import eval_arg_parser, launch_isaac_app
 
-parser = argparse.ArgumentParser(description="Evaluate a trained C-TRAC (SAC) flipper policy (Isaac Sim backend).")
-parser.add_argument("--rundir", type=str, required=True, metavar="RUN_DIR", help="Path to the run directory (must contain config.yaml and weights/).")
-parser.add_argument("--policy", type=str, default="policy_final.pth", help="Actor checkpoint filename inside <run>/weights/. (default: policy_final.pth)")
-parser.add_argument("--vecnorm", type=str, default="vecnorm_final.pth", help="VecNorm checkpoint filename inside <run>/weights/. (default: vecnorm_final.pth)")
-parser.add_argument("--num_envs", type=int, default=None, help="Override num_robots from config.")
-parser.add_argument("--repeats", type=int, default=1, help="Number of independent eval rollouts to run and average. (default: 1)")
-parser.add_argument("--max_steps", type=int, default=None, help="Override max_eval_steps from config.")
-parser.add_argument("--map", type=str, default=None, metavar="TERRAIN", help="Override the terrain from the saved config.")
-parser.add_argument("--output_dir", type=str, default=None, metavar="DIR", help="Directory to save CSV results. If omitted, prints metrics only.")
-parser.add_argument("--num_env_types", type=int, default=None, help="Number of distinct env types cycling across robots. Default: looked up from the terrain's registered layout.")
-parser.add_argument("--env_names_yaml", type=str, default=None, metavar="YAML", help="Path to YAML file mapping env-type index -> name, overriding the terrain's registered default names.")
-parser.add_argument("--eval_id", type=str, default=None, help="Identifier for this eval run (default: auto UTC timestamp).")
-AppLauncher.add_app_launcher_args(parser)
-args, unknown_args = parser.parse_known_args()
-
-_filtered, _skip = [], False
-for _a in unknown_args:
-    if _skip:
-        _skip = False
-        continue
-    if _a.startswith("--") and "=" not in _a:
-        _skip = True
-        continue
-    _filtered.append(_a)
-unknown_args = _filtered
-
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
+parser = eval_arg_parser(
+    "Evaluate a trained C-TRAC (SAC) flipper policy (Isaac Sim backend).",
+    policy_help="Actor checkpoint filename inside <run>/weights/. (default: policy_final.pth)",
+)
+args, unknown_args, simulation_app = launch_isaac_app(parser)
 
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
@@ -42,11 +18,11 @@ from pathlib import Path
 from omegaconf import OmegaConf
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-import gymnasium
-
 import marv_rl_training  # noqa: F401 — registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks
+from marv_rl_training.training.eval_common import exit_flushed, print_results
 from marv_rl_training.training.env_type_registry import default_num_depth_cols, default_num_env_types
 from marv_rl_training.training.terrain_assets import write_terrain_manifest
 from marv_rl_training.training.eval_data import (
@@ -65,14 +41,6 @@ from marv_rl_training.utils.torch_utils import seed_all, set_device
 from rl_modules.ctrac.ctrac_policy import CTRACPolicyConfig
 
 logger = get_terminal_logger("eval_sac")
-
-
-def _print_results(results: dict[str, float], header: str) -> None:
-    print(f"\n{'=' * 60}")
-    print(header)
-    print("=" * 60)
-    for k, v in sorted(results.items()):
-        print(f"  {k:<45} {v:.6f}")
 
 
 def run_eval(raw_cfg, ftr_gym_env, max_steps, repeats, output_dir=None, num_env_types=None,
@@ -149,7 +117,7 @@ def run_eval(raw_cfg, ftr_gym_env, max_steps, repeats, output_dir=None, num_env_
                     repeat=r + 1, eval_id=_eval_id, policy_label=_policy_lbl, terrain=_terrain,
                     num_env_types=num_env_types, env_type_names=_env_names,
                 )
-                _print_results(results, f"Repeat {r + 1}/{repeats}")
+                print_results(results, f"Repeat {r + 1}/{repeats}")
                 all_results.append(results)
 
                 if _output_dir and episode_records:
@@ -182,7 +150,7 @@ def run_eval(raw_cfg, ftr_gym_env, max_steps, repeats, output_dir=None, num_env_
 
     if repeats > 1 and all_results:
         averaged = {k: sum(d[k] for d in all_results) / repeats for k in all_results[0]}
-        _print_results(averaged, f"AVERAGE over {repeats} repeats")
+        print_results(averaged, f"AVERAGE over {repeats} repeats")
 
     if _output_dir:
         logger.info(f"Eval complete. Results saved to {_output_dir}  (eval_id={_eval_id})")
@@ -217,61 +185,10 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("FATAL: torch.cuda.is_available() returned False after AppLauncher init.", flush=True)
         os._exit(1)
-    import ftr_envs.tasks  # noqa: F401
+    import_ftr_tasks()
 
     _cfg = FtrSACConfig(**raw_cfg)
-    spec = gymnasium.spec(_cfg.task)
-    _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-    if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-        import importlib
-        _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
-        _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
-    else:
-        from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-        _EnvCfgClass = CrossingEnvCfg
-
-    env_cfg = _EnvCfgClass()
-    env_cfg.scene.num_envs = _cfg.num_robots
-    env_cfg.terrain_name = _cfg.terrain
-    env_cfg.sim.dt = _cfg.sim_dt
-    env_cfg.decimation = _cfg.decimation
-    env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
-    env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
-    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
-    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
-    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
-    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
-    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
-    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
-    env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
-    env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
-    env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
-    env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
-
-    # Scale down GPU PhysX buffers for small env counts (e.g. local eval on laptop GPUs) —
-    # mirrors eval_ftr.py's own scaling exactly. FTR_SIM_CFG's defaults are sized for 4096
-    # envs on server GPUs; requesting that scale of PhysX GPU buffers on an 8 GB laptop
-    # card is what was actually causing "Failed to create simulation view: no active
-    # physics scene found" locally — confirmed by direct comparison against eval_ftr.py,
-    # which already has this scaling and works fine locally at small env counts, while
-    # eval_sac.py (missing it entirely) failed even at num_envs=4. Not a ContactSensor,
-    # terrain, or SAC-specific issue — this scaling was simply never carried over from
-    # eval_ftr.py's reference pattern into any of the ctrac scripts.
-    if _cfg.num_robots <= 64:
-        env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
-        env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
-        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
-        env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
-        env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
-    elif _cfg.num_robots > 512:
-        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
-
-    for k, v in (_cfg.env_cfg_overrides or {}).items():
-        setattr(env_cfg, k, v)
-
-    ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
+    ftr_gym_env = build_ftr_gym_env(_cfg, physx_buffers="auto")
 
     run_eval(
         raw_cfg, ftr_gym_env,
@@ -280,4 +197,4 @@ if __name__ == "__main__":
         policy_label=run_dir.name,
     )
 
-    os._exit(0)
+    exit_flushed()

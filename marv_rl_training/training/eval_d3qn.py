@@ -1,85 +1,18 @@
 # ============================================================
 # BLOCK 1 — AppLauncher MUST be initialised before any omni.* imports
 # ============================================================
-import argparse
-from omni.isaac.lab.app import AppLauncher
+from marv_rl_training.training.cli import eval_arg_parser, launch_isaac_app
 
-parser = argparse.ArgumentParser(
-    description="Evaluate a trained AT-D3QN / ICM-D3QN flipper policy (Isaac Sim backend)."
+parser = eval_arg_parser(
+    "Evaluate a trained AT-D3QN / ICM-D3QN flipper policy (Isaac Sim backend).",
+    policy_help="Policy (Q-network) checkpoint filename inside <run>/weights/. "
+                "(default: policy_final.pth)",
 )
-parser.add_argument(
-    "--rundir", type=str, required=True, metavar="RUN_DIR",
-    help="Path to the run directory (must contain config.yaml and weights/).",
-)
-parser.add_argument(
-    "--policy", type=str, default="policy_final.pth",
-    help="Policy (Q-network) checkpoint filename inside <run>/weights/. (default: policy_final.pth)",
-)
-parser.add_argument(
-    "--vecnorm", type=str, default="vecnorm_final.pth",
-    help="VecNorm checkpoint filename inside <run>/weights/. (default: vecnorm_final.pth)",
-)
-parser.add_argument(
-    "--num_envs", type=int, default=None,
-    help="Override num_robots from config.",
-)
-parser.add_argument(
-    "--repeats", type=int, default=1,
-    help="Number of independent eval rollouts to run and average. (default: 1)",
-)
-parser.add_argument(
-    "--max_steps", type=int, default=None,
-    help="Override max_eval_steps from config.",
-)
-parser.add_argument(
-    "--map", type=str, default=None, metavar="TERRAIN",
-    help="Override the terrain from the saved config (e.g. ground, cur_mixed, cur_stairs_up, exp_stair33_up).",
-)
-parser.add_argument(
-    "--output_dir", type=str, default=None, metavar="DIR",
-    help="Directory to save CSV results (eval_summary.csv, eval_per_env.csv, eval_episodes.csv, "
-         "eval_per_spot.csv). If omitted, prints metrics only.",
-)
-parser.add_argument(
-    "--num_env_types", type=int, default=None,
-    help="Number of distinct env types cycling across robots. Default: looked up from the "
-         "terrain's registered layout (env_type_registry.py).",
-)
-parser.add_argument(
-    "--env_names_yaml", type=str, default=None, metavar="YAML",
-    help="Path to YAML file mapping env-type index → name (list or dict), overriding the "
-         "terrain's registered default names.",
-)
-parser.add_argument(
-    "--eval_id", type=str, default=None,
-    help="Identifier for this eval run (default: auto UTC timestamp).",
-)
-AppLauncher.add_app_launcher_args(parser)
-args, unknown_args = parser.parse_known_args()
-
-# AppLauncher processes some flags (e.g. --gpu) from sys.argv directly without
-# removing them from unknown_args, so they leak into OmegaConf overrides and crash.
-# Strip any --flag / value pairs that are not OmegaConf key=value overrides.
-_filtered, _skip = [], False
-for _a in unknown_args:
-    if _skip:
-        _skip = False
-        continue
-    if _a.startswith("--") and "=" not in _a:
-        _skip = True  # also drop the following positional value
-        continue
-    _filtered.append(_a)
-unknown_args = _filtered
-
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
-
+args, unknown_args, simulation_app = launch_isaac_app(parser)
 
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
-import importlib
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,10 +25,11 @@ import gymnasium
 import marv_rl_training  # noqa: F401 — registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks
+from marv_rl_training.training.eval_common import exit_flushed, print_results
 from marv_rl_training.training.env_type_registry import default_num_depth_cols, default_num_env_types
 from marv_rl_training.training.terrain_assets import write_terrain_manifest
 from marv_rl_training.training.eval_data import (
-    EpisodeRecord,
     SummaryRow,
     aggregate_per_env,
     aggregate_per_spot,
@@ -132,19 +66,6 @@ def _select_module(raw_cfg: OmegaConf):
     if module_name == "icmd3qn":
         return FtrICMD3QNConfig, ICMD3QNPolicy
     return FtrD3QNConfig, ATD3QNPolicy
-
-
-def _print_results(results: dict[str, float], header: str) -> None:
-    print(f"\n{'=' * 60}")
-    print(header)
-    print('=' * 60)
-    groups: dict[str, list[tuple[str, float]]] = {}
-    for k, v in sorted(results.items()):
-        prefix = k.split("/")[0]
-        groups.setdefault(prefix, []).append((k, v))
-    for _prefix, items in groups.items():
-        for k, v in items:
-            print(f"  {k:<45} {v:.6f}")
 
 
 def run_eval(
@@ -241,7 +162,7 @@ def run_eval(
                 env_type_names=_env_names,
             )
 
-            _print_results(results, f"Repeat {r + 1}/{repeats}")
+            print_results(results, f"Repeat {r + 1}/{repeats}")
             all_results.append(results)
 
             if _output_dir and episode_records:
@@ -288,7 +209,7 @@ def run_eval(
 
     if repeats > 1 and all_results:
         averaged = {k: sum(d[k] for d in all_results) / repeats for k in all_results[0]}
-        _print_results(averaged, f"AVERAGE over {repeats} repeats")
+        print_results(averaged, f"AVERAGE over {repeats} repeats")
 
     if _output_dir:
         logger.info(f"Eval complete. Results saved to {_output_dir}  (eval_id={_eval_id})")
@@ -299,7 +220,7 @@ def run_eval(
 # ============================================================
 
 if __name__ == "__main__":
-    import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
+    import_ftr_tasks()
 
     run_dir = Path(args.rundir)
     saved_cfg_path = run_dir / "config.yaml"
@@ -334,61 +255,7 @@ if __name__ == "__main__":
 
     # Build the config just to read task/terrain/env fields for gymnasium.make
     _cfg = _config_cls(**raw_cfg)
-
-    spec = gymnasium.spec(_cfg.task)
-    _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-    if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-        _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
-        _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
-    elif isinstance(_env_cfg_entry, type):
-        _EnvCfgClass = _env_cfg_entry
-    else:
-        from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-        _EnvCfgClass = CrossingEnvCfg
-
-    env_cfg = _EnvCfgClass()
-    env_cfg.scene.num_envs = _cfg.num_robots
-    env_cfg.terrain_name = _cfg.terrain
-
-    # --- Simulation timestep + control decimation (D3QN configs set decimation) ---
-    env_cfg.sim.dt = _cfg.sim_dt
-    env_cfg.decimation = _cfg.decimation
-
-    # --- Rigid body properties ---
-    env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
-    env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
-    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
-    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
-    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
-
-    # --- Per-articulation solver iterations ---
-    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
-
-    # --- Scene-wide PhysX solver (matched to per-articulation values) ---
-    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
-    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
-    env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
-    env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
-    env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
-    env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
-
-    # Scale down GPU PhysX buffers for small env counts (e.g. local eval on laptop GPUs).
-    # The defaults in FTR_SIM_CFG are sized for thousands of envs on server GPUs.
-    if _cfg.num_robots <= 64:
-        env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
-        env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
-        env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
-        env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
-        env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
-
-    # Must apply env_cfg_overrides (module_name: atd3qn/icmd3qn, sync_flipper_control: true, ...)
-    # so FtrEnv routes obs/rewards through the D3QN module and collapses to the front/rear pair.
-    for k, v in (_cfg.env_cfg_overrides or {}).items():
-        setattr(env_cfg, k, v)
-
-    ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
+    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_buffers="small")
 
     run_eval(
         raw_cfg, ftr_gym_env,
@@ -402,4 +269,4 @@ if __name__ == "__main__":
         policy_cls=_policy_cls,
     )
 
-    os._exit(0)
+    exit_flushed()

@@ -1,39 +1,13 @@
 # ============================================================
 # BLOCK 1 — AppLauncher MUST be initialised before any omni.* imports
 # ============================================================
-import argparse
-from omni.isaac.lab.app import AppLauncher
 import optuna
 
+from marv_rl_training.training.cli import launch_isaac_app, train_arg_parser
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train PPO policy inside FTR-Benchmark (Isaac Sim)")
-    parser.add_argument("--config", type=str, required=True, help="Path to ftr_config.yaml")
-    parser.add_argument("--num_envs", type=int, default=None, help="Override num_robots in config")
-    parser.add_argument("--terrain", type=str, default=None, help="Override terrain in config")
-    parser.add_argument("--task", type=str, default=None, help="Override task in config (e.g. Marv-Crossing-Direct-v0)")
-    parser.add_argument("--play", type=str, default=None, metavar="RUN_DIR",
-                        help="Visualise a trained policy instead of training. "
-                             "Pass the run directory (e.g. runs/ppo/ftr_ppo_crossing_2026-…). "
-                             "Loads policy_final.pth + vecnorm_final.pth from <RUN_DIR>/weights/.")
-    AppLauncher.add_app_launcher_args(parser)
-    args, unknown_args = parser.parse_known_args()
-
-    # AppLauncher processes some flags (e.g. --gpu) from sys.argv directly without
-    # removing them from unknown_args, so they leak into OmegaConf overrides and crash.
-    # Strip any --flag / value pairs that are not OmegaConf key=value overrides.
-    _filtered, _skip = [], False
-    for _a in unknown_args:
-        if _skip:
-            _skip = False
-            continue
-        if _a.startswith("--") and "=" not in _a:
-            _skip = True  # also drop the following positional value
-            continue
-        _filtered.append(_a)
-    unknown_args = _filtered
-
-    app_launcher = AppLauncher(args)
-    simulation_app = app_launcher.app
+    parser = train_arg_parser("Train PPO policy inside FTR-Benchmark (Isaac Sim)", play=True)
+    args, unknown_args, simulation_app = launch_isaac_app(parser)
 
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
@@ -62,6 +36,7 @@ import gymnasium
 import marv_rl_training  # registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
+from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks, require_cuda
 from marv_rl_training.training.env_type_registry import default_num_env_types
 from marv_rl_training.training.eval_data import (
     aggregate_per_env,
@@ -907,92 +882,17 @@ if __name__ == "__main__":
     if args.task is not None:
         raw_cfg.task = args.task
 
-    # Verify CUDA is accessible before importing FTR tasks.
-    # Importing ftr_envs.tasks triggers wp.init() (via omni.isaac.lab.envs chain),
-    # which crashes with an unhelpful RuntimeError if the CUDA context is dead.
-    # Use os._exit() — not sys.exit/raise — so Isaac Sim's atexit handlers are bypassed
-    # and the apptainer process terminates immediately instead of hanging for minutes.
-    import os
-    import torch
-    if not torch.cuda.is_available():
-        print(
-            "FATAL: torch.cuda.is_available() returned False after AppLauncher init.\n"
-            "Isaac Sim failed to create a CUDA context (check .err for 'CUDA error 46').\n"
-            "This is usually a node-level GPU issue — try a different compute node.",
-            flush=True,
-        )
-        os._exit(1)
+    require_cuda()
+    import_ftr_tasks()
 
-    # Import FTR task registrations (must happen after AppLauncher)
-    try:
-        import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
-    except Exception as _e:
-        print(f"FATAL: failed to import ftr_envs.tasks: {_e}", flush=True)
-        os._exit(1)
-
-    # Use FtrPPOConfig only to read the num_robots / task / terrain fields needed for env setup
+    # FtrPPOConfig is built here only to read the env fields build_ftr_gym_env needs.
     _cfg = FtrPPOConfig(**raw_cfg)
-
-    # Dynamically resolve the env config class from the gymnasium task registry
-    # so that --task Marv-Crossing-Potential-v0 (or any registered task) uses the right config.
-    spec = gymnasium.spec(_cfg.task)
-    _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-    if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-        import importlib
-        _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
-        _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
-    elif isinstance(_env_cfg_entry, type):
-        _EnvCfgClass = _env_cfg_entry
-    else:
-        from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-        _EnvCfgClass = CrossingEnvCfg
-
-    env_cfg = _EnvCfgClass()
-    env_cfg.scene.num_envs = _cfg.num_robots
-    env_cfg.terrain_name = _cfg.terrain
-
-    # --- Simulation timestep and decimation ---
-    env_cfg.sim.dt = _cfg.sim_dt
-    env_cfg.decimation = _cfg.decimation
-
-    # --- Rigid body properties ---
-    env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
-    env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
-    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
-    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
-    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
-
-    # --- Per-articulation solver iterations ---
-    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
-
-    # --- Scene-wide PhysX solver (matched to per-articulation values) ---
-    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
-    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
-    env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
-    env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
-    env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
-    env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
-
-    # Apply arbitrary direct-attribute overrides (e.g. potential reward params)
-    for k, v in (_cfg.env_cfg_overrides or {}).items():
-        setattr(env_cfg, k, v)
-
-    # Raw accel logging: enable flag + interval now; path is set by FtrPPOTrainer after
-    # RunLogger is created (logpath not known until then).
-    if _cfg.log_raw_accel:
-        env_cfg.log_raw_accel = True
-        env_cfg.log_raw_accel_interval = _cfg.log_raw_accel_interval
-        # log_raw_accel_path stays None until trainer patches it below
-
-    ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
+    # log_raw_accel_path stays None until the trainer patches it below — RunLogger has not
+    # decided on the run directory yet.
+    ftr_gym_env = build_ftr_gym_env(_cfg)
 
     if args.play is not None:
         # Visualisation-only: build env + policy, run forever in deterministic mode
-        from marv_rl_training.training.common import make_transformed_env
-        from torchrl.envs.utils import ExplorationType, set_exploration_type
-
         env = FtrTorchRLEnv(
             ftr_gym_env,
             encoder_opts=_cfg.ftr_obs_encoder_opts,
