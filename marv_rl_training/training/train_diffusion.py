@@ -85,6 +85,8 @@ from tqdm import tqdm
 
 import gymnasium
 
+from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks, require_cuda
+
 import marv_rl_training  # registers OmegaConf resolvers
 from torchrl.envs import CatFrames
 
@@ -1215,70 +1217,18 @@ if __name__ == "__main__":
         )
         os._exit(1)
 
-    # Import FTR task registrations (must happen after AppLauncher)
-    try:
-        import ftr_envs.tasks  # noqa: F401 — triggers gymnasium.register calls
-    except Exception as _e:
-        print(f"FATAL: failed to import ftr_envs.tasks: {_e}", flush=True)
-        os._exit(1)
+    require_cuda()
+    import_ftr_tasks()
 
-    # Use FtrDiffusionConfig only to read the num_robots / task / terrain fields needed for env setup
+    # FtrDiffusionConfig is built here only to read the env fields build_ftr_gym_env needs.
     _cfg = FtrDiffusionConfig(**raw_cfg)
-
-    # Dynamically resolve the env config class from the gymnasium task registry
-    # so that --task Marv-Crossing-Potential-v0 (or any registered task) uses the right config.
-    spec = gymnasium.spec(_cfg.task)
-    _env_cfg_entry = spec.kwargs.get("env_cfg_entry_point", "")
-    if isinstance(_env_cfg_entry, str) and ":" in _env_cfg_entry:
-        import importlib
-        _mod_path, _cls_name = _env_cfg_entry.rsplit(":", 1)
-        _EnvCfgClass = getattr(importlib.import_module(_mod_path), _cls_name)
-    elif isinstance(_env_cfg_entry, type):
-        _EnvCfgClass = _env_cfg_entry
-    else:
-        from ftr_envs.tasks.crossing.crossing_env import CrossingEnvCfg
-        _EnvCfgClass = CrossingEnvCfg
-
-    env_cfg = _EnvCfgClass()
-    env_cfg.scene.num_envs = _cfg.num_robots
-    env_cfg.terrain_name = _cfg.terrain
-
-    # --- Simulation timestep and decimation ---
-    env_cfg.sim.dt = _cfg.sim_dt
-    env_cfg.decimation = _cfg.decimation
-
-    # --- Rigid body properties ---
-    env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
-    env_cfg.robot.spawn.rigid_props.max_angular_velocity = _cfg.robot_max_angular_velocity
-    env_cfg.robot.spawn.rigid_props.max_depenetration_velocity = _cfg.max_depenetration_velocity
-    env_cfg.robot.spawn.rigid_props.linear_damping = _cfg.robot_linear_damping
-    env_cfg.robot.spawn.rigid_props.angular_damping = _cfg.robot_angular_damping
-
-    # --- Per-articulation solver iterations ---
-    env_cfg.robot.spawn.articulation_props.solver_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.robot.spawn.articulation_props.solver_velocity_iteration_count = _cfg.solver_velocity_iterations
-
-    # --- Scene-wide PhysX solver (matched to per-articulation values) ---
-    env_cfg.sim.physx.min_position_iteration_count = _cfg.solver_position_iterations
-    env_cfg.sim.physx.max_velocity_iteration_count = _cfg.solver_velocity_iterations
-    env_cfg.sim.physx.bounce_threshold_velocity = _cfg.bounce_threshold_velocity
-    env_cfg.sim.physx.gpu_heap_capacity = _cfg.physx_gpu_heap_capacity
-    env_cfg.sim.physx.gpu_temp_buffer_capacity = _cfg.physx_gpu_temp_buffer_capacity
-    env_cfg.sim.physx.gpu_max_num_partitions = _cfg.physx_gpu_max_num_partitions
-    env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = _cfg.physx_gpu_found_lost_aggregate_pairs_capacity
-
-    # Apply arbitrary direct-attribute overrides (e.g. potential reward params)
-    for k, v in (_cfg.env_cfg_overrides or {}).items():
-        setattr(env_cfg, k, v)
-
-    # Raw accel logging: enable flag + interval now; path is set by FtrDiffusionTrainer after
-    # RunLogger is created (logpath not known until then).
-    if _cfg.log_raw_accel:
-        env_cfg.log_raw_accel = True
-        env_cfg.log_raw_accel_interval = _cfg.log_raw_accel_interval
-        # log_raw_accel_path stays None until trainer patches it below
-
-    ftr_gym_env = gymnasium.make(_cfg.task, cfg=env_cfg)
+    # physx_autotune="full": identical to the previous inline block for every cluster run
+    # (1024 envs > 512 -> gpu_found_lost_aggregate_pairs_capacity 2**27, which the config
+    # already sets), and shrinks the GPU buffers at <= 64 envs so train_diffusion_debug.sh
+    # can run on a laptop GPU -- the A100-sized defaults made simulation-view creation fail
+    # there ("Failed to create simulation view backend"). log_raw_accel_path stays None
+    # until the trainer patches it below, once RunLogger has decided the run directory.
+    ftr_gym_env = build_ftr_gym_env(_cfg, physx_autotune="full")
 
     if args.play is not None:
         # Visualisation-only: build env + policy, run forever in deterministic mode

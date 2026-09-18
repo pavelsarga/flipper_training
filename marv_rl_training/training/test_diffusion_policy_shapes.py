@@ -26,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from marv_rl_training.policies.diffusion_policy import (  # noqa: E402
     ChunkCriticNet,
     ChunkGaussianActorNet,
+    ChunkMLPActorNet,
+    DiffusionPolicyConfig,
     ObsHistoryEncoder,
 )
 from rl_modules.marv_rl.marv_rl_cnn_flat_encoder import MarvRLCNNFlatEncoder  # noqa: E402
@@ -99,6 +101,63 @@ check("initial scale is 1.0 everywhere (zero-init output conv, as the baseline h
 check("loc is finite", bool(torch.isfinite(loc).all()))
 check("loc reshapes to [N, T_p, A] — the layout ActionChunkEnv assumes",
       tuple(loc.reshape(8, T_P, ACTION_DIM).shape) == (8, T_P, ACTION_DIM))
+
+# ----------------------------------------------------------------------------------
+# 2b. Ablation head: the baseline's MLP emitting the chunk flat (head="mlp")
+# ----------------------------------------------------------------------------------
+
+# The baseline marv_rl actor's own MLP options (configs/baselines/marv_config_marv_rl.yaml).
+BASELINE_ACTOR_MLP = dict(num_hidden=2, hidden_dim=128, layernorm=False)
+actor_mlp = ChunkMLPActorNet(make_encoder(), ACTION_DIM, T_P, BASELINE_ACTOR_MLP).eval()
+with torch.no_grad():
+    loc_m, scale_m = actor_mlp(torch.randn(8, T_O * OBS_DIM))
+check("mlp head emits loc/scale over the same flattened T_p x A chunk as the U-Net head",
+      tuple(loc_m.shape) == tuple(loc.shape) and tuple(scale_m.shape) == tuple(scale.shape),
+      f"{tuple(loc_m.shape)} / {tuple(scale_m.shape)}")
+check("mlp head loc/scale are finite and scale is positive",
+      bool(torch.isfinite(loc_m).all()) and bool((scale_m > 0).all()))
+check("mlp head loc reshapes to [N, T_p, A]", tuple(loc_m.reshape(8, T_P, ACTION_DIM).shape) == (8, T_P, ACTION_DIM))
+with torch.no_grad():
+    loc_m3, _ = actor_mlp(torch.randn(4, 5, T_O * OBS_DIM))
+check("mlp head keeps leading dims (3-D input -> [envs, time, chunk])",
+      tuple(loc_m3.shape) == (4, 5, T_P * ACTION_DIM), str(tuple(loc_m3.shape)))
+n_unet_head = sum(q.numel() for q in actor.unet.parameters())
+n_mlp_head = sum(q.numel() for q in actor_mlp.mlp.parameters())
+print(f"  INFO  head params: unet {n_unet_head:,}  vs  mlp {n_mlp_head:,}  (ratio {n_unet_head / n_mlp_head:.1f}x)")
+check("the two heads share an identical encoder architecture (only the head differs)",
+      sum(q.numel() for q in actor.encoder.parameters()) == sum(q.numel() for q in actor_mlp.encoder.parameters()))
+
+# Config-level: head="mlp" must build, must refuse without actor_mlp_opts, must reject junk.
+from torchrl.data import Bounded  # noqa: E402
+
+
+class _StubObs:
+    dim = OBS_DIM
+    def get_encoder(self):
+        return MarvRLCNNFlatEncoder(input_dim=OBS_DIM, **ENCODER_OPTS)
+
+
+class _StubEnv:
+    observations = [_StubObs()]
+    action_spec = Bounded(low=-1.0, high=1.0, shape=(1, T_P * ACTION_DIM))
+
+
+_common = dict(actor_optimizer_opts={"lr": 1e-4}, value_optimizer_opts={"lr": 1e-3},
+               value_mlp_opts=dict(num_hidden=2, hidden_dim=256, layernorm=True),
+               prediction_horizon=T_P, history_len=T_O, down_dims=DOWN_DIMS)
+try:
+    w_mlp, groups_mlp, _ = DiffusionPolicyConfig(head="mlp", actor_mlp_opts=BASELINE_ACTOR_MLP, **_common).create(_StubEnv())
+    out_m = w_mlp.get_policy_operator()(TensorDict({"obs_history": torch.randn(3, T_O * OBS_DIM)}, batch_size=[3]))
+    check("DiffusionPolicyConfig(head='mlp') builds and samples an action of the right shape",
+          tuple(out_m["action"].shape) == (3, T_P * ACTION_DIM), str(tuple(out_m["action"].shape)))
+except Exception as e:  # noqa: BLE001
+    check("DiffusionPolicyConfig(head='mlp') builds", False, f"{type(e).__name__}: {e}")
+for bad, label in ((dict(head="mlp"), "head='mlp' without actor_mlp_opts"), (dict(head="bogus"), "head='bogus'")):
+    try:
+        DiffusionPolicyConfig(**bad, **_common).create(_StubEnv())
+        check(f"config rejects {label}", False, "it did not raise")
+    except ValueError:
+        check(f"config rejects {label}", True)
 
 # ----------------------------------------------------------------------------------
 # 3. Critic

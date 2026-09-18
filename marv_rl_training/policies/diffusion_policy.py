@@ -35,7 +35,7 @@ from torchrl.modules import ActorCriticWrapper, NormalParamExtractor, Probabilis
 from marv_rl_training.policies import MLP, PolicyConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
 
-__all__ = ["DiffusionPolicyConfig", "ConditionalUnet1D", "ObsHistoryEncoder"]
+__all__ = ["DiffusionPolicyConfig", "ConditionalUnet1D", "ObsHistoryEncoder", "ChunkMLPActorNet"]
 
 _log = get_terminal_logger("DiffusionPolicy")
 
@@ -299,6 +299,40 @@ class ChunkGaussianActorNet(nn.Module):
         return self.param_extractor(torch.cat([loc, scale_raw], dim=-1))
 
 
+class ChunkMLPActorNet(nn.Module):
+    """obs_history -> MLP -> (loc, scale_raw) over the flattened T_p x A chunk.
+
+    The ABLATION head: the same encoder as ChunkGaussianActorNet, the same TanhNormal over the
+    same flattened chunk, but the FiLM U-Net replaced by a plain MLP -- i.e. the baseline
+    marv_rl policy's own head (actor_mlp_opts: num_hidden 2, hidden_dim 128), widened only at
+    its output from 2A to 2*T_p*A so it emits a whole chunk at once. With head="mlp" the only
+    thing that differs from the U-Net arm is whether the horizon axis is modelled by temporal
+    convolutions conditioned through FiLM, or emitted flat by fully-connected layers that see
+    no structure across the T_p steps at all. Everything the receding-horizon scaffold adds
+    (T_o history, position control, chunked env, macro-step discount) is held fixed, so the
+    difference in success rate is attributable to the U-Net+FiLM head alone.
+
+    Initialisation is PyTorch's default, deliberately matching the U-Net arm rather than the
+    baseline's orthogonal init -- init would otherwise be a second variable.
+    """
+
+    def __init__(self, encoder: ObsHistoryEncoder, action_dim: int, prediction_horizon: int, mlp_opts: dict):
+        super().__init__()
+        self.encoder = encoder
+        self.action_dim = action_dim
+        self.prediction_horizon = prediction_horizon
+        chunk_dim = prediction_horizon * action_dim
+        self.mlp = MLP(in_dim=encoder.output_dim, out_dim=2 * chunk_dim, **mlp_opts)
+        self.param_extractor = NormalParamExtractor()
+
+    def forward(self, obs_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Output layout is [loc (chunk_dim, step-major) | scale_raw (chunk_dim)] -- the same
+        # concatenation ChunkGaussianActorNet hands to the extractor, so the env wrapper's
+        # reshape(N, T_p, A) reads both heads identically. For an MLP the step-major order is
+        # a convention the network learns rather than a structural property.
+        return self.param_extractor(self.mlp(self.encoder(obs_history)))
+
+
 class ChunkCriticNet(nn.Module):
     """obs_history -> its own encoder copy -> MLP -> one state value per macro-step."""
 
@@ -331,6 +365,13 @@ class DiffusionPolicyConfig(PolicyConfig):
         value_mlp_opts: Options for the critic MLP (in/out features come from the encoder).
         actor_optimizer_opts / value_optimizer_opts: Per-param-group optimiser settings.
         obs_history_key: TensorDict key the CatFrames transform writes.
+        head: "unet" (default) -- ChunkGaussianActorNet, the FiLM-conditioned temporal U-Net
+            over the horizon axis. "mlp" -- ChunkMLPActorNet, the ABLATION arm: the same
+            encoder and the same TanhNormal over the same chunk, but a plain MLP emitting the
+            chunk flat. down_dims/kernel_size/n_groups are ignored for "mlp".
+        actor_mlp_opts: MLP options for head="mlp" (num_hidden, hidden_dim, layernorm). Use
+            the baseline marv_rl actor's values so the ablation compares the U-Net against the
+            head the baseline actually runs, not against an arbitrary MLP.
     """
 
     actor_optimizer_opts: dict[str, Any]
@@ -343,8 +384,14 @@ class DiffusionPolicyConfig(PolicyConfig):
     n_groups: int = 8
     extra_distribution_kwargs: dict = field(default_factory=dict)
     obs_history_key: str = "obs_history"
+    head: str = "unet"
+    actor_mlp_opts: dict[str, Any] | None = None
 
     def create(self, env, **kwargs):
+        if self.head not in ("unet", "mlp"):
+            raise ValueError(f"head must be 'unet' or 'mlp', got {self.head!r}")
+        if self.head == "mlp" and not self.actor_mlp_opts:
+            raise ValueError("head='mlp' requires actor_mlp_opts (num_hidden, hidden_dim, layernorm)")
         action_spec = env.action_spec
         chunk_dim = action_spec.shape[-1]
         action_dim = chunk_dim // self.prediction_horizon
@@ -363,14 +410,22 @@ class DiffusionPolicyConfig(PolicyConfig):
             # the per-frame CNN+MLP exactly as it does for the baseline MLP policy.
             return ObsHistoryEncoder(observation.get_encoder(), obs_dim, self.history_len)
 
-        actor_net = ChunkGaussianActorNet(
-            encoder=_build_encoder(),
-            action_dim=action_dim,
-            prediction_horizon=self.prediction_horizon,
-            down_dims=list(self.down_dims),
-            kernel_size=self.kernel_size,
-            n_groups=self.n_groups,
-        )
+        if self.head == "mlp":
+            actor_net = ChunkMLPActorNet(
+                encoder=_build_encoder(),
+                action_dim=action_dim,
+                prediction_horizon=self.prediction_horizon,
+                mlp_opts=dict(self.actor_mlp_opts),
+            )
+        else:
+            actor_net = ChunkGaussianActorNet(
+                encoder=_build_encoder(),
+                action_dim=action_dim,
+                prediction_horizon=self.prediction_horizon,
+                down_dims=list(self.down_dims),
+                kernel_size=self.kernel_size,
+                n_groups=self.n_groups,
+            )
         # A separate encoder instance for the critic — the baseline runs share_encoder: false
         # and we keep that, so the value loss cannot drag the actor's perception around.
         critic_net = ChunkCriticNet(encoder=_build_encoder(), mlp_opts=dict(self.value_mlp_opts))
@@ -408,16 +463,18 @@ class DiffusionPolicyConfig(PolicyConfig):
             if missing_unexpected.unexpected_keys:
                 _log.warning(f"Unexpected keys: {missing_unexpected.unexpected_keys}")
 
+        head_net = actor_net.mlp if self.head == "mlp" else actor_net.unet
         _log.info(
-            "Diffusion policy (Phase 1): T_p=%d T_o=%d action_dim=%d down_dims=%s | "
-            "actor %s params (encoder %s, unet %s), critic %s params",
+            "Diffusion policy (Phase 1): head=%s T_p=%d T_o=%d action_dim=%d %s | "
+            "actor %s params (encoder %s, head %s), critic %s params",
+            self.head,
             self.prediction_horizon,
             self.history_len,
             action_dim,
-            list(self.down_dims),
+            f"actor_mlp_opts={self.actor_mlp_opts}" if self.head == "mlp" else f"down_dims={list(self.down_dims)}",
             f"{count_parameters(actor_net):,}",
             f"{count_parameters(actor_net.encoder):,}",
-            f"{count_parameters(actor_net.unet):,}",
+            f"{count_parameters(head_net):,}",
             f"{count_parameters(critic_net):,}",
         )
         return wrapper, optim_groups, []
