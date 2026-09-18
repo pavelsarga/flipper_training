@@ -42,13 +42,10 @@ from marv_rl_training.training.eval_common import (
 from marv_rl_training.training.terrain_assets import write_terrain_manifest
 from marv_rl_training.training.eval_data import (
     EpisodeRecord,
-    SummaryRow,
-    aggregate_per_env,
-    aggregate_per_spot,
     load_env_type_names,
     make_eval_id,
     run_tracked_rollout,
-    save_eval_csvs,
+    save_repeat,
 )
 from marv_rl_training.training.train_ftr import FtrPPOConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
@@ -155,8 +152,6 @@ def run_eval(
 
     all_results: list[dict[str, float]] = []
     all_episodes: list[EpisodeRecord]   = []
-    all_per_env_rows: list = []
-    all_per_spot_rows: list = []
 
     for r in range(repeats):
         logger.info(f"Running eval rollout {r + 1}/{repeats} (max_steps={max_steps}) ...")
@@ -190,46 +185,12 @@ def run_eval(
         all_episodes.extend(episode_records)
 
         if _output_dir and episode_records:
-            from datetime import datetime, timezone
-            timestamp = datetime.now(timezone.utc).isoformat()
-            summary = SummaryRow(
-                eval_id=_eval_id,
-                policy=_policy_lbl,
-                terrain=_terrain,
-                num_envs=ftr_gym_env.unwrapped.num_envs,
-                num_env_types=num_env_types,
-                repeat=r + 1,
-                timestamp=timestamp,
-                success_rate=results.get("eval/success_rate", float("nan")),
-                failure_rate=results.get("eval/failure_rate", float("nan")),
-                explosion_rate=results.get("eval/explosion_rate", float("nan")),
-                mean_step_reward=results.get("eval/mean_step_reward", float("nan")),
-                shock_mean=results.get("shock/accel_magnitude", float("nan")),
-                shock_p90=results.get("shock/accel_p90", float("nan")),
-                shock_p95=results.get("shock/accel_p95", float("nan")),
-                shock_p99=results.get("shock/accel_p99", float("nan")),
+            save_repeat(
+                _output_dir, results, episode_records,
+                eval_id=_eval_id, policy=_policy_lbl, terrain=_terrain,
+                num_envs=ftr_gym_env.unwrapped.num_envs, num_env_types=num_env_types,
+                env_type_names=_env_names, num_depth_cols=_depth_cols, repeat=r + 1,
             )
-            per_env_rows = aggregate_per_env(
-                episode_records=episode_records,
-                env_type_names=_env_names,
-                eval_id=_eval_id,
-                policy=_policy_lbl,
-                terrain=_terrain,
-                repeat=r + 1,
-                obs_stats=results,
-            )
-            per_spot_rows = aggregate_per_spot(
-                episode_records=episode_records,
-                env_type_names=_env_names,
-                num_depth_cols=_depth_cols,
-                eval_id=_eval_id,
-                policy=_policy_lbl,
-                terrain=_terrain,
-                repeat=r + 1,
-            )
-            all_per_env_rows.extend(per_env_rows)
-            all_per_spot_rows.extend(per_spot_rows)
-            save_eval_csvs(_output_dir, [summary], per_env_rows, per_spot_rows, episode_records)
             logger.info(f"Saved repeat {r+1} CSV → {_output_dir}")
 
     if repeats > 1:

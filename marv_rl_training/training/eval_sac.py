@@ -12,7 +12,6 @@ args, unknown_args, simulation_app = launch_isaac_app(parser)
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
-from datetime import datetime, timezone
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -26,13 +25,10 @@ from marv_rl_training.training.eval_common import exit_flushed, print_results
 from marv_rl_training.training.env_type_registry import default_num_depth_cols, default_num_env_types
 from marv_rl_training.training.terrain_assets import write_terrain_manifest
 from marv_rl_training.training.eval_data import (
-    SummaryRow,
-    aggregate_per_env,
-    aggregate_per_spot,
     load_env_type_names,
     make_eval_id,
     run_tracked_rollout,
-    save_eval_csvs,
+    save_repeat,
 )
 from marv_rl_training.training.train_sac import FtrSACConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
@@ -121,29 +117,12 @@ def run_eval(raw_cfg, ftr_gym_env, max_steps, repeats, output_dir=None, num_env_
                 all_results.append(results)
 
                 if _output_dir and episode_records:
-                    timestamp = datetime.now(timezone.utc).isoformat()
-                    summary = SummaryRow(
+                    save_repeat(
+                        _output_dir, results, episode_records,
                         eval_id=_eval_id, policy=_policy_lbl, terrain=_terrain,
-                        num_envs=ftr_gym_env.unwrapped.num_envs, num_env_types=num_env_types, repeat=r + 1,
-                        timestamp=timestamp,
-                        success_rate=results.get("eval/success_rate", float("nan")),
-                        failure_rate=results.get("eval/failure_rate", float("nan")),
-                        explosion_rate=results.get("eval/explosion_rate", float("nan")),
-                        mean_step_reward=results.get("eval/mean_step_reward", float("nan")),
-                        shock_mean=results.get("shock/accel_magnitude", float("nan")),
-                        shock_p90=results.get("shock/accel_p90", float("nan")),
-                        shock_p95=results.get("shock/accel_p95", float("nan")),
-                        shock_p99=results.get("shock/accel_p99", float("nan")),
+                        num_envs=ftr_gym_env.unwrapped.num_envs, num_env_types=num_env_types,
+                        env_type_names=_env_names, num_depth_cols=_depth_cols, repeat=r + 1,
                     )
-                    per_env_rows = aggregate_per_env(
-                        episode_records=episode_records, env_type_names=_env_names, eval_id=_eval_id,
-                        policy=_policy_lbl, terrain=_terrain, repeat=r + 1, obs_stats=results,
-                    )
-                    per_spot_rows = aggregate_per_spot(
-                        episode_records=episode_records, env_type_names=_env_names, num_depth_cols=_depth_cols,
-                        eval_id=_eval_id, policy=_policy_lbl, terrain=_terrain, repeat=r + 1,
-                    )
-                    save_eval_csvs(_output_dir, [summary], per_env_rows, per_spot_rows, episode_records)
                     logger.info(f"Saved repeat {r + 1} CSV -> {_output_dir}")
     finally:
         ftr_torchrl_env.disable_per_env_tracking()

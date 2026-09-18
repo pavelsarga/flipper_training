@@ -181,6 +181,52 @@ def save_eval_csvs(
     _append_rows(output_dir / "eval_episodes.csv",  episode_records, EpisodeRecord)
 
 
+def save_repeat(
+    output_dir: Path,
+    results: dict[str, float],
+    episode_records: list[EpisodeRecord],
+    *,
+    eval_id: str,
+    policy: str,
+    terrain: str,
+    num_envs: int,
+    num_env_types: int,
+    env_type_names: list[str],
+    num_depth_cols: int,
+    repeat: int,
+) -> None:
+    """Write one eval repeat's summary, per-env, per-spot and episode CSV rows.
+
+    Every eval entry point does exactly this after each repeat; the only per-script input is
+    what produced ``results`` and ``episode_records``.
+    """
+    from datetime import datetime, timezone
+
+    nan = float("nan")
+    summary = SummaryRow(
+        eval_id=eval_id, policy=policy, terrain=terrain,
+        num_envs=num_envs, num_env_types=num_env_types, repeat=repeat,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        success_rate=results.get("eval/success_rate", nan),
+        failure_rate=results.get("eval/failure_rate", nan),
+        explosion_rate=results.get("eval/explosion_rate", nan),
+        mean_step_reward=results.get("eval/mean_step_reward", nan),
+        shock_mean=results.get("shock/accel_magnitude", nan),
+        shock_p90=results.get("shock/accel_p90", nan),
+        shock_p95=results.get("shock/accel_p95", nan),
+        shock_p99=results.get("shock/accel_p99", nan),
+    )
+    per_env_rows = aggregate_per_env(
+        episode_records=episode_records, env_type_names=env_type_names,
+        eval_id=eval_id, policy=policy, terrain=terrain, repeat=repeat, obs_stats=results,
+    )
+    per_spot_rows = aggregate_per_spot(
+        episode_records=episode_records, env_type_names=env_type_names, num_depth_cols=num_depth_cols,
+        eval_id=eval_id, policy=policy, terrain=terrain, repeat=repeat,
+    )
+    save_eval_csvs(output_dir, [summary], per_env_rows, per_spot_rows, episode_records)
+
+
 def save_per_spot_csv(csv_path: Path, per_spot_rows: list[PerSpotRow]) -> None:
     """Append *per_spot_rows* to a single local CSV file (not sent to wandb)."""
     csv_path.parent.mkdir(parents=True, exist_ok=True)
