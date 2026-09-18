@@ -5,7 +5,6 @@ Imported by eval_ftr.py and eval_ftr_rand.py (no Isaac Sim / omni imports here).
 from __future__ import annotations
 
 import csv
-import os
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path

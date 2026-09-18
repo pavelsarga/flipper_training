@@ -20,7 +20,7 @@ Flipper synchronisation (sync_flippers=True in policy_opts):
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn

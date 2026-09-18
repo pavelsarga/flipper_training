@@ -45,7 +45,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from marv_rl_training.training.ftr_heightmap_window import HM_COLS, HM_RES, HM_ROWS, ftr_heightmap_window
+from marv_rl_training.training.ftr_heightmap_window import HM_RES, ftr_heightmap_window
 from marv_rl_training.utils.logutils import get_terminal_logger
 
 # ftr_env.py's MARV default (env.track_wheel_radius): converts the raw elevation map into

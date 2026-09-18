@@ -52,7 +52,6 @@ import marv_rl_training  # noqa: F401 — registers OmegaConf resolvers
 
 from rl_modules.hfcil.hfcil_policy import HFCILClassifier
 from rl_modules.hfc.hfc_policy import HFCTerrainStateEncoder
-from rl_modules.hfc import hfc_policy as _hfc
 from rl_modules.hfcil.hfcil_transitions import (
     LEGAL_SUCCESSORS,
     NUM_STATES,

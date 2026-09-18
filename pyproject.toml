@@ -3,86 +3,35 @@ requires = ["setuptools>=64.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flipper_training"
-version = "1.0"
-authors = [{ name="David Korcak", email="david.korcak@gmail.com" }]
-description = "Physics engine and training environment for the robot control"
+name = "marv_rl_training"
+version = "2.0"
+description = "Training, evaluation and ROS2 deployment of flipper-control policies for the MARV tracked rover"
+requires-python = ">=3.10"
+# The runtime environment is the Isaac Lab conda env built by containers/isaaclab.def from
+# containers/environment.yml (workspace root); that is where versions are pinned. This list
+# names what the package imports so it can be installed into that env in editable mode.
 dependencies = [
-    # Core dependencies
-    "torch==2.9.1",
-    "torchvision==0.24.1",
-    "torchrl==0.8.1",
-    "tensordict==0.8.3",
-    
-    # 3D graphics and mesh processing
-    "trimesh==4.6.6",
-    "pyvista==0.44.2",
-    "pyacvd==0.3.2",
-    "vtk==9.3.1",
-    
-    # Visualization
-    "matplotlib==3.10.1",
-    "plotly==6.0.1",
-    "plotly-express==0.4.1",
-    
-    # Configuration and utilities
-    "omegaconf==2.3.0",
-    "pyyaml==6.0.3",
-    "tqdm==4.67.1",
-    "natsort==8.4.0",
-    "einops==0.8.1",
-    
-    # ML/DL utilities
-    "numpy==2.3.5",
-    "tensorboard==2.11.2",
-    "wandb==0.19.1",
-    "optuna==4.3.0",
-    
-    # Development tools
-    "pytest==8.3.4",
-    "ipython==8.32.0",
-    "jupyter==1.1.1",
-    
-    # CLI and formatting
-    "rich==14.0.0",
-    "lovely-tensors==0.1.18",
-    
-    # External dependencies
-    "simview @ git+https://github.com/aleskucera/simview.git@823cfe40e0ade8e52b91239de840e287d1e94d13",
-    
-    # Required transitive dependencies
-    "pillow==12.0.0",
-    "scipy==1.15.2",
-    "networkx==3.6.1",
-    "packaging==25.0",
-    "filelock==3.20.1",
-    "jinja2==3.1.6",
-    "fsspec==2025.12.0",
-    "sympy==1.14.0",
-    "typing-extensions==4.15.0",
-    "markupsafe==3.0.3",
-    "pyparsing==3.2.3",
-    "python-dateutil==2.9.0.post0",
-    "six==1.17.0",
-    "certifi==2025.11.12",
-    "charset-normalizer==3.4.1",
-    "idna==3.11",
-    "urllib3==2.3.0",
-    "requests==2.32.3",
-    "pydantic==2.7.1",
-    "pydantic-core==2.18.2",
-    "click==8.3.1",
-    "setuptools==80.9.0",
-    "protobuf==3.20.3",
+    "torch",
+    "torchrl",
+    "tensordict",
+    "gymnasium",
+    "omegaconf",
+    "numpy",
+    "scipy",
+    "pyyaml",
+    "tqdm",
+    "rich",
+    "matplotlib",
+    "wandb",
+    "optuna",
+    "lovely-tensors",
 ]
-
-
-[project.scripts]
-flipper_policy_node = "flipper_training.ros2.flipper_policy_node:main"
-send_goal = "flipper_training.ros2.send_goal:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["marv_rl_training*"]
 
-[tool.ty.environment]
-python = ".venv"
+[tool.ruff]
+line-length = 150
+extend-select = ["E", "F", "Q", "B"]
+extend-exclude = ["*.ipynb"]

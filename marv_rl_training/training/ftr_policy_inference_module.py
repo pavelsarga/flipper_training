@@ -106,8 +106,7 @@ class FtrPolicyInferenceModule:
         self.cfg = OmegaConf.load(config_path)
 
         # FtrEnvCfg.flipper_pos_max_deg's real default is 90.0 (ftr_env.py) — none of the
-        # deployed marv_rl configs override it, so this must match, not the generic 60.0
-        # some other observation classes (e.g. ftr_compat_obs.py) default to.
+        # deployed marv_rl configs override it, so this must match.
         self.joint_limit = float(
             np.deg2rad(self.cfg.env_cfg_overrides.get("flipper_pos_max_deg", 90.0))
         )

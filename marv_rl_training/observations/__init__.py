@@ -4,10 +4,7 @@ from typing import TYPE_CHECKING, ClassVar, Callable
 from functools import wraps
 
 import torch
-from tensordict import TensorDict
 from torchrl.data import Bounded, Composite, Unbounded
-
-from marv_rl_training.engine.engine_state import PhysicsState, PhysicsStateDer
 
 if TYPE_CHECKING:
     from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
@@ -47,24 +44,6 @@ class Observation(ABC):
         Name of the observation generator.
         """
         return self.__class__.__name__
-
-    @abstractmethod
-    def __call__(
-        self, prev_state: PhysicsState, action: torch.Tensor, prev_state_der: PhysicsStateDer, curr_state: PhysicsState
-    ) -> torch.Tensor | TensorDict:
-        """
-        Generate observations from the current state of the environment.
-
-        Args:
-            prev_state (PhysicsState): The previous state of the environment.
-            action (torch.Tensor): The action taken in previous state.
-            prev_state_der (PhysicsStateDer): The derivative of the previous state.
-            curr_state (PhysicsState): The current state of the environment.
-
-        Returns:
-            The observation tensor.
-        """
-        pass
 
     @abstractmethod
     def get_spec(self) -> Bounded | Unbounded | Composite:

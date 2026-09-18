@@ -1,248 +1,206 @@
-# CLAUDE.md
+# marv_rl_training
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Training, evaluation and ROS2 deployment of flipper-control policies for the MARV tracked
+rover. The simulator is the sibling `FTR-Benchmark` submodule (Isaac Sim / IsaacLab); this
+package wraps its env in TorchRL and holds the trainers, evaluators and the deployment nodes.
+The workspace root's README documents how to launch things; this file documents the package.
 
-## Overview
+This is a fork of David Korčák's `flipper_training`. The differentiable physics engine, the
+procedural heightmap generators and the MPPI/grad experiments it was built around are gone —
+everything here runs against Isaac Sim through `FtrTorchRLEnv`.
 
-Flipper Training is a differentiable physics-based reinforcement learning framework for training tracked rover locomotion with flipper actuators. It provides a PyTorch-native physics engine, TorchRL-based environments, and multiple training paradigms (PPO, gradient-based, MPPI).
-
-## Build and Development Commands
-
-```bash
-# Install dependencies (using UV package manager)
-uv sync
-
-# Run code formatting and linting (Ruff via pre-commit)
-pre-commit run --all-files
-
-# Run tests
-pytest tests/
-
-# Run a specific test
-pytest tests/utils/test_environment.py::test_heightmap_gradients
-```
-
-## Training and Evaluation
-
-```bash
-# Train with PPO using a config file
-python -m flipper_training.experiments.ppo.train --local test_configs/deterministic_flats_debug.yaml
-
-# Evaluate a trained model from local run directory
-python -m flipper_training.experiments.ppo.eval --local runs/ppo/<run_name>
-
-# Evaluate from W&B run
-python -m flipper_training.experiments.ppo.eval --wandb <wandb_run_name>
-
-# Override config values via CLI
-python -m flipper_training.experiments.ppo.train --local config.yaml num_robots=64 device=cuda:0
-```
-
-## Deploying Policy for Gazebo/ROS2
-
-Key files:
-- **ROS2 node**: `ros2/flipper_policy_node.py`
-- **Launch file**: `ros2/flipper_policy.launch.py`
-- **Goal sender utility**: `ros2/send_goal.py`
-- **Jupyter notebook**: `notebooks/ppo_policy_inference.ipynb`
-- **Policy inference module**: `flipper_training/experiments/ppo/policy_inference_module.py`
-- **Pretrained weights**: `modified_networks/top_3_averaged/` (policy.pth, vecnorm.pth)
-
-### Running the ROS2 Node
-
-```bash
-# Using launch file
-ros2 launch ros2/flipper_policy.launch.py \
-    config_path:=/path/to/config.yaml \
-    policy_weights_path:=/path/to/policy.pth \
-    vecnorm_weights_path:=/path/to/vecnorm.pth \
-    device:=cuda:0
-
-# Direct execution
-python ros2/flipper_policy_node.py --ros-args \
-    -p config_path:=/path/to/config.yaml \
-    -p policy_weights_path:=/path/to/policy.pth
-
-# Send goal to the policy node
-python ros2/send_goal.py <x> <y>   # World frame coordinates
-```
-
-### ROS2 Node Topics
-
-**Subscribed:**
-- `/ground_truth_odom` (nav_msgs/Odometry) - Robot pose and velocity
-- `/joint_state` (sensor_msgs/JointState) - Flipper joint angles
-- `/elevation_map` (grid_map_msgs/GridMap) - Elevation map from mapping
-- `/goal_pose` (geometry_msgs/PoseStamped) - Goal position in world frame
-
-**Published:**
-- `/cmd_vel` (geometry_msgs/Twist) - Track velocity commands
-- `/flippers_cmd_pos/{front_left,front_right,rear_left,rear_right}` (std_msgs/Float64) - Flipper position commands
-
-### Node Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `config_path` | required | Path to training config YAML |
-| `policy_weights_path` | required | Path to policy weights (.pth) |
-| `vecnorm_weights_path` | "" | Path to vecnorm weights (optional) |
-| `device` | "cpu" | Inference device (cpu/cuda:N) |
-| `control_rate` | 10.0 | Control loop rate (Hz) |
-| `heightmap_decay` | 0.95 | Temporal decay for heightmap smoothing |
-| `heightmap_layer` | "elevation" | GridMap layer name |
-| `flipper_velocity_scale` | 1.0 | Scale factor for flipper velocities |
-
-### Flipper Angle Conventions
-
-- **Angle 0**: Flipper is horizontal
-- **Negative rotational velocity**: Front flippers rotate **up**, rear flippers rotate **down**
-
-| Flipper | Fully Up | Fully Down |
-|---------|----------|------------|
-| Front   | -π/2     | +π/2       |
-| Rear    | +π/2     | -π/2       |
-
-Clamp input angles from ROS to this interval.
-
-### Policy Input State Vector
-
-1. **Goal vector**: Direction to goal in base_link frame (meters)
-2. **Linear velocity**: In m/s
-3. **Angular velocity** (twist): In rad/s
-4. **Flipper angles**: In radians, using the convention above
-5. **Quaternion**: ROS convention (x, y, z, w) relative to gravity vector (used internally to extract roll/pitch)
-
-### Heightmap Input
-
-- **Resolution**: 64×64 (higher resolution accepted - resampled internally)
-- **Physical extent**: [1, 1] (top-left) to [-1, -1] (bottom-right)
-- **Orientation**: As if standing behind the robot looking forward, then leaning over it. Objects **in front** of the robot should be in the **upper part** of the heightmap.
-
-Debug with `plt.imshow(heightmap)` to verify correct front/back orientation.
-
-### Policy Output Actions
-
-8 values total:
-1. **4 track velocities**: In m/s (+1 = forward, -1 = backward)
-2. **4 flipper rotational velocities**: Sign convention as described above
-
-### Operational Recommendation
-
-Set a slow temporal decay on the heightmap in production to prevent accumulation/smearing over time.
-
-## Architecture
-
-### Core Components
-
-**Physics Engine** (`flipper_training/engine/`)
-- `engine.py`: Main differentiable physics engine (PyTorch tensors, ~14K lines)
-- `engine_warp.py`: Alternative NVIDIA Warp GPU-accelerated implementation
-- `engine_state.py`: `PhysicsState` and `PhysicsStateDer` dataclasses
-
-**Environment** (`flipper_training/environment/`)
-- `env.py`: TorchRL `EnvBase` implementation with batch-locked vectorized simulation
-- `transforms.py`: Observation/reward transforms compatible with TorchRL
-
-**Factory Pattern for Composable Components**
-- `observations/__init__.py` → `ObservationFactory` interface
-- `rl_rewards/__init__.py` → `RewardFactory` interface
-- `rl_objectives/__init__.py` → `ObjectiveFactory` interface
-- `heightmaps/__init__.py` → `HeightmapGenerator` interface
-
-**Policy Networks** (`flipper_training/policies/`)
-- MLP, GRU, LSTM architectures with GSDE distribution variants
-- All implement `PolicyConfig` with `create()` method returning actor-value wrapper
-
-### Configuration System
-
-YAML configs use OmegaConf with custom resolvers defined in `flipper_training/__init__.py`:
-
-```yaml
-# Arithmetic
-total_frames: ${mul:5242880,6}          # 31457280
-batch_ratio: ${div:128,64}              # 2.0
-
-# Class instantiation (dynamically loads classes)
-heightmap_gen: ${cls:flipper_training.heightmaps.trunks.TrunkHeightmapGenerator}
-optimizer: ${cls:torch.optim.AdamW}
-
-# PyTorch types
-training_dtype: ${dtype:float32}        # torch.float32
-start_pos: ${tensor:[-1.5, 0.0, 0.2]}   # torch.tensor(...)
-```
-
-### Data Flow
+## Layout
 
 ```
-YAML Config
-    ↓
-PPOExperimentConfig (dataclass)
-    ↓
-┌───────────────────────────────────────┐
-│ Environment (Env)                      │
-│  ├─ ObservationFactory → observations │
-│  ├─ RewardFactory → reward signal     │
-│  ├─ ObjectiveFactory → task logic     │
-│  ├─ TerrainConfig → heightmap grids   │
-│  └─ PhysicsEngine → differentiable sim│
-└───────────────────────────────────────┘
-    ↓
-TorchRL Collector → Policy → Training Loop
+marv_rl_training/
+  __init__.py            OmegaConf resolvers (below), ROOT / PACKAGE_ROOT
+  environment/
+    ftr_env_adapter.py   FtrTorchRLEnv: TorchRL EnvBase over the Isaac gymnasium env. Picks
+                         the observation class from env_cfg_overrides.module_name, owns the
+                         termination / reward / state stats the trainers and evals drain
+    chunked_env.py       ActionChunkEnv for the receding-horizon (diffusion) trainer
+    transforms.py        RawRewardSaveTransform
+  observations/          Observation / ObservationEncoder base classes and HeightmapEncoder.
+                         The concrete observations live in FTR-Benchmark/rl_modules; they are
+                         populated directly by FtrTorchRLEnv._step / _reset
+  policies/              PolicyConfig base, MLP actor-critic, random baseline,
+                         heuristic heightmap policy, diffusion policy + DPPO
+  utils/
+    logutils.py          RunLogger (run dir, CSV/W&B/TensorBoard, SLURM attempt_N layout,
+                         candidate_weight_dirs for resume), LocalRunReader / WandbRunReader
+    cfg_schedulers.py    linear schedulers that write into a config field (step penalty, epsilon)
+    torch_utils.py       seed_all, set_device
+  training/
+    cli.py               launch_isaac_app + the shared argument parsers. Import first: it is
+                         the one thing that may run before AppLauncher
+    env_setup.py         require_cuda / import_ftr_tasks / build_ftr_gym_env
+    entrypoint.py        resolve_train_config (--play, SLURM respawn) and run_trainer
+    common.py            make_transformed_env (StepCounter, VecNorm, extra transforms)
+    trainer_common.py    eval aggregation and fatal-error test shared by the trainers
+    eval_common.py       rollout loops, result printer, exit_flushed
+    eval_data.py         run_tracked_rollout, per-env / per-spot aggregation, CSV writers
+    env_type_registry.py terrain layout (rows, depth columns) from gen_config
+    terrain_assets.py    write_terrain_manifest
+    train_ftr.py         PPO (FtrPPOConfig / FtrPPOTrainer) — marv_rl, hfc, mitriakov
+    train_d3qn.py        AT-D3QN (FtrD3QNConfig / FtrD3QNTrainer)
+    train_icmd3qn.py     ICM-D3QN — subclass of the above through its aux-module hooks
+    train_sac.py         C-TRAC: asymmetric SAC + C-VAE (FtrSACConfig / FtrSACTrainer)
+    train_creps.py       CREPS (FtrCREPSConfig / FtrCREPSTrainer)
+    train_diffusion.py   receding-horizon diffusion policy
+    train_hfcil.py       supervised pretraining for the HFC imitation variant
+    eval_ftr.py, eval_d3qn.py, eval_sac.py, eval_creps.py, eval_diffusion.py
+    eval_ftr_rand.py     random-policy baseline
+    optuna_train_ftr.py, optuna_eval_rand.py, eval_optuna_top.py, recover_optuna_trials.py
+    collect_ctrac_dataset.py / pretrain_ctrac_cvae.py     C-TRAC Stage I
+    collect_chunk_dataset.py / pretrain_diffusion_bc.py   diffusion BC pretraining
+    *_policy_inference_module.py   config + weights -> callable policy, for the ROS nodes
+    replay_buffer_io.py  partial replay-buffer persistence across SLURM respawns
+    test_*.py            shape / env unit tests (pytest, need the isaaclab env)
+ros2/                    deployment nodes (below)
+launch/                  ros2 launch file for flipper_policy_node
 ```
 
-### Key Dataclasses with `.to(device)` Pattern
+## Entry-point structure
 
-Configs in `flipper_training/configs/` inherit from `BaseConfig` which provides automatic tensor device movement:
+Every `train_*.py` / `eval_*.py` has the same shape, and the order matters:
 
 ```python
-terrain_config.to(device)  # Moves all tensor fields to device
-physics_config.to(device)
-robot_model.to(device)
+# BLOCK 1 — nothing that imports omni.* may run before this
+from marv_rl_training.training.cli import launch_isaac_app, train_arg_parser
+if __name__ == "__main__":
+    parser = train_arg_parser("...", play=True)
+    args, unknown_args, simulation_app = launch_isaac_app(parser)
+
+# BLOCK 2 — everything else; Isaac Sim is running now
+...
+
+if __name__ == "__main__":
+    raw_cfg = resolve_train_config(args, unknown_args)
+    require_cuda(); import_ftr_tasks()
+    ftr_gym_env = build_ftr_gym_env(FtrXConfig(**raw_cfg))
+    run_trainer(FtrXTrainer, raw_cfg, ftr_gym_env)
+    exit_flushed()
 ```
 
-## Directory Structure
+- The `if __name__` guard around the launcher is load-bearing: the eval scripts import their
+  config dataclass from the trainer module, and an unguarded launcher would start a second
+  Isaac Sim app on import.
+- `unknown_args` is the OmegaConf dotlist merged on top of the config. `launch_isaac_app`
+  strips leftover `--flag value` pairs first — AppLauncher reads some of its own flags
+  straight out of `sys.argv` without removing them, and they crash `OmegaConf.from_dotlist`.
+- Exit through `exit_flushed()` / `os._exit`, never `sys.exit`: Isaac Sim's shutdown
+  re-initialises GPU foundation and regularly deadlocks, which holds a SLURM slot for hours.
+  `exit_flushed` flushes stdout first, because a redirected stdout is block-buffered and
+  `os._exit` alone discards the whole results summary.
+- Exit code 75 means "transient, respawn me" to `slurm/lib/respawn_common.sh`; it is what
+  the trainers use for a dead CUDA context or a W&B transport failure. Anything else is a
+  real failure and exits 1.
 
-```
-flipper_training/
-├── configs/           # Dataclass configs (engine, robot, terrain)
-├── engine/            # Differentiable physics simulation
-├── environment/       # TorchRL Env implementation
-├── experiments/       # Training pipelines
-│   ├── ppo/          # PPO training/eval (main entry points)
-│   ├── grad/         # Gradient-based control
-│   └── mppi/         # Model Predictive Path Integral
-├── heightmaps/        # Procedural terrain generators
-├── observations/      # Observation vector builders
-├── policies/          # Neural network architectures
-├── rl_objectives/     # Task definitions (barrier, stairs, trunk crossing)
-├── rl_rewards/        # Reward function implementations
-├── utils/             # Geometry, mesh processing, logging
-└── vis/               # SimView visualization integration
+The config dataclasses are not interchangeable — `FtrPPOConfig` rejects
+`replay_buffer_capacity`, `FtrD3QNConfig` rejects `icm_opts`, and so on — so the trainer and
+evaluator must match the config. `scripts/lib/config_detect.sh` encodes the mapping (from
+`env_cfg_overrides.module_name`, except that a config with top-level
+`prediction_horizon` + `execution_horizon` is a diffusion run whatever its module_name says).
 
-test_configs/          # Training config examples
-sota_configs/          # State-of-the-art model configs
-robots/                # Robot YAML parameter files
-meshes/                # Robot mesh files (STL/OBJ)
-modified_networks/     # Pretrained weights (top_3_averaged/, transferred_with_preference/)
-ros2/                  # ROS2 deployment (flipper_policy_node.py, send_goal.py, launch file)
-notebooks/             # Jupyter notebooks (including policy inference demo)
-```
+## Resume across SLURM respawns
 
-## Code Style
+`RunLogger` writes `logs/<job_name>_<job_id>/attempt_N/` under SLURM. On a respawn the
+trainer searches `RunLogger.candidate_weight_dirs()` (this attempt, then earlier ones) for
+`policy_crash.pth` / `vecnorm_crash.pth`, else the latest `policy_step_<frames>.pth` pair,
+then restores `training_state.pth` — optimizer, LR scheduler, the config schedulers and the
+frame counter — from `_restore_training_state()` at the *end* of `__init__`, once everything
+it writes into exists. Consequence: `collected_frames` and the `policy_step_*` names are
+cumulative across attempts on runs that resumed.
 
-- Line length: 150 characters
-- Formatter/Linter: Ruff with rules E, F, Q, B, S
-- Python version: 3.12
+`FtrD3QNTrainer` extends this through `_build_aux_modules` / `_build_aux_optimizers`: an aux
+module is saved as `<name>_{crash,step_N,final}.pth` beside the policy and its optimizer goes
+into `training_state.pth`. That is how ICM-D3QN's curiosity module rides along.
 
-## Key Patterns
+`FtrSACTrainer` is different: SAC's `loss_module.state_dict()` is the only state that carries
+the SoftUpdate targets and `log_alpha`, so that is what it checkpoints, and it persists the
+replay buffer as well (memmapped once per job, shared by all attempts). See the workspace
+README's C-TRAC section for why each of those was necessary.
 
-**Vectorized Batch Simulation**: All physics and environment code operates on batched tensors `[num_robots, ...]` for GPU parallelism (typically 128-256 robots).
+## Config resolvers
 
-**Engine Compilation**: The physics engine supports TorchDynamo compilation with Triton CUDA graphs for performance:
+Registered in `marv_rl_training/__init__.py`; importing the package is what makes them
+available, which is why every entry point has `import marv_rl_training`:
+
 ```yaml
-engine_compile_opts:
-  max-autotune: true
-  triton.cudagraphs: true
+total_frames: ${mul:5242880,6}                          # add / mul / div / intdiv / pow
+optimizer:    ${cls:torch.optim.AdamW}                  # dotted path -> class
+training_dtype: ${dtype:float32}                        # torch.float32
+start_pos:    ${tensor:[-1.5, 0.0, 0.2]}                # torch.tensor
 ```
 
-**Curriculum Learning**: Objectives support `state_dict()`/`load_state_dict()` for saving/restoring curriculum state.
+## Observation and encoder conventions
+
+`env_cfg_overrides.module_name` selects both the FTR-Benchmark reward module *and* the
+observation class `FtrTorchRLEnv` builds (`ftr_env_adapter.py`). Observations declare
+`supports_vecnorm`; `make_transformed_env` normalises exactly those keys.
+
+Checkpoints from the original flipper_training have encoder weights under
+`encoders.LocalStateVector.*` / `encoders.Heightmap.*`; this package's single
+`MarvRLFlatObservation` + `FtrFlipperStyleEncoder` puts them under
+`encoders.MarvRLFlatObservation.{state_encoder,cnn}.*`. `eval_common.remap_native_to_ftr_weights`
+does the rename, and `mlp_policy.py` also maps the intermediate `encoders.FtrFlatObservation.*`
+spelling.
+
+## ROS2 deployment
+
+`ros2/flipper_policy_node.py` runs a trained `marv_rl` / `hfc` policy on the robot;
+`ros2/mitriakov_policy_node.py` runs the Mitriakov step-edge baseline. `ros2/send_goal.py`
+publishes a goal; `launch/flipper_policy.launch.py` wires the first node up from a run
+directory (`run_dir:=...`, optional `policy_filename:=`).
+
+```bash
+ros2 launch flipper_training flipper_policy.launch.py run_dir:=/path/to/logs/train_ftr_<id> device:=cuda:0
+python ros2/send_goal.py <x> <y>          # world frame
+```
+
+Subscribed: `/ground_truth_odom` (Odometry), `/imu/data` (Imu), `/joint_state` (JointState),
+`/elevation_map` (GridMap), `/goal_pose` and `/goal_reset` (PoseStamped), `/flipper_override`
+(Bool). Published: `/cmd_vel` (Twist), `/flippers_cmd_{vel,pos,pos_rel}/{front,rear}_{left,right}`
+(Float64), and the `/policy_*` debug topics (heightmap cloud/grid/image, action array, RViz
+markers, the flipper-command HUD image).
+
+Node parameters: `config_path`, `policy_weights_path`, `vecnorm_weights_path` (required for a
+run; the launch file derives them from `run_dir`), `device`, `control_rate` (10 Hz),
+`heightmap_decay` (0.95 — keep a slow decay in production so the map does not smear),
+`heightmap_layer`, `flipper_velocity_scale`, `track_velocity_scale`, `publish_cmd_vel`,
+`disable_turning`, `auto_goal_on_release` / `auto_goal_ahead_m`.
+
+### Flipper angle conventions
+
+- Angle 0 is horizontal. Negative rotational velocity moves the **front** flippers up and the
+  **rear** flippers down.
+
+| flipper | fully up | fully down |
+|---|---|---|
+| front | −π/2 | +π/2 |
+| rear | +π/2 | −π/2 |
+
+Clamp angles coming from ROS to those intervals. MARV's enforced limits are asymmetric
+(front −90/+80°, rear −80/+90° in the D3QN configs), which is why the D3QN observations
+normalise by the limits actually enforced rather than by a symmetric constant.
+
+### Policy inputs and outputs
+
+State vector: goal direction in `base_link` (m), linear velocity (m/s), angular velocity
+(rad/s), flipper angles (rad, convention above), orientation quaternion (x, y, z, w — roll and
+pitch are extracted from it).
+
+Heightmap: 64×64 (a finer map is resampled), extent `[1, 1]` (top-left) to `[−1, −1]`
+(bottom-right), oriented as if standing behind the robot and leaning over it — terrain in
+front of the robot is in the upper rows. Check with `plt.imshow(heightmap)`.
+
+Action: 4 track velocities (m/s, +1 forward) followed by 4 flipper rotational velocities.
+
+## Notes
+
+- Nothing configures a handler for the `ftr_envs.*` loggers on the eval path; only the
+  `marv_rl_training` loggers reach stdout there. Use `print(..., flush=True)` in FTR-Benchmark
+  code for anything that must be seen during eval.
+- The unit tests need the isaaclab conda env:
+  `apptainer exec containers/isaaclab_optuna.sif conda run -n isaaclab python -m pytest src/flipper_training/marv_rl_training/training/`.
+- Line length 150, ruff rules E/F/Q/B (`pyproject.toml`).
