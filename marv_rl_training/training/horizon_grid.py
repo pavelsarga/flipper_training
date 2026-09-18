@@ -47,10 +47,30 @@ def load_axes(optuna_config: str | Path) -> dict[str, list[Any]]:
     return {k: (list(v) if t == "categorical" else [True, False]) for k, t, v in zip(keys, types, values)}
 
 
+def feasible(point: dict[str, Any]) -> bool:
+    """The two constraints the receding-horizon scaffold imposes, when both axes are present.
+
+    prediction_horizon >= execution_horizon: ActionChunkEnv executes the first T_a steps of a
+    T_p-step chunk, so a chunk shorter than what is executed cannot exist.
+    prediction_horizon even: ConditionalUnet1D halves the horizon once per level below the
+    first; with the [64,128] head that is one halving, so T_p must divide by 2 (T_p=4..32 all
+    do -- the check is here so a future odd axis value fails loudly at grid time, not one
+    GPU-day into the study).
+    """
+    tp, ta = point.get("prediction_horizon"), point.get("execution_horizon")
+    if tp is not None and ta is not None and tp < ta:
+        return False
+    if tp is not None and tp % 2 != 0:
+        return False
+    return True
+
+
 def grid_points(optuna_config: str | Path) -> list[dict[str, Any]]:
+    """Product of the axes, minus infeasible points, in a fixed order (first axis slowest)."""
     axes = load_axes(optuna_config)
     keys = list(axes)
-    return [dict(zip(keys, combo)) for combo in itertools.product(*(axes[k] for k in keys))]
+    pts = [dict(zip(keys, combo)) for combo in itertools.product(*(axes[k] for k in keys))]
+    return [pt for pt in pts if feasible(pt)]
 
 
 def point_for_task(optuna_config: str | Path, task_id: int) -> dict[str, Any]:
