@@ -203,7 +203,79 @@ class DPPOPerStepClipLoss(DPPOClipLoss):
     Formulation: the denoising chain is an MDP whose intermediate transitions carry zero
     reward, so every denoising step shares the environment advantage. The objective is the
     mean over steps of the usual clipped surrogate.
+
+    Per-step clipping alone was not enough in practice: diff_p2_fresh (flat lr 1e-4) sat at
+    2 of 64 optimiser updates per iteration for its entire 42M-frame life, and diff_p2_v2 (an
+    LR warmup meant to fix that) still never exceeded 2/64 across 24 iterations while its
+    measured KL climbed 0.24 -> 1.46 as the ramp raised the LR -- i.e. the throttle was not a
+    tuning problem, every denoising step was being clipped equally hard regardless of how
+    much a given step's error actually deserved it. ``step_weighting="snr"`` (see
+    DiffusionSchedule.step_snr) reweights each step's contribution to both the objective AND
+    the measured KL by its signal-to-noise ratio, so the early, high-noise steps -- where
+    ddim_step's 1/sqrt(a_k) reconstruction amplifies a fixed eps_theta error the most -- stop
+    dominating a metric that a handful of well-behaved late steps used to share equally with
+    them. This is a soft reweighting, not the DPPO paper's harder "train only the last K_ft
+    steps": every step keeps a nonzero weight (via ``snr_weight_cap``), so RL can still move
+    the noisy end of the chain, just proportionally less per unit of its apparent KL.
     """
+
+    def __init__(self, *args, step_weighting: str = "uniform", snr_weight_cap: float | None = 5.0,
+                 sigma2_weight_floor: float | None = 0.15, **kwargs):
+        super().__init__(*args, **kwargs)
+        if step_weighting not in ("uniform", "snr", "sigma2"):
+            raise ValueError(f"step_weighting must be 'uniform', 'snr' or 'sigma2', got {step_weighting!r}")
+        self.step_weighting = step_weighting
+        self.snr_weight_cap = snr_weight_cap
+        self.sigma2_weight_floor = sigma2_weight_floor
+        self._step_weights = None  # lazily built on first forward(): needs actor_network.schedule
+
+    def _get_step_weights(self, K: int, device, dtype) -> torch.Tensor:
+        """[K] weights, mean 1 (so sum == K and the weighted mean stays on the same scale a
+        plain ``.mean()`` over K uniform-weight-1 steps already had -- target_kl's threshold
+        does not need to change units as step_weighting changes).
+
+        ``"snr"`` (weight by SNR, i.e. weight the near-clean, high-SNR steps UP) was the first
+        attempt and measurably backfired: on this schedule sigma falls monotonically as SNR
+        rises, so the near-clean step is both the highest-SNR AND the lowest-sigma (most
+        log-prob-sensitive) one, and weighting it up amplified exactly the step already
+        dominating the throttle (diff_p2_v3: kl_step_last ~100x kl_step_first, and weighting
+        by SNR pushed the measured kl_approx ABOVE the unweighted raw quantity). Kept only as
+        a documented negative result -- do not default new configs to it.
+
+        ``"sigma2"`` is the corrected scheme: weight each step by its own sigma**2, which is
+        proportional to the inverse of that step's log-prob sensitivity (``1/sigma**2``), so
+        it downweights the low-sigma, oversensitive steps directly rather than through an SNR
+        proxy that happened to point the wrong way. See DiffusionSchedule.step_sigmas.
+        """
+        if self._step_weights is not None:
+            return self._step_weights
+        if self.step_weighting == "uniform":
+            w = torch.ones(K, device=device, dtype=dtype)
+        elif self.step_weighting == "snr":
+            schedule = self.actor_network.schedule
+            snr = schedule.step_snr().to(device=device, dtype=dtype)
+            if snr.shape[0] != K:
+                raise ValueError(f"schedule.step_snr() returned {snr.shape[0]} steps, expected {K}")
+            if self.snr_weight_cap is not None:
+                snr = snr.clamp(max=self.snr_weight_cap)
+            w = snr / snr.mean().clamp_min(1e-8)
+        else:  # "sigma2"
+            schedule = self.actor_network.schedule
+            sigma = schedule.step_sigmas().to(device=device, dtype=dtype)
+            if sigma.shape[0] != K:
+                raise ValueError(f"schedule.step_sigmas() returned {sigma.shape[0]} steps, expected {K}")
+            w = sigma.pow(2)
+            w = w / w.mean().clamp_min(1e-8)   # mean exactly 1, unfloored
+            if self.sigma2_weight_floor is not None:
+                # Floor is a FRACTION OF THE MEAN (post-normalisation), not an absolute sigma^2
+                # value, so the same default is sensible regardless of the schedule's own scale.
+                # Without it the lowest-sigma step's weight is ~0.001x the mean here -- soft
+                # reweighting, not the hard "zero out the noisy end" this was explicitly meant
+                # to avoid.
+                w = w.clamp(min=self.sigma2_weight_floor)
+                w = w / w.mean().clamp_min(1e-8)   # renormalise: flooring alone shifts the mean
+        self._step_weights = w
+        return w
 
     def forward(self, tensordict):
         from tensordict import TensorDict as _TD
@@ -239,6 +311,9 @@ class DPPOPerStepClipLoss(DPPOClipLoss):
         gain2 = lw_clip.exp() * adv
         gain = torch.stack([gain1, gain2], -1).min(dim=-1).values
 
+        K = log_weight.shape[1]
+        w = self._get_step_weights(K, log_weight.device, log_weight.dtype).view(1, -1)  # [1, K]
+
         # torchrl's losses apply self.reduction at the end of forward, and every caller
         # relies on it: the trainer does loss_objective.backward() directly, which needs a
         # scalar. DPPOClipLoss inherits ClipPPOLoss.forward and gets this for free; this
@@ -254,11 +329,23 @@ class DPPOPerStepClipLoss(DPPOClipLoss):
                 return x.sum()
             return x
 
-        td_out = _TD({"loss_objective": _red(-gain.mean(dim=1))}, batch_size=[])
-        td_out.set("clip_fraction", (lw_clip != log_weight).to(log_weight.dtype).mean().detach())
-        td_out.set("kl_approx", (prev - cur).mean().detach())
-        # Per-step diagnostics: if the later steps carry all the drift, K_infer is too long.
+        # weighted objective: w has mean 1 (sum == K), so this stays a proper mean-over-steps
+        # rather than rescaling the loss's overall magnitude when step_weighting == "snr".
+        td_out = _TD({"loss_objective": _red(-(gain * w).mean(dim=1))}, batch_size=[])
+        raw_kl = prev - cur                                     # [N, K], unweighted -- diagnostic only
+        # kl_approx is what the trainer's target_kl throttle acts on (see train_diffusion.py's
+        # updates_run / stopped_on_kl logic) -- it MUST use the same weights as the objective,
+        # or reweighting the loss buys nothing: the throttle would keep firing on the raw,
+        # early-step-dominated quantity while the gradient itself had already moved on.
+        td_out.set("kl_approx", (raw_kl * w).mean().detach())
+        td_out.set("kl_approx_raw", raw_kl.mean().detach())
+        td_out.set("clip_fraction", ((lw_clip != log_weight).to(log_weight.dtype) * w).mean().detach())
+        # Per-step diagnostics, unweighted: if the later steps carry all the drift, K_infer is
+        # too long; if the early ones do, that is step_weighting's whole justification.
         td_out.set("clip_fraction_per_step", (lw_clip != log_weight).to(log_weight.dtype).mean(dim=0).detach())
+        per_step_kl = raw_kl.mean(dim=0)                        # [K]
+        td_out.set("kl_step_first", per_step_kl[0].detach())    # noisiest step
+        td_out.set("kl_step_last", per_step_kl[-1].detach())    # near-clean step
         if self.critic_coef is not None:
             _lc = self.loss_critic(tensordict)
             # loss_critic returns (loss, value_clip_fraction) in some versions and a bare
@@ -291,6 +378,26 @@ class DiffusionPolicyPhase2Config(PolicyConfig):
         per_step_clipping: Use DPPOPerStepClipLoss instead of DPPOClipLoss. Chain-level is
             the default because it measured comfortably inside the trust region at
             realistic step sizes; this is the safety valve if KL misbehaves.
+        step_weighting: Only used when per_step_clipping is true. "uniform" treats every
+            denoising step equally (the original behaviour). "snr" weights each step's
+            contribution to the loss AND to the measured kl_approx by DiffusionSchedule's
+            step_snr(), so the early, high-noise steps -- which ddim_step's x0
+            reconstruction amplifies most -- stop dominating a metric the late steps used
+            to share equally with them. See DPPOPerStepClipLoss's docstring for why this
+            was needed: two flat/ramped-LR attempts (diff_p2_fresh, diff_p2_v2) both stayed
+            pinned at 2 of 64 optimiser updates per iteration regardless of the LR schedule.
+        snr_weight_cap: Upper bound on a single step's SNR before it enters the weight
+            normalisation (min-SNR-style, Hang et al. 2023, adapted here to an RL objective
+            rather than a reconstruction loss). Only used by step_weighting="snr" -- which
+            measurably backfired (see DPPOPerStepClipLoss's docstring) and is kept only as a
+            documented negative result. Do not default new configs to "snr".
+        sigma2_weight_floor: Only used by step_weighting="sigma2" (the corrected scheme).
+            Minimum per-step weight, as a fraction of the mean weight (e.g. 0.15 = no step
+            drops below 15% of a uniform step's weight). Without a floor the lowest-sigma
+            step's raw weight is a small fraction of a percent of the mean on the schedule
+            this was measured against -- a soft reweighting is the point, not a de facto
+            hard cutoff of that step's contribution. Unvalidated default; treat as an open
+            hyperparameter alongside step_weighting itself.
     """
 
     actor_optimizer_opts: dict
@@ -307,6 +414,9 @@ class DiffusionPolicyPhase2Config(PolicyConfig):
     eta: float = 1.0
     min_sampling_std: float = 0.02
     per_step_clipping: bool = False
+    step_weighting: str = "uniform"
+    snr_weight_cap: float | None = 5.0
+    sigma2_weight_floor: float | None = 0.15
     obs_history_key: str = "obs_history"
     # Checkpoint from pretrain_diffusion_bc.py, loaded straight into the ACTOR.
     # Distinct from PolicyConfig's weights_path, which loads a full actor-critic wrapper
@@ -395,5 +505,12 @@ def make_dppo_loss(policy_cfg, actor, critic, **ppo_opts):
             "the loss returns dist=None, and ClipPPOLoss would call dist.entropy(). Use the "
             "schedule's min_sampling_std for exploration instead."
         )
-    cls = DPPOPerStepClipLoss if getattr(policy_cfg, "per_step_clipping", False) else DPPOClipLoss
-    return cls(actor, critic, **ppo_opts)
+    if getattr(policy_cfg, "per_step_clipping", False):
+        return DPPOPerStepClipLoss(
+            actor, critic,
+            step_weighting=getattr(policy_cfg, "step_weighting", "uniform"),
+            snr_weight_cap=getattr(policy_cfg, "snr_weight_cap", None),
+            sigma2_weight_floor=getattr(policy_cfg, "sigma2_weight_floor", None),
+            **ppo_opts,
+        )
+    return DPPOClipLoss(actor, critic, **ppo_opts)

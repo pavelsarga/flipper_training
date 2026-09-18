@@ -134,6 +134,53 @@ class DiffusionSchedule(nn.Module):
         ts = self.timesteps.tolist()
         return [(k, ts[i + 1] if i + 1 < len(ts) else -1) for i, k in enumerate(ts)]
 
+    def step_snr(self) -> torch.Tensor:
+        """SNR = alpha_bar_k / (1 - alpha_bar_k) at each of the K_infer denoising steps, in
+        the same order ``step_pairs()`` / ``chain_log_prob_steps`` iterate.
+
+        Motivation for DPPOPerStepClipLoss's ``step_weighting="snr"``: ddim_step reconstructs
+        x0 as ``(x_k - sqrt(1-a_k)*eps) / sqrt(a_k)``. At low a_k (the noisy, early steps) that
+        division is by a small number, so a fixed error in eps_theta produces a far larger
+        shift in the resulting mean than the same error would at high a_k (the late,
+        near-clean steps). The per-step PPO ratio inherits that asymmetry: a parameter update
+        that is well-behaved at the late steps can still register a large log-prob change at
+        the early ones. Weighting each step's contribution to the loss (and to the measured
+        KL) by its SNR concentrates learning where a unit of gradient buys a bounded, useful
+        policy change, without zeroing out the early steps entirely.
+        """
+        ks = torch.tensor([k for k, _ in self.step_pairs()], device=self.alphas_cumprod.device)
+        a = self.alphas_cumprod[ks]
+        return a / (1.0 - a).clamp_min(1e-8)
+
+    def step_sigmas(self) -> torch.Tensor:
+        """DDIM per-step sigma (post floor-clamp), one per K_infer denoising step, in the
+        same order ``step_pairs()`` / ``chain_log_prob_steps`` iterate.
+
+        This is the quantity DPPOPerStepClipLoss's ``step_weighting="sigma2"`` actually needs
+        — measured directly, it falls monotonically from ~0.98 at the noisiest step to the
+        ``min_sampling_std`` floor at the last one, on the config this was checked against
+        (K_infer=8, eta=1.0, min_sampling_std=0.02): [0.98, 0.80, 0.65, 0.54, 0.42, 0.30,
+        0.18, 0.02]. The last step is forced there by construction, not by the noise
+        schedule: ``_sigma`` computes ``eta * sqrt((1-a_prev)/(1-a_k)) * sqrt(1-a_k/a_prev)``,
+        and the final transition uses ``a_prev = 1`` (there is no k_prev; the chain ends at
+        clean data), which zeroes the first factor exactly, before the floor clamp. Every
+        other step's sigma is comfortably above the floor.
+
+        Why this replaced ``step_snr`` as the weighting basis: a Gaussian log-prob's
+        sensitivity to a mean shift scales as ``1 / sigma**2``, so the step running at the
+        floor is unconditionally the most sensitive to any eps_theta error, regardless of its
+        SNR. Measured on diff_p2_v3 (which weighted by SNR, i.e. weighted the LAST step
+        *up*): train/mean_kl_step_first ~0.04-0.05 vs train/mean_kl_step_last ~3.9-5.7, a
+        ~100x gap the wrong way round for that scheme to help — SNR happens to correlate with
+        1/sigma on this schedule, so weighting by SNR amplified precisely the step already
+        dominating the throttle. Weighting by sigma**2 targets the mechanism directly instead
+        of a proxy for it.
+        """
+        device = self.alphas_cumprod.device
+        sigmas = [self._sigma(torch.as_tensor(k, device=device), torch.as_tensor(kp, device=device))
+                  for k, kp in self.step_pairs()]
+        return torch.stack(sigmas)
+
 
 if __name__ == "__main__":  # smoke check
     torch.manual_seed(0)

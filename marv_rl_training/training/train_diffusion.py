@@ -925,7 +925,7 @@ class FtrDiffusionTrainer:
                 for _k in range(n_subbatches):
                     sub_batch = self.replay_buffer.sample().to(self.device)
                     loss_vals = self.loss_module(sub_batch)
-                    for _dk in ("clip_fraction", "kl_approx", "entropy", "loss_objective", "loss_critic"):
+                    for _dk in ("clip_fraction", "kl_approx", "kl_approx_raw", "kl_step_first", "kl_step_last", "entropy", "loss_objective", "loss_critic"):
                         if _dk in loss_vals.keys():
                             _diag_sum[_dk] = _diag_sum.get(_dk, 0.0) + loss_vals[_dk].mean().item()
                     _diag_n += 1
@@ -1001,6 +1001,17 @@ class FtrDiffusionTrainer:
                 ),
                 "train/mean_entropy": _diag_sum.get("entropy", 0.0) / max(1, _diag_n),
                 "train/mean_kl_approx": _diag_sum.get("kl_approx", 0.0) / max(1, _diag_n),
+                # Present only under DPPOPerStepClipLoss with step_weighting="snr" (absent
+                # keys default to 0.0, same convention as every other _diag_sum.get above).
+                # kl_approx_raw is the pre-weighting quantity, comparable across configs
+                # regardless of step_weighting; kl_step_first/last are the noisiest vs
+                # near-clean denoising step's own KL, unweighted -- this is the direct,
+                # per-run check for whether the early steps are actually the ones driving
+                # the throttle (the hypothesis step_weighting="snr" is built on), instead of
+                # inferring it indirectly from how the aggregate mean_kl_approx moves.
+                "train/mean_kl_approx_raw": _diag_sum.get("kl_approx_raw", 0.0) / max(1, _diag_n),
+                "train/mean_kl_step_first": _diag_sum.get("kl_step_first", 0.0) / max(1, _diag_n),
+                "train/mean_kl_step_last": _diag_sum.get("kl_step_last", 0.0) / max(1, _diag_n),
                 "train/mean_clip_fraction": _diag_sum.get("clip_fraction", 0.0) / max(1, _diag_n),
                 # Last sub-batch only — the END-of-iteration drift, vs the mean above.
                 "train/final_clip_fraction": loss_vals["clip_fraction"].mean().item(),

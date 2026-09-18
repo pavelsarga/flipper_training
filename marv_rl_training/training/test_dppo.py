@@ -192,6 +192,154 @@ try:
 except Exception as e:  # noqa: BLE001
     check("DPPOPerStepClipLoss runs", False, f"{type(e).__name__}: {e}")
 
+# --- 6b. SNR-weighted per-step contributions (lever 3) ---------------------------------
+snr = sched.step_snr()
+check("step_snr() has one entry per denoising step", tuple(snr.shape) == (K,), str(tuple(snr.shape)))
+check("SNR rises monotonically from the noisiest step to the near-clean one",
+      bool((snr[1:] > snr[:-1]).all()), str(snr.tolist()))
+
+loss_uniform = DPPOPerStepClipLoss(actor, critic, clip_epsilon=0.2, entropy_bonus=False,
+                                    critic_coef=1.0, loss_critic_type="smooth_l1",
+                                    normalize_advantage=True, step_weighting="uniform")
+loss_snr = DPPOPerStepClipLoss(actor, critic, clip_epsilon=0.2, entropy_bonus=False,
+                                critic_coef=1.0, loss_critic_type="smooth_l1",
+                                normalize_advantage=True, step_weighting="snr", snr_weight_cap=5.0)
+td_u, td_s = td2.clone(), td2.clone()
+for p_ in loss_uniform.parameters():
+    p_.grad = None
+for p_ in loss_snr.parameters():
+    p_.grad = None
+# Perturb the actor before scoring: td2's stored denoise_logp_steps (`prev`) came from the
+# UNPERTURBED actor, so evaluating at unperturbed params gives prev == cur, i.e. raw_kl is
+# identically zero and no weighting scheme can be told apart from any other. A real KL needs
+# a genuine parameter difference between the chain that was sampled and the chain being
+# scored now — exactly the situation an actual PPO update is in.
+_bak_snr_test = [q.detach().clone() for q in actor.unet.parameters()]
+with torch.no_grad():
+    for q in actor.unet.parameters():
+        q.add_(torch.randn_like(q) * 3e-4)
+o_u = loss_uniform(td_u)
+o_s = loss_snr(td_s)
+with torch.no_grad():
+    for q, b in zip(actor.unet.parameters(), _bak_snr_test):
+        q.copy_(b)
+
+check("uniform weighting reproduces the pre-lever-3 kl_approx exactly",
+      torch.allclose(o_u["kl_approx"], o_u["kl_approx_raw"], atol=1e-6),
+      f"weighted {float(o_u['kl_approx']):.6f} vs raw {float(o_u['kl_approx_raw']):.6f}")
+check("snr weighting changes the measured kl_approx relative to the raw quantity",
+      not torch.allclose(o_s["kl_approx"], o_s["kl_approx_raw"], atol=1e-6),
+      f"weighted {float(o_s['kl_approx']):.6f} vs raw {float(o_s['kl_approx_raw']):.6f}")
+check("kl_approx_raw agrees between uniform and snr runs (same chain, same params — only the "
+      "WEIGHTING differs, not what is measured before weighting)",
+      torch.allclose(o_u["kl_approx_raw"], o_s["kl_approx_raw"], atol=1e-6),
+      f"{float(o_u['kl_approx_raw']):.6f} vs {float(o_s['kl_approx_raw']):.6f}")
+check("kl_step_first / kl_step_last are scalars",
+      o_s["kl_step_first"].dim() == 0 and o_s["kl_step_last"].dim() == 0)
+
+w_uniform = loss_uniform._get_step_weights(K, snr.device, snr.dtype)
+w_snr = loss_snr._get_step_weights(K, snr.device, snr.dtype)
+check("uniform step weights are all 1", bool((w_uniform == 1.0).all()), str(w_uniform.tolist()))
+check("snr step weights have mean 1 (same scale as uniform's sum == K)",
+      abs(float(w_snr.mean()) - 1.0) < 1e-5, f"mean={float(w_snr.mean()):.6f}")
+check("snr step weights are smallest at the noisiest step, largest near-clean (pre-cap SNR order)",
+      bool(w_snr[0] <= w_snr[-1]), str(w_snr.tolist()))
+check("snr_weight_cap actually bounds a step's weight",
+      float(w_snr.max()) <= 5.0 / float(snr.clamp(max=5.0).mean()) + 1e-4, f"max={float(w_snr.max()):.4f}")
+
+for p_ in loss_snr.parameters():
+    p_.grad = None
+o_s2 = loss_snr(td2.clone())
+(o_s2["loss_objective"] + o_s2["loss_critic"]).backward()
+ug_snr = [p_.grad for n_, p_ in loss_snr.named_parameters() if "unet" in n_ and p_.grad is not None]
+un_snr = torch.sqrt(sum((g.double()**2).sum() for g in ug_snr)) if ug_snr else torch.tensor(0.0)
+check("eps_theta still receives gradient under snr-weighted per-step clipping",
+      len(ug_snr) > 0 and float(un_snr) > 1e-8, f"{len(ug_snr)} tensors, norm {float(un_snr):.6g}")
+
+try:
+    DPPOPerStepClipLoss(actor, critic, clip_epsilon=0.2, entropy_bonus=False, step_weighting="bogus")
+    check("DPPOPerStepClipLoss rejects an unknown step_weighting", False, "it did not raise")
+except ValueError:
+    check("DPPOPerStepClipLoss rejects an unknown step_weighting", True)
+
+cfg_snr = DiffusionPolicyPhase2Config(
+    actor_optimizer_opts={}, value_optimizer_opts={},
+    value_mlp_opts={"num_hidden": 1, "hidden_dim": 32, "layernorm": False},
+    per_step_clipping=True, step_weighting="snr", snr_weight_cap=3.0,
+)
+loss_from_cfg = make_dppo_loss(cfg_snr, actor, critic, clip_epsilon=0.2, entropy_bonus=False)
+check("make_dppo_loss threads step_weighting/snr_weight_cap from the policy config",
+      loss_from_cfg.step_weighting == "snr" and loss_from_cfg.snr_weight_cap == 3.0,
+      f"{loss_from_cfg.step_weighting}, {loss_from_cfg.snr_weight_cap}")
+
+# --- 6c. sigma2 weighting (the corrected lever 3) ---------------------------------------
+sigmas = sched.step_sigmas()
+check("step_sigmas() has one entry per denoising step", tuple(sigmas.shape) == (K,), str(tuple(sigmas.shape)))
+check("sigma falls monotonically from the noisiest step to the near-clean one",
+      bool((sigmas[1:] < sigmas[:-1]).all()), str(sigmas.tolist()))
+check("the last step's sigma sits at the min_sampling_std floor (a_prev=1 zeroes the raw formula)",
+      abs(float(sigmas[-1]) - sched.min_sampling_std) < 1e-6, f"{float(sigmas[-1]):.5f}")
+
+loss_sigma2 = DPPOPerStepClipLoss(actor, critic, clip_epsilon=0.2, entropy_bonus=False,
+                                   critic_coef=1.0, loss_critic_type="smooth_l1",
+                                   normalize_advantage=True, step_weighting="sigma2", sigma2_weight_floor=0.15)
+w_sigma2 = loss_sigma2._get_step_weights(K, sigmas.device, sigmas.dtype)
+check("sigma2 step weights have mean 1", abs(float(w_sigma2.mean()) - 1.0) < 1e-5, f"mean={float(w_sigma2.mean()):.6f}")
+check("sigma2 weights are LARGEST at the noisiest step, smallest near-clean — opposite of snr's ordering",
+      bool(w_sigma2[0] >= w_sigma2[-1]), str(w_sigma2.tolist()))
+# Two steps (the last two, here) fall below the 0.15 threshold simultaneously, so
+# renormalising after the floor pulls the EFFECTIVE minimum slightly below the nominal 0.15
+# to keep mean==1 -- that is correct, so check the implementation reproduces its own
+# documented floor-then-renormalise formula exactly, rather than asserting an unadjusted
+# threshold that ignores what renormalisation does when more than one step is floored.
+_s2 = sigmas.pow(2)
+_w_expected = _s2 / _s2.mean().clamp_min(1e-8)
+_w_expected = _w_expected.clamp(min=0.15)
+_w_expected = _w_expected / _w_expected.mean().clamp_min(1e-8)
+check("sigma2_weight_floor matches the documented floor-then-renormalise formula exactly",
+      torch.allclose(w_sigma2, _w_expected, atol=1e-5),
+      f"{w_sigma2.tolist()} vs {_w_expected.tolist()}")
+check("flooring still lifts the near-zero unfloored weight well above its unfloored value",
+      float(w_sigma2.min()) > 10 * float((sigmas[-1]**2 / (sigmas**2).mean())),
+      f"floored min={float(w_sigma2.min()):.4f} vs unfloored last-step={float((sigmas[-1]**2/(sigmas**2).mean())):.4f}")
+check("without a floor, the near-clean step's raw weight collapses toward zero (motivates the floor)",
+      float((sigmas[-1]**2 / (sigmas**2).mean())) < 0.05,
+      f"unfloored last-step weight = {float((sigmas[-1]**2 / (sigmas**2).mean())):.4f}")
+
+td_sig = td2.clone()
+for p_ in loss_sigma2.parameters():
+    p_.grad = None
+_bak_sig_test = [q.detach().clone() for q in actor.unet.parameters()]
+with torch.no_grad():
+    for q in actor.unet.parameters():
+        q.add_(torch.randn_like(q) * 3e-4)
+o_sig = loss_sigma2(td_sig)
+with torch.no_grad():
+    for q, b in zip(actor.unet.parameters(), _bak_sig_test):
+        q.copy_(b)
+check("sigma2 weighting changes the measured kl_approx relative to the raw quantity",
+      not torch.allclose(o_sig["kl_approx"], o_sig["kl_approx_raw"], atol=1e-6),
+      f"weighted {float(o_sig['kl_approx']):.6f} vs raw {float(o_sig['kl_approx_raw']):.6f}")
+
+for p_ in loss_sigma2.parameters():
+    p_.grad = None
+o_sig2 = loss_sigma2(td2.clone())
+(o_sig2["loss_objective"] + o_sig2["loss_critic"]).backward()
+ug_sig = [p_.grad for n_, p_ in loss_sigma2.named_parameters() if "unet" in n_ and p_.grad is not None]
+un_sig = torch.sqrt(sum((g.double()**2).sum() for g in ug_sig)) if ug_sig else torch.tensor(0.0)
+check("eps_theta still receives gradient under sigma2-weighted per-step clipping",
+      len(ug_sig) > 0 and float(un_sig) > 1e-8, f"{len(ug_sig)} tensors, norm {float(un_sig):.6g}")
+
+cfg_sigma2 = DiffusionPolicyPhase2Config(
+    actor_optimizer_opts={}, value_optimizer_opts={},
+    value_mlp_opts={"num_hidden": 1, "hidden_dim": 32, "layernorm": False},
+    per_step_clipping=True, step_weighting="sigma2", sigma2_weight_floor=0.2,
+)
+loss_from_cfg2 = make_dppo_loss(cfg_sigma2, actor, critic, clip_epsilon=0.2, entropy_bonus=False)
+check("make_dppo_loss threads step_weighting/sigma2_weight_floor from the policy config",
+      loss_from_cfg2.step_weighting == "sigma2" and loss_from_cfg2.sigma2_weight_floor == 0.2,
+      f"{loss_from_cfg2.step_weighting}, {loss_from_cfg2.sigma2_weight_floor}")
+
 # 2A vs 2B under a realistic parameter step: how much of the batch clips?
 bak = [q.detach().clone() for q in actor.unet.parameters()]
 with torch.no_grad():
