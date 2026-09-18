@@ -2,7 +2,6 @@
 """
 Subscribe to /policy_heightmap_debug and plot it with matplotlib.
 """
-import struct
 import threading
 
 import matplotlib.pyplot as plt

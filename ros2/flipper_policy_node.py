@@ -26,7 +26,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState, PointCloud2, PointField, Imu, Image as RosImage
 from geometry_msgs.msg import PoseStamped, Point, Twist
-from std_msgs.msg import Bool, Float64, MultiArrayDimension, MultiArrayLayout, Float32MultiArray
+from std_msgs.msg import Bool, Float64, MultiArrayDimension, Float32MultiArray
 from grid_map_msgs.msg import GridMap
 from visualization_msgs.msg import Marker, MarkerArray
 from builtin_interfaces.msg import Time as TimeMsg
@@ -46,7 +46,7 @@ except ImportError:  # HUD/colour image degrade to no-ops; markers are unaffecte
 import matplotlib
 matplotlib.use('Agg')  # Forces Matplotlib to run in headless/thread-safe mode
 
-import torch
+import torch  # noqa: F401 - kept: the inference module needs torch loaded before the node starts
 from scipy.spatial.transform import Rotation
 
 
