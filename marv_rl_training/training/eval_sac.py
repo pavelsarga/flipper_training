@@ -21,7 +21,7 @@ import marv_rl_training  # noqa: F401 — registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks
-from marv_rl_training.training.eval_common import exit_flushed, print_results
+from marv_rl_training.training.eval_common import install_hard_exit_excepthook, exit_flushed, print_results
 from marv_rl_training.training.env_type_registry import default_num_depth_cols, default_num_env_types
 from marv_rl_training.training.terrain_assets import write_terrain_manifest
 from marv_rl_training.training.eval_data import (
@@ -140,6 +140,7 @@ def run_eval(raw_cfg, ftr_gym_env, max_steps, repeats, output_dir=None, num_env_
 # ============================================================
 
 if __name__ == "__main__":
+    install_hard_exit_excepthook()
     run_dir = Path(args.rundir)
     saved_cfg_path = run_dir / "config.yaml"
     if not saved_cfg_path.exists():
@@ -167,7 +168,7 @@ if __name__ == "__main__":
     import_ftr_tasks()
 
     _cfg = FtrSACConfig(**raw_cfg)
-    ftr_gym_env = build_ftr_gym_env(_cfg, physx_buffers="auto")
+    ftr_gym_env = build_ftr_gym_env(_cfg, physx_autotune="full")
 
     run_eval(
         raw_cfg, ftr_gym_env,

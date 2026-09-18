@@ -989,7 +989,7 @@ if __name__ == "__main__":
     # env_cfg_overrides must set module_name: ctrac so FtrEnv routes observations
     # and rewards through CTRACModule instead of the default marv_rl one.
     _cfg = FtrSACConfig(**raw_cfg)
-    ftr_gym_env = build_ftr_gym_env(_cfg, physx_buffers="auto")
+    ftr_gym_env = build_ftr_gym_env(_cfg, physx_autotune="full")
 
     run_trainer(FtrSACTrainer, raw_cfg, ftr_gym_env)
 

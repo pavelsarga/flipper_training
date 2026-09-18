@@ -25,7 +25,7 @@ import marv_rl_training  # noqa: F401 — registers OmegaConf resolvers
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks
-from marv_rl_training.training.eval_common import exit_flushed, print_results
+from marv_rl_training.training.eval_common import install_hard_exit_excepthook, exit_flushed, print_results
 from marv_rl_training.training.env_type_registry import default_num_depth_cols, default_num_env_types
 from marv_rl_training.training.terrain_assets import write_terrain_manifest
 from marv_rl_training.training.eval_data import (
@@ -185,6 +185,7 @@ def run_eval(
 # ============================================================
 
 if __name__ == "__main__":
+    install_hard_exit_excepthook()
     import_ftr_tasks()
 
     run_dir = Path(args.rundir)
@@ -220,7 +221,7 @@ if __name__ == "__main__":
 
     # Build the config just to read task/terrain/env fields for gymnasium.make
     _cfg = _config_cls(**raw_cfg)
-    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_buffers="small")
+    ftr_gym_env = build_ftr_gym_env(_cfg, physx_autotune="shrink")
 
     run_eval(
         raw_cfg, ftr_gym_env,

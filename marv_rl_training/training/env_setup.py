@@ -72,23 +72,32 @@ def build_ftr_gym_env(
     cfg: Any,
     *,
     set_decimation: bool = True,
-    physx_buffers: str = "config",
+    physx_from_config: bool = True,
+    physx_autotune: str = "none",
     log_raw_accel: bool | None = None,
     log_raw_accel_path: str | None = None,
 ):
     """Create the gymnasium env described by ``cfg`` (any of the Ftr*Config dataclasses).
 
-    ``set_decimation`` — copy ``cfg.decimation`` onto the env config. The trainers do; the
-    eval scripts deliberately leave the env's own default in place.
+    ``set_decimation`` — copy ``cfg.decimation`` onto the env config. Every trainer does, and
+    so do the D3QN, CREPS and SAC evals (their configs set a non-default decimation); the PPO
+    evals leave the env's own default in place.
 
-    ``physx_buffers`` — how ``gpu_found_lost_aggregate_pairs_capacity`` and friends are sized.
-    FTR_SIM_CFG's defaults assume 4096 envs on a server GPU, which does not fit a laptop GPU
-    running a handful of envs and leaves headroom unused at very large counts:
+    The two PhysX-buffer knobs are independent, because the entry points combined them four
+    different ways and each combination is in use:
 
-      ``"config"``  take the value from the config and nothing else (what the trainers do)
-      ``"small"``   the config value, then shrink every GPU buffer at num_robots <= 64
-      ``"auto"``    shrink at <= 64, grow the aggregate-pairs capacity above 512, and leave
-                    the env default in between — the config value is not used at all
+    ``physx_from_config``  apply ``cfg.physx_gpu_found_lost_aggregate_pairs_capacity`` first.
+    ``physx_autotune``     then resize by env count. FTR_SIM_CFG's defaults assume 4096 envs on
+                           a server GPU, which does not fit a laptop running a handful of envs:
+                             ``"none"``    leave it
+                             ``"shrink"``  at num_robots <= 64, shrink every GPU buffer
+                             ``"full"``    shrink at <= 64, and above 512 grow the
+                                           aggregate-pairs capacity to 2**27
+
+      trainers (PPO, D3QN, CREPS)      from_config=True,  autotune="none"
+      C-TRAC train + eval              from_config=True,  autotune="full"
+      D3QN / CREPS eval                from_config=True,  autotune="shrink"
+      PPO evals, random baseline       from_config=False, autotune="full"
 
     ``log_raw_accel`` overrides ``cfg.log_raw_accel`` (the random-policy eval turns it on from
     a CLI flag); configs whose dataclass has no such field never enable it.
@@ -125,15 +134,17 @@ def build_ftr_gym_env(
     env_cfg.sim.physx.gpu_temp_buffer_capacity = cfg.physx_gpu_temp_buffer_capacity
     env_cfg.sim.physx.gpu_max_num_partitions = cfg.physx_gpu_max_num_partitions
 
-    if physx_buffers in ("config", "small"):
+    if physx_autotune not in ("none", "shrink", "full"):
+        raise ValueError(f"physx_autotune must be none/shrink/full, got {physx_autotune!r}")
+    if physx_from_config:
         env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = cfg.physx_gpu_found_lost_aggregate_pairs_capacity
-    if physx_buffers in ("small", "auto") and cfg.num_robots <= 64:
+    if physx_autotune != "none" and cfg.num_robots <= 64:
         env_cfg.sim.physx.gpu_max_rigid_contact_count = 2 ** 20
         env_cfg.sim.physx.gpu_found_lost_pairs_capacity = 2 ** 18
         env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 20
         env_cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 2 ** 18
         env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
-    elif physx_buffers == "auto" and cfg.num_robots > 512:
+    elif physx_autotune == "full" and cfg.num_robots > 512:
         env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
 
     # Arbitrary direct-attribute overrides — module_name, reward params, potential-reward

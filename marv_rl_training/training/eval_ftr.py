@@ -31,6 +31,7 @@ from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks
 from marv_rl_training.training.env_type_registry import default_num_depth_cols, default_num_env_types
 from marv_rl_training.training.eval_common import (
+    install_hard_exit_excepthook,
     exit_flushed,
     ActionOverrideWrapper,
     print_results,
@@ -206,6 +207,7 @@ def run_eval(
 # ============================================================
 
 if __name__ == "__main__":
+    install_hard_exit_excepthook()
     import_ftr_tasks()
 
     run_dir = Path(args.rundir)
@@ -237,7 +239,7 @@ if __name__ == "__main__":
 
     # FtrPPOConfig is built here only to read the env fields build_ftr_gym_env needs.
     _cfg = FtrPPOConfig(**raw_cfg)
-    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_buffers="auto")
+    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_from_config=False, physx_autotune="full")
 
     if _cfg.log_raw_accel:
         accel_path = run_dir / "raw_accel_eval.npz"

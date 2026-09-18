@@ -38,6 +38,7 @@ from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks
 from marv_rl_training.training.eval_common import (
+    install_hard_exit_excepthook,
     exit_flushed,
     print_results,
     run_single_rollout,
@@ -189,6 +190,7 @@ def run_eval_rand(
 # ============================================================
 
 if __name__ == "__main__":
+    install_hard_exit_excepthook()
     import_ftr_tasks()
 
     config_path = Path(args.config)
@@ -217,7 +219,7 @@ if __name__ == "__main__":
             f"/tmp/ftr_eval_rand_{datetime.now().strftime('%Y%m%d_%H%M%S')}/raw_accel.npz")
         logger.info(f"Raw accel logging enabled → {accel_path}")
 
-    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_buffers="auto",
+    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_from_config=False, physx_autotune="full",
                                     log_raw_accel_path=accel_path)
 
     run_eval_rand(

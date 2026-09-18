@@ -42,7 +42,7 @@ from marv_rl_training import ROOT
 from marv_rl_training.environment.ftr_env_adapter import FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_setup import build_ftr_gym_env, import_ftr_tasks, require_cuda
-from marv_rl_training.training.eval_common import run_single_rollout
+from marv_rl_training.training.eval_common import install_hard_exit_excepthook, run_single_rollout
 from marv_rl_training.training.train_ftr import FtrPPOConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
@@ -197,7 +197,7 @@ def eval_trial(
 
     # FtrPPOConfig is built here only to read the env fields build_ftr_gym_env needs.
     _cfg = FtrPPOConfig(**raw_cfg)
-    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_buffers="auto")
+    ftr_gym_env = build_ftr_gym_env(_cfg, set_decimation=False, physx_from_config=False, physx_autotune="full")
     device = set_device(_cfg.device)
     seed_all(_cfg.seed)
 
@@ -251,6 +251,7 @@ def eval_trial(
 # ============================================================
 
 if __name__ == "__main__":
+    install_hard_exit_excepthook()
     require_cuda()
     import_ftr_tasks()
 

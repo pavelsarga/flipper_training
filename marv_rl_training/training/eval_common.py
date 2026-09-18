@@ -23,6 +23,7 @@ from marv_rl_training.utils.logutils import get_terminal_logger
 __all__ = [
     "ActionOverrideWrapper",
     "exit_flushed",
+    "install_hard_exit_excepthook",
     "print_results",
     "print_lin_vels",
     "remap_native_to_ftr_weights",
@@ -54,6 +55,25 @@ def exit_flushed(code: int = 0) -> None:
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)
+
+
+def install_hard_exit_excepthook() -> None:
+    """Make an uncaught exception exit 1 instead of 0.
+
+    Isaac Sim's Kit app runs its own teardown on normal interpreter exit and the process ends
+    with status 0 whatever Python raised — a crashed eval under SLURM looked like a success.
+    The trainers avoid it by wrapping ``train()`` (entrypoint.run_trainer); the eval scripts
+    have no single call to wrap, so this hook does the same for anything that escapes their
+    module body: print the traceback, flush, ``os._exit(1)``.
+    """
+    import sys
+    import traceback
+
+    def _hook(exc_type, exc, tb):
+        traceback.print_exception(exc_type, exc, tb)
+        exit_flushed(1)
+
+    sys.excepthook = _hook
 
 
 def _termination_and_reward_stats(ftr_torchrl_env) -> dict[str, float]:
