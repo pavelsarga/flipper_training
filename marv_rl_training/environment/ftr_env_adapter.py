@@ -57,6 +57,12 @@ class FtrTorchRLEnv(EnvBase):
         self._term_failure: int = 0
         self._term_explosion: int = 0
         self._term_total: int = 0
+        # Traversal quality of finished episodes (extras["tq_episode"], NaN while running):
+        # sum/count over all finished episodes, and over the successful ones only.
+        self._tq_sum: float = 0.0
+        self._tq_n: int = 0
+        self._tq_success_sum: float = 0.0
+        self._tq_success_n: int = 0
 
         # Per-robot tracking (disabled by default; activate via enable_per_env_tracking())
         self._per_env_tracking: bool = False
@@ -64,6 +70,8 @@ class FtrTorchRLEnv(EnvBase):
         self._per_env_success: torch.Tensor | None = None
         self._per_env_failure: torch.Tensor | None = None
         self._per_env_explosion: torch.Tensor | None = None
+        self._per_env_tq_sum: torch.Tensor | None = None
+        self._per_env_tq_n: torch.Tensor | None = None
 
         # Instantiate the observation descriptor so make_transformed_env can build VecNorm keys
         # and mlp_policy.py can build the matching encoder. Which descriptor class matches the
@@ -174,6 +182,18 @@ class FtrTorchRLEnv(EnvBase):
                 if "explosion" in _info:
                     self._term_explosion += _info["explosion"].long().sum().item()
 
+                tq_ep = _info.get("tq_episode", None)
+                if tq_ep is not None:
+                    tq_ep = tq_ep.to(self.device)
+                    has_tq = ~torch.isnan(tq_ep)
+                    if has_tq.any():
+                        self._tq_sum += tq_ep[has_tq].sum().item()
+                        self._tq_n += int(has_tq.sum().item())
+                        succ_tq = has_tq & _info["success"].to(self.device)
+                        if succ_tq.any():
+                            self._tq_success_sum += tq_ep[succ_tq].sum().item()
+                            self._tq_success_n += int(succ_tq.sum().item())
+
                 if self._per_env_tracking:
                     done_mask = (terminated | truncated).squeeze(-1)
                     self._per_env_episodes  += done_mask.long().to(self.device)
@@ -181,6 +201,9 @@ class FtrTorchRLEnv(EnvBase):
                     self._per_env_failure   += _info["failure"].long().to(self.device)
                     if "explosion" in _info:
                         self._per_env_explosion += _info["explosion"].long().to(self.device)
+                    if tq_ep is not None:
+                        self._per_env_tq_sum += torch.nan_to_num(tq_ep, nan=0.0)
+                        self._per_env_tq_n   += has_tq.long()
 
         # Sanitize observation: NaN from invalid robot state (fallen off terrain) must not reach
         # the policy or VecNorm running statistics on the next step.
@@ -258,7 +281,15 @@ class FtrTorchRLEnv(EnvBase):
             "env/failure_rate": self._term_failure / self._term_total,
             "explosions/rate": self._term_explosion / self._term_total,
         }
+        if self._tq_n > 0:
+            # tq_episode: mean over every finished episode; tq_success: over the successful
+            # ones; tq_scored: the paper's convention, an obstacle not traversed scores 0.
+            result["env/tq_episode"] = self._tq_sum / self._tq_n
+            result["env/tq_success"] = (self._tq_success_sum / self._tq_success_n) if self._tq_success_n else 0.0
+            result["env/tq_scored"] = self._tq_success_sum / self._tq_n
         self._term_success = self._term_failure = self._term_explosion = self._term_total = 0
+        self._tq_sum = self._tq_success_sum = 0.0
+        self._tq_n = self._tq_success_n = 0
         return result
 
     def enable_per_env_tracking(self) -> None:
@@ -269,21 +300,27 @@ class FtrTorchRLEnv(EnvBase):
         self._per_env_success   = torch.zeros(n, dtype=torch.long, device=self.device)
         self._per_env_failure   = torch.zeros(n, dtype=torch.long, device=self.device)
         self._per_env_explosion = torch.zeros(n, dtype=torch.long, device=self.device)
+        self._per_env_tq_sum    = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self._per_env_tq_n      = torch.zeros(n, dtype=torch.long, device=self.device)
 
-    def pop_per_env_termination(self) -> dict[int, dict[str, int]]:
+    def pop_per_env_termination(self) -> dict[int, dict[str, int | float]]:
         """Return per-robot episode counts then reset all counters.
 
-        Returns ``{robot_idx: {"episodes": N, "successes": N, "failures": N, "explosions": N}}``.
+        Returns ``{robot_idx: {"episodes": N, "successes": N, "failures": N, "explosions": N,
+        "tq": mean traversal quality of the robot's finished episodes (NaN if none)}}``.
         Only meaningful after ``enable_per_env_tracking()`` was called.
         """
         if not self._per_env_tracking or self._per_env_episodes is None:
             return {}
+        tq_n = self._per_env_tq_n.cpu()
+        tq_mean = (self._per_env_tq_sum.cpu() / tq_n.clamp(min=1)).tolist()
         result = {
             i: {
                 "episodes":   int(self._per_env_episodes[i].item()),
                 "successes":  int(self._per_env_success[i].item()),
                 "failures":   int(self._per_env_failure[i].item()),
                 "explosions": int(self._per_env_explosion[i].item()),
+                "tq":         tq_mean[i] if int(tq_n[i]) > 0 else float("nan"),
             }
             for i in range(self.batch_size[0])
         }
@@ -291,6 +328,8 @@ class FtrTorchRLEnv(EnvBase):
         self._per_env_success.zero_()
         self._per_env_failure.zero_()
         self._per_env_explosion.zero_()
+        self._per_env_tq_sum.zero_()
+        self._per_env_tq_n.zero_()
         return result
 
     def disable_per_env_tracking(self) -> None:

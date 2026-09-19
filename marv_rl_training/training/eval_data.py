@@ -93,6 +93,9 @@ class EpisodeRecord:
     # "fwd" = the course's native -X traversal, "rev" = a `bidirectional` birth entry
     # driving +X (the same tile met from its other end)
     direction: str = "fwd"
+    # traversal quality of the episode (CrossingEnv's distance-binned three-channel metric,
+    # in (0, 1]); NaN when the env did not report one
+    tq: float = float("nan")
 
 
 @dataclass
@@ -132,6 +135,10 @@ class PerEnvRow:
     flipper_fr_mean: float
     flipper_rl_mean: float
     flipper_rr_mean: float
+    # traversal quality: mean over the episodes that reported one, and the paper's scored
+    # form where an obstacle that was not traversed (any non-success outcome) counts 0
+    mean_tq: float = float("nan")
+    mean_tq_scored: float = float("nan")
 
 
 @dataclass
@@ -154,6 +161,8 @@ class PerSpotRow:
     # quickly, so this (not episodes_total) is the tile's weight in the training data
     steps_total: int = 0
     mean_steps: float = float("nan")
+    mean_tq: float = float("nan")
+    mean_tq_scored: float = float("nan")
 
 
 # ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -280,6 +289,7 @@ def aggregate_per_env(
         successes   = sum(1 for e in eps if e.outcome == "success")
         failures    = sum(1 for e in eps if e.outcome == "failure")
         explosions  = sum(1 for e in eps if e.outcome == "explosion")
+        mean_tq, mean_tq_scored = _tq_means(eps)
         rows.append(PerEnvRow(
             eval_id=eval_id, policy=policy, terrain=terrain, repeat=repeat,
             env_type_idx=idx, env_type_name=name,
@@ -293,8 +303,22 @@ def aggregate_per_env(
             flipper_fr_mean=obs_stats.get("observations/flipper_fr_mean", float("nan")),
             flipper_rl_mean=obs_stats.get("observations/flipper_rl_mean", float("nan")),
             flipper_rr_mean=obs_stats.get("observations/flipper_rr_mean", float("nan")),
+            mean_tq=mean_tq,
+            mean_tq_scored=mean_tq_scored,
         ))
     return rows
+
+
+def _tq_means(eps: list[EpisodeRecord]) -> tuple[float, float]:
+    """(mean TQ over episodes that reported one, mean with non-successes scored 0)."""
+    import math
+
+    with_tq = [e for e in eps if not math.isnan(e.tq)]
+    if not with_tq:
+        return float("nan"), float("nan")
+    mean_tq = sum(e.tq for e in with_tq) / len(with_tq)
+    scored = sum(e.tq for e in with_tq if e.outcome == "success") / len(with_tq)
+    return mean_tq, scored
 
 
 # ── Per-spot aggregation helper ───────────────────────────────────────────────
@@ -336,6 +360,7 @@ def aggregate_per_spot(
             failures   = sum(1 for e in eps if e.outcome == "failure")
             explosions = sum(1 for e in eps if e.outcome == "explosion")
             steps_total = sum(e.steps for e in eps)
+            mean_tq, mean_tq_scored = _tq_means(eps)
             rows.append(PerSpotRow(
                 eval_id=eval_id, policy=policy, terrain=terrain, repeat=repeat,
                 env_type_idx=env_idx, env_type_name=name, depth_col=col,
@@ -347,6 +372,8 @@ def aggregate_per_spot(
                 mean_dist_to_goal_final=sum(e.dist_to_goal_final for e in eps) / total,
                 steps_total=steps_total,
                 mean_steps=steps_total / total,
+                mean_tq=mean_tq,
+                mean_tq_scored=mean_tq_scored,
             ))
     return rows
 
@@ -552,6 +579,7 @@ def run_tracked_rollout(
                         cumulative_reward=float(rew_cpu[i].item()),
                         dist_to_goal_final=dist,
                         direction="fwd" if float(target_pos[i, 0]) <= float(start_pos[i, 0]) else "rev",
+                        tq=float(counts.get("tq", float("nan"))),
                     ))
                     robot_rewards[i] = 0.0
                     robot_steps[i]   = 0
