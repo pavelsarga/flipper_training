@@ -171,7 +171,18 @@ def get_terrain_layout(terrain: str | None) -> TerrainLayout | None:
     """
     if terrain is None:
         return None
-    return _layout_from_gen_config(terrain) or TERRAIN_ENV_TYPES.get(terrain)
+    layout = _layout_from_gen_config(terrain) or TERRAIN_ENV_TYPES.get(terrain)
+    if layout is None:
+        # Falling back to the generic 16 x 10 layout makes every per-env-type / per-spot
+        # number meaningless, so say loudly why (print: the ftr_envs loggers have no
+        # handler on the eval path, see CLAUDE.md).
+        from marv_rl_training.training.terrain_assets import terrain_assets_dir  # noqa: PLC0415
+
+        print(f"[env_type_registry] WARNING: no layout for terrain {terrain!r} "
+              f"(assets dir = {terrain_assets_dir()}, gen_config present = "
+              f"{(terrain_assets_dir() / 'gen_config' / f'{terrain}.yaml').is_file() if terrain_assets_dir() else None}); "
+              f"falling back to generic env_NN names", flush=True)
+    return layout
 
 
 def default_env_type_names(terrain: str | None, num_env_types: int | None = None) -> list[str]:

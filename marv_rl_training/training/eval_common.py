@@ -122,14 +122,28 @@ class ActionOverrideWrapper(torch.nn.Module):
     """
 
     def __init__(self, actor, const_linear_vel: float | None = None,
-                 invert_rear_flippers: bool = False):
+                 invert_rear_flippers: bool = False, scripted_action=None):
         super().__init__()
         self.actor = actor
         self.const_linear_vel = const_linear_vel
         self.invert_rear_flippers = invert_rear_flippers
+        # a fixed action vector that REPLACES the policy's output every step — the
+        # policy still runs (so the rollout machinery is unchanged) but only the
+        # scripted values reach the env. Used for open-loop robot-capability tests,
+        # e.g. "hold this flipper posture and command w=1 on flat ground" to measure
+        # what yaw rate MARV can actually produce in each posture.
+        self.scripted_action = None if scripted_action is None else torch.as_tensor(
+            scripted_action, dtype=torch.float32)
 
     def forward(self, td):
         td = self.actor(td)
+        if self.scripted_action is not None:
+            a = td["action"]
+            if self.scripted_action.numel() != a.shape[-1]:
+                raise ValueError(
+                    f"--scripted_action has {self.scripted_action.numel()} values but the action "
+                    f"space is {a.shape[-1]}-dimensional")
+            td["action"] = self.scripted_action.to(a.device).expand_as(a).clone()
         if self.const_linear_vel is not None:
             td["action"][..., 0] = self.const_linear_vel
         if self.invert_rear_flippers:

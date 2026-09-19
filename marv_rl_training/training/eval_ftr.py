@@ -15,6 +15,12 @@ parser.add_argument("--const_linear_vel", type=float, default=None,
                          "Use for policies trained without forward command control.")
 parser.add_argument("--invert_rear_flippers", action="store_true",
                     help="Multiply rear flipper actions (action[:,4:]) by -1.")
+parser.add_argument("--scripted_action", type=str, default=None, metavar="V,W,FL,FR,RL,RR",
+                    help="Replace the policy's action with this constant vector every step (values in "
+                         "[-1,1], one per action dim). Open-loop robot-capability probe — e.g. the "
+                         "yaw-authority test: --map ground --scripted_action 0,1,-1,-1,1,1 "
+                         "env_cfg_overrides.flipper_control_mode=position (flippers pinned fully up, "
+                         "full left turn) and read state/yaw_rate* from the printed results.")
 args, unknown_args, simulation_app = launch_isaac_app(parser)
 
 # ============================================================
@@ -71,6 +77,7 @@ def run_eval(
     plot_interval: int = 1,
     const_linear_vel: float | None = None,
     invert_rear_flippers: bool = False,
+    scripted_action: "list[float] | None" = None,
     output_dir: "Path | None" = None,
     num_env_types: "int | None" = None,
     env_names_yaml: "str | None" = None,
@@ -99,13 +106,16 @@ def run_eval(
     )
     actor = actor_value_wrapper.get_policy_operator()
 
-    if const_linear_vel is not None or invert_rear_flippers:
+    if const_linear_vel is not None or invert_rear_flippers or scripted_action is not None:
+        if scripted_action is not None:
+            logger.info(f"Scripted action (policy output ignored): {scripted_action}")
         if const_linear_vel is not None:
             logger.info(f"Overriding linear velocity with constant: {const_linear_vel}")
         if invert_rear_flippers:
             logger.info("Inverting flipper actions (multiplying by -1)")
         actor = ActionOverrideWrapper(actor, const_linear_vel=const_linear_vel,
-                                      invert_rear_flippers=invert_rear_flippers)
+                                      invert_rear_flippers=invert_rear_flippers,
+                                      scripted_action=scripted_action)
 
     env, vecnorm = make_transformed_env(ftr_torchrl_env, cfg, policy_transforms)
 
@@ -254,6 +264,7 @@ if __name__ == "__main__":
         plot_interval=args.plot_interval,
         const_linear_vel=args.const_linear_vel,
         invert_rear_flippers=args.invert_rear_flippers,
+        scripted_action=[float(v) for v in args.scripted_action.split(",")] if args.scripted_action else None,
         output_dir=args.output_dir,
         num_env_types=args.num_env_types,
         env_names_yaml=args.env_names_yaml,

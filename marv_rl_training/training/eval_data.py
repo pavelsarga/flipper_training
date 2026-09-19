@@ -90,6 +90,9 @@ class EpisodeRecord:
     steps: int
     cumulative_reward: float
     dist_to_goal_final: float
+    # "fwd" = the course's native -X traversal, "rev" = a `bidirectional` birth entry
+    # driving +X (the same tile met from its other end)
+    direction: str = "fwd"
 
 
 @dataclass
@@ -146,6 +149,11 @@ class PerSpotRow:
     explosion_rate: float
     mean_cumulative_reward: float
     mean_dist_to_goal_final: float
+    # frames this spot consumed — the spawn pointer starts equal numbers of episodes per
+    # tile, but a tile that times out costs several times the frames of one solved
+    # quickly, so this (not episodes_total) is the tile's weight in the training data
+    steps_total: int = 0
+    mean_steps: float = float("nan")
 
 
 # ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -327,6 +335,7 @@ def aggregate_per_spot(
             successes  = sum(1 for e in eps if e.outcome == "success")
             failures   = sum(1 for e in eps if e.outcome == "failure")
             explosions = sum(1 for e in eps if e.outcome == "explosion")
+            steps_total = sum(e.steps for e in eps)
             rows.append(PerSpotRow(
                 eval_id=eval_id, policy=policy, terrain=terrain, repeat=repeat,
                 env_type_idx=env_idx, env_type_name=name, depth_col=col,
@@ -336,6 +345,8 @@ def aggregate_per_spot(
                 explosion_rate=explosions / total,
                 mean_cumulative_reward=sum(e.cumulative_reward for e in eps) / total,
                 mean_dist_to_goal_final=sum(e.dist_to_goal_final for e in eps) / total,
+                steps_total=steps_total,
+                mean_steps=steps_total / total,
             ))
     return rows
 
@@ -479,6 +490,7 @@ def run_tracked_rollout(
             # start position rather than the terminal position.
             _pos_snap = unwrapped.positions.clone()
             _tgt_snap = unwrapped.target_positions.clone()
+            _start_snap = unwrapped.start_positions.clone()
 
             td = actor(td)
             td = env.step(td)
@@ -505,6 +517,7 @@ def run_tracked_rollout(
                 done_idx    = done_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
                 positions   = _pos_snap.cpu()
                 target_pos  = _tgt_snap.cpu()
+                start_pos   = _start_snap.cpu()
                 rew_cpu     = robot_rewards.cpu()
                 steps_cpu   = robot_steps.cpu()
 
@@ -538,6 +551,7 @@ def run_tracked_rollout(
                         steps=int(steps_cpu[i].item()),
                         cumulative_reward=float(rew_cpu[i].item()),
                         dist_to_goal_final=dist,
+                        direction="fwd" if float(target_pos[i, 0]) <= float(start_pos[i, 0]) else "rev",
                     ))
                     robot_rewards[i] = 0.0
                     robot_steps[i]   = 0

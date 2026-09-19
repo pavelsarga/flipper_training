@@ -56,17 +56,33 @@ def terrain_assets_dir() -> Path | None:
         if p.is_dir():
             return p
 
+    candidates: list[Path] = []
     try:
         import ftr_envs  # noqa: PLC0415  (optional dependency — analysis code may not have it)
 
-        # __file__ is None for a namespace package; anything unexpected here must
+        # __file__ is None for a namespace package — which is what ftr_envs becomes once
+        # Isaac Sim has registered FTR-Benchmark as an extension, i.e. in every local
+        # eval_*.py run. That silently sent evals down the generic env_NN naming path
+        # (16 env types) while the plain-python path resolved the layout fine; try the
+        # package's search path before giving up. Anything unexpected must still
         # degrade to "no asset tree", never break the caller — get_terrain_layout()
         # runs on every train/eval startup.
-        p = Path(ftr_envs.__file__).parent / "assets" / "terrain"
+        if getattr(ftr_envs, "__file__", None):
+            candidates.append(Path(ftr_envs.__file__).parent / "assets" / "terrain")
+        for entry in list(getattr(ftr_envs, "__path__", []) or []):
+            candidates.append(Path(entry) / "assets" / "terrain")
     except Exception:  # noqa: BLE001
-        return None
+        pass
+    # last resort: the sibling submodule checkout this package ships next to
+    candidates.append(Path(__file__).resolve().parents[3] / "FTR-Benchmark" / "ftr_envs" / "assets" / "terrain")
 
-    return p if p.is_dir() else None
+    for p in candidates:
+        try:
+            if p.is_dir():
+                return p
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def _asset_path(terrain: str, sub: str, suffix: str) -> Path | None:
@@ -97,10 +113,17 @@ def load_terrain_gen_config(terrain: str | None) -> dict[str, Any] | None:
         import yaml  # noqa: PLC0415
 
         try:
-            loaded = yaml.safe_load(path.read_text())
+            # explicit utf-8: the generator configs carry non-ASCII comment characters and
+            # the apptainer container has an ASCII locale, so a bare read_text() raised
+            # UnicodeDecodeError here and every local eval silently fell back to the
+            # generic env_NN layout
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict) and loaded.get("rows"):
                 cfg = loaded
-        except Exception:  # noqa: BLE001 — a malformed config must not break eval
+            else:
+                print(f"[terrain_assets] {path} parsed but has no 'rows' (got {type(loaded).__name__})", flush=True)
+        except Exception as e:  # noqa: BLE001 — a malformed config must not break eval
+            print(f"[terrain_assets] could not parse {path}: {type(e).__name__}: {e}", flush=True)
             cfg = None
 
     _GEN_CONFIG_CACHE[terrain] = cfg
@@ -114,7 +137,10 @@ def gen_config_geometry(terrain: str | None) -> dict[str, Any] | None:
         return None
     tile = cfg.get("tile", {}) or {}
     return {
-        "row_types": [r["type"] for r in cfg["rows"]],
+        # a row's optional `name:` labels the env type (e.g. two `raised_stairs`
+        # rows as "raised_stairs" and "steep_stairs", or a `sequence` row by
+        # what it chains) — the obstacle `type:` is only the generator class
+        "row_types": [r.get("name", r["type"]) for r in cfg["rows"]],
         "n_rows": len(cfg["rows"]),
         "repeats": int(cfg.get("repeats", 1)),
         "tile_width": float(tile.get("width", 5.0)),
@@ -169,7 +195,7 @@ def _render_preview_png(terrain: str, dest: Path) -> bool:
 
         with open(map_path, "rb") as f:
             heightmap = np.load(f, allow_pickle=True)
-        map_cfg = (yaml.safe_load(cfg_path.read_text()) or {}).get("map", {})
+        map_cfg = (yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}).get("map", {})
         lower = list(map_cfg["lower"])[:2]
         upper = list(map_cfg["upper"])[:2]
         cell_size = float(map_cfg.get("cell_size", 0.05))
@@ -207,7 +233,7 @@ def _render_preview_png(terrain: str, dest: Path) -> bool:
 
         birth_path = _asset_path(terrain, "birth", ".json")
         if birth_path is not None:
-            birth = json.loads(birth_path.read_text())
+            birth = json.loads(birth_path.read_text(encoding="utf-8"))
             starts = np.array([e["start_point"][:2] for e in birth])
             targets = np.array([e["target_point"][:2] for e in birth])
             ax.scatter(starts[:, 0], starts[:, 1], marker="o", color="lime", edgecolors="black", s=40, zorder=5)
@@ -293,7 +319,7 @@ def write_terrain_manifest(
         manifest: dict[str, Any] = {"evals": {}, "terrains": {}}
         if path.is_file():
             try:
-                loaded = json.loads(path.read_text())
+                loaded = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     manifest["evals"].update(loaded.get("evals", {}))
                     manifest["terrains"].update(loaded.get("terrains", {}))
