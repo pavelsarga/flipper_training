@@ -91,6 +91,7 @@ import marv_rl_training  # registers OmegaConf resolvers
 from torchrl.envs import CatFrames
 
 from marv_rl_training.environment.chunked_env import ActionChunkEnv
+from marv_rl_training.policies.chunk_ppo_loss import PrefixMaskedClipPPOLoss, per_dim_tanh_normal
 from marv_rl_training.policies.diffusion_dppo import DiffusionChunkActor, make_dppo_loss
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
@@ -269,6 +270,22 @@ class FtrDiffusionConfig:
     # updates moves the policy further later in training. target_kl bounds the drift
     # directly instead of proxying it through an epoch count.
     target_kl: float | None = None
+    # --- What to do with the T_p - T_a unexecuted steps of each chunk -------------------
+    # By default ClipPPOLoss scores the likelihood ratio of the WHOLE chunk, so the tail is
+    # a zero-signal, full-variance part of the ratio (see policies/chunk_ppo_loss.py).
+    # logprob_prefix_only: ratio and entropy over the executed prefix only.
+    # execution_horizon_random: execute a RANDOM prefix length per macro step during
+    #   collection, drawn from a discretised Gaussian on {1..T_p} centred on
+    #   execution_horizon with std execution_horizon_std (None = T_p - T_a); eval keeps T_a.
+    #   Every chunk position then gets real return. Implies logprob_prefix_only; GAE uses
+    #   control_gamma ** exec_len per transition (gae_opts.gamma is ignored, lmbda is kept).
+    # tail_consistency_coef: weight of the auxiliary loss regressing the unexecuted tail of
+    #   chunk t onto the mean action of chunk t+1 for the same control steps (stop-grad,
+    #   rollout-time plan). 0 = off. Implies logprob_prefix_only so the tail has one loss.
+    logprob_prefix_only: bool = False
+    execution_horizon_random: bool = False
+    execution_horizon_std: float | None = None
+    tail_consistency_coef: float = 0.0
     save_weights_every: int = 0  # 0 = same as eval_and_save_every
     max_eval_steps: int = 0  # 0 = auto: 2 × max_episode_length derived from sim_dt
     # Per-env-type breakdown of mid-training eval success rate — logged to wandb under the
@@ -372,12 +389,29 @@ class FtrDiffusionTrainer:
             shock_scale=self.config.env_cfg_overrides.get("shock_scale"),
         )
         self.T_a = self.config.execution_horizon
+        self._exec_std = None
+        if self.config.execution_horizon_random:
+            self._exec_std = (
+                float(self.config.execution_horizon_std) if self.config.execution_horizon_std is not None
+                else float(self.config.prediction_horizon - self.T_a)
+            )
+        self._masked_loss = bool(
+            self.config.logprob_prefix_only or self.config.execution_horizon_random or self.config.tail_consistency_coef > 0
+        )
         self.ftr_torchrl_env = ActionChunkEnv(
             self.inner_env,
             prediction_horizon=self.config.prediction_horizon,
             execution_horizon=self.T_a,
             control_gamma=self.config.control_gamma,
+            execution_horizon_std=self._exec_std,
         )
+        # Frames per macro step the budget divides by: T_a, or E[exec_len] under randomisation.
+        self.T_a_mean = self.ftr_torchrl_env.expected_execution_horizon
+        if self._exec_std is not None:
+            self.term_logger.info(
+                f"Random execution horizon: std={self._exec_std:.3g}, E[exec_len]={self.T_a_mean:.3f}, "
+                f"p={[round(float(v), 3) for v in self.ftr_torchrl_env._exec_probs]}"
+            )
         self.env = self.ftr_torchrl_env
         _macro_gamma = self.config.gae_opts.get("gamma")
         _expected = self.config.control_gamma ** self.T_a
@@ -436,7 +470,7 @@ class FtrDiffusionTrainer:
             self.env,
             self.actor_operator,
             frames_per_batch=iteration_size,
-            total_frames=self.config.total_frames // self.T_a,
+            total_frames=int(self.config.total_frames / self.T_a_mean),
             **self.config.data_collector_opts,
             device=self.device,
         )
@@ -471,6 +505,18 @@ class FtrDiffusionTrainer:
                 policy_cfg, self.actor_operator, _critic_for_loss, **self.config.ppo_opts
             )
             self.term_logger.info(f"Phase 2: using {type(self.loss_module).__name__}")
+        elif self._masked_loss:
+            self.loss_module = PrefixMaskedClipPPOLoss(
+                self.actor_operator, _critic_for_loss,
+                prediction_horizon=self.config.prediction_horizon,
+                action_dim=self.ftr_torchrl_env.action_dim,
+                tail_consistency_coef=self.config.tail_consistency_coef,
+                **self.config.ppo_opts,
+            )
+            self.term_logger.info(
+                f"Prefix-masked PPO loss (random T_a: {self.config.execution_horizon_random}, "
+                f"tail_consistency_coef: {self.config.tail_consistency_coef})"
+            )
         else:
             self.loss_module = ClipPPOLoss(self.actor_operator, _critic_for_loss, **self.config.ppo_opts)
         self.loss_module = self.loss_module.to(self.config.training_dtype)
@@ -742,13 +788,20 @@ class FtrDiffusionTrainer:
             pbar.update(resume_frames)
             self.term_logger.info(f"Resuming training — progress bar starting at {resume_frames} frames (iter_offset={iter_offset})")
 
+        _frames_so_far = resume_frames or 0
         for i, tensordict_data in enumerate(self.collector):
             effective_i = i + iter_offset
-            total_collected_frames = (effective_i + 1) * frames_per_iter
+            if self._exec_std is not None:
+                # Random prefix lengths: count the control steps actually executed.
+                _frames_this_iter = int(tensordict_data.get(("next", "exec_len")).sum().item())
+            else:
+                _frames_this_iter = frames_per_iter
+            _frames_so_far += _frames_this_iter
+            total_collected_frames = _frames_so_far if self._exec_std is not None else (effective_i + 1) * frames_per_iter
             # Track for crash checkpoint
             self._current_iteration = effective_i
             self._current_total_frames = total_collected_frames
-            pbar.update(frames_per_iter)
+            pbar.update(_frames_this_iter)
 
             # FTR env does not produce "curr_state"; pop safely.
             tensordict_data.pop("curr_state", None)
@@ -798,11 +851,17 @@ class FtrDiffusionTrainer:
             _chunks = []
             for _c in range(0, _n_clean, _gae_chunk):
                 _chunk = tensordict_data[_c:_c + _gae_chunk]
-                self.advantage_module(_chunk)
+                if self._exec_std is not None:
+                    self._variable_gamma_gae(_chunk)
+                else:
+                    self.advantage_module(_chunk)
                 _chunks.append(_chunk)
             for _key in ("advantage", "value_target", "state_value"):
                 if _key in _chunks[0].keys():
                     tensordict_data[_key] = torch.cat([_ch[_key] for _ch in _chunks], dim=0)
+
+            if self.config.tail_consistency_coef > 0:
+                self._add_tail_targets(tensordict_data)
 
             # Sanitize any remaining NaN/Inf (should be rare after trajectory filter).
             nan_count = 0
@@ -828,7 +887,7 @@ class FtrDiffusionTrainer:
             _reward_series = self.ftr_torchrl_env.peek_reward_series()
             reward_grad_stats = (
                 _compute_reward_grad_stats(flat, _reward_series, self.config.time_steps_per_batch, self.T_a)
-                if _reward_series else {}
+                if (_reward_series and self._exec_std is None) else {}
             )
 
             rollout_log_prob = flat["sample_log_prob"].mean().item()
@@ -927,7 +986,7 @@ class FtrDiffusionTrainer:
                 for _k in range(n_subbatches):
                     sub_batch = self.replay_buffer.sample().to(self.device)
                     loss_vals = self.loss_module(sub_batch)
-                    for _dk in ("clip_fraction", "kl_approx", "kl_approx_raw", "kl_step_first", "kl_step_last", "entropy", "loss_objective", "loss_critic"):
+                    for _dk in ("clip_fraction", "kl_approx", "kl_approx_raw", "kl_step_first", "kl_step_last", "entropy", "loss_objective", "loss_critic", "loss_tail", "tail_mse", "exec_len_mean"):
                         if _dk in loss_vals.keys():
                             _diag_sum[_dk] = _diag_sum.get(_dk, 0.0) + loss_vals[_dk].mean().item()
                     _diag_n += 1
@@ -949,6 +1008,8 @@ class FtrDiffusionTrainer:
                     loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"]
                     if "loss_entropy" in loss_vals.keys():
                         loss_value = loss_value + loss_vals["loss_entropy"]
+                    if "loss_tail" in loss_vals.keys():
+                        loss_value = loss_value + loss_vals["loss_tail"]
                     loss_value.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.actor_value_wrapper.parameters(),
@@ -1015,6 +1076,10 @@ class FtrDiffusionTrainer:
                 "train/mean_kl_step_first": _diag_sum.get("kl_step_first", 0.0) / max(1, _diag_n),
                 "train/mean_kl_step_last": _diag_sum.get("kl_step_last", 0.0) / max(1, _diag_n),
                 "train/mean_clip_fraction": _diag_sum.get("clip_fraction", 0.0) / max(1, _diag_n),
+                # Present only under PrefixMaskedClipPPOLoss (random T_a / tail consistency).
+                **({"train/mean_exec_len": _diag_sum["exec_len_mean"] / max(1, _diag_n)} if "exec_len_mean" in _diag_sum else {}),
+                **({"train/mean_tail_loss": _diag_sum["loss_tail"] / max(1, _diag_n),
+                    "train/mean_tail_mse": _diag_sum["tail_mse"] / max(1, _diag_n)} if "loss_tail" in _diag_sum else {}),
                 # Last sub-batch only — the END-of-iteration drift, vs the mean above.
                 "train/final_clip_fraction": loss_vals["clip_fraction"].mean().item(),
                 "train/final_kl_approx": loss_vals["kl_approx"].mean().item(),
@@ -1134,7 +1199,66 @@ class FtrDiffusionTrainer:
                 terrain=self.config.terrain, repeat=1,
             )
             save_per_spot_csv(self._eval_per_spot_csv, per_spot_rows)
+        # The next collection happens before the loop body switches modes back, and the
+        # chunked env only randomises its horizon in training mode.
+        self.env.train()
+        self.actor_operator.train()
         return results
+
+    @torch.no_grad()
+    def _variable_gamma_gae(self, td) -> None:
+        """GAE with a per-transition discount control_gamma ** exec_len (random execution horizon).
+
+        Same estimator as torchrl's GAE (bootstrap cut on ``terminated``, propagation cut on
+        ``done``), written out because torchrl takes one scalar gamma. Writes advantage,
+        value_target and state_value into ``td`` ([N, T] layout, time_dim=1).
+        """
+        lmbda = float(self.config.gae_opts.get("lmbda", 0.95))
+        self.value_operator(td)
+        value = td["state_value"].squeeze(-1)                       # [N, T]
+        next_td = td.get("next")
+        self.value_operator(next_td)
+        next_value = next_td["state_value"].squeeze(-1)
+        reward = next_td["reward"].squeeze(-1)
+        terminated = next_td["terminated"].squeeze(-1).to(value.dtype)
+        done = next_td["done"].squeeze(-1).to(value.dtype)
+        gamma = self.config.control_gamma ** next_td["exec_len"].squeeze(-1).to(value.dtype)
+        delta = reward + gamma * next_value * (1.0 - terminated) - value
+        adv = torch.zeros_like(value)
+        running = torch.zeros_like(value[:, 0])
+        for t in range(value.shape[1] - 1, -1, -1):
+            running = delta[:, t] + gamma[:, t] * lmbda * (1.0 - done[:, t]) * running
+            adv[:, t] = running
+        td["advantage"] = adv.unsqueeze(-1)
+        td["value_target"] = (adv + value).unsqueeze(-1)
+
+    @torch.no_grad()
+    def _add_tail_targets(self, td) -> None:
+        """tail_target / tail_mask for the consistency loss, on the [N, T] rollout.
+
+        For chunk t with executed prefix exec_len[t], chunk step j >= exec_len[t] predicts the
+        same control step as step j - exec_len[t] of chunk t+1. The target is chunk t+1's
+        ROLLOUT-TIME mean action (from the stored loc/scale), masked out where t is the last
+        step of the batch or the episode ended at t.
+        """
+        T_p, A = self.config.prediction_horizon, self.ftr_torchrl_env.action_dim
+        N, T = td.batch_size
+        dist = self.actor_operator.get_dist(td[:1, :1])   # only for support/upscale
+        mode = per_dim_tanh_normal(dist, td["loc"], td["scale"]).deterministic_sample.reshape(N, T, T_p, A)
+        exec_len = td["next", "exec_len"].reshape(N, T)
+        done = td["next", "done"].reshape(N, T)
+        target = torch.zeros(N, T, T_p, A, device=mode.device, dtype=mode.dtype)
+        mask = torch.zeros(N, T, T_p, dtype=torch.bool, device=mode.device)
+        steps = torch.arange(T_p, device=mode.device)
+        for t in range(T - 1):
+            tau = exec_len[:, t]                                   # [N]
+            src = (steps[None, :] - tau[:, None]).clamp(min=0)     # step of chunk t+1
+            valid = (steps[None, :] >= tau[:, None]) & (~done[:, t])[:, None]
+            gathered = torch.gather(mode[:, t + 1], 1, src[..., None].expand(N, T_p, A))
+            target[:, t] = torch.where(valid[..., None], gathered, target[:, t])
+            mask[:, t] = valid
+        td["tail_target"] = target.reshape(N, T, T_p * A)
+        td["tail_mask"] = mask.repeat_interleave(A, dim=2)
 
     def _post_training_evaluation(self) -> dict[str, float]:
         self.term_logger.info(f"Training finished. Running {self.config.eval_repeats_after_training} final eval(s).")
