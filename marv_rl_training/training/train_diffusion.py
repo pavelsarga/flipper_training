@@ -103,7 +103,7 @@ from marv_rl_training.training.eval_data import (
     run_tracked_rollout,
     save_per_spot_csv,
 )
-from marv_rl_training.utils.cfg_schedulers import _make_cfg_scheduler
+from marv_rl_training.utils.cfg_schedulers import SRGatedCoefScheduler, _make_cfg_scheduler
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
 
@@ -309,6 +309,12 @@ class FtrDiffusionConfig:
     # type: 'linear' or 'exponential'. Keys: start_factor, end_factor, total_iters.
     # null = disabled (action_bonus_coef stays constant). Silently skipped if action_bonus_coef is null.
     action_bonus_coef_scheduler: dict | None = None
+    # SR-gated tq_coef ramp (see utils/cfg_schedulers.SRGatedCoefScheduler): once
+    # eval/success_rate >= sr_threshold, ramp tq_coef linearly toward target_coef over
+    # ramp_evals qualifying evals; if success_rate drops below sr_floor, retreat one step.
+    # Keys: target_coef, sr_threshold, sr_floor, ramp_evals (default 10). None = disabled
+    # (tq_coef stays at env_cfg_overrides.tq_coef throughout, as before).
+    tq_coef_schedule: dict | None = None
     # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
     sim_dt: float = 1 / 400
     decimation: int = 5                  # physics steps per policy step; control_freq = 1 / (sim_dt * decimation)
@@ -555,6 +561,27 @@ class FtrDiffusionTrainer:
         else:
             self.action_bonus_scheduler = None
 
+        # ---- tq_coef SR-gated schedule ----
+        _tq_sched = self.config.tq_coef_schedule
+        _tq_init = self.config.env_cfg_overrides.get("tq_coef")
+        if _tq_sched is not None and _tq_init is not None:
+            self.tq_coef_scheduler = SRGatedCoefScheduler(
+                self.ftr_torchrl_env.ftr_env.unwrapped.cfg,
+                "tq_coef",
+                _tq_init,
+                target_value=_tq_sched["target_coef"],
+                sr_threshold=_tq_sched["sr_threshold"],
+                sr_floor=_tq_sched["sr_floor"],
+                ramp_evals=_tq_sched.get("ramp_evals", 10),
+            )
+            self.term_logger.info(
+                f"tq_coef SR-gated schedule: {_tq_init} -> {_tq_sched['target_coef']} "
+                f"(sr_threshold={_tq_sched['sr_threshold']}, sr_floor={_tq_sched['sr_floor']}, "
+                f"ramp_evals={_tq_sched.get('ramp_evals', 10)})"
+            )
+        else:
+            self.tq_coef_scheduler = None
+
         # ---- resume optimizer / schedulers / counters (needs all of the above to exist) ----
         self._restore_training_state()
 
@@ -650,6 +677,8 @@ class FtrDiffusionTrainer:
             checkpoint["step_penalty_scheduler_state_dict"] = self.step_penalty_scheduler.state_dict()
         if self.action_bonus_scheduler is not None:
             checkpoint["action_bonus_scheduler_state_dict"] = self.action_bonus_scheduler.state_dict()
+        if self.tq_coef_scheduler is not None:
+            checkpoint["tq_coef_scheduler_state_dict"] = self.tq_coef_scheduler.state_dict()
         self.run_logger.save_weights(checkpoint, "training_state")
 
     def _load_training_checkpoint(self):
@@ -707,6 +736,8 @@ class FtrDiffusionTrainer:
                 self.step_penalty_scheduler.load_state_dict(checkpoint["step_penalty_scheduler_state_dict"])
             if "action_bonus_scheduler_state_dict" in checkpoint and self.action_bonus_scheduler is not None:
                 self.action_bonus_scheduler.load_state_dict(checkpoint["action_bonus_scheduler_state_dict"])
+            if "tq_coef_scheduler_state_dict" in checkpoint and self.tq_coef_scheduler is not None:
+                self.tq_coef_scheduler.load_state_dict(checkpoint["tq_coef_scheduler_state_dict"])
             self.term_logger.info(
                 f"Loaded training checkpoint: resuming from iteration {checkpoint['iteration']}, "
                 f"total_collected_frames={checkpoint['total_collected_frames']}"
@@ -1045,6 +1076,7 @@ class FtrDiffusionTrainer:
             if self.action_bonus_scheduler is not None:
                 self.action_bonus_scheduler.step()
             _abc_current = self.action_bonus_scheduler.current_value if self.action_bonus_scheduler is not None else self.config.env_cfg_overrides.get("action_bonus_coef")
+            _tq_current = self.tq_coef_scheduler.current_value if self.tq_coef_scheduler is not None else self.config.env_cfg_overrides.get("tq_coef")
 
             log = {
                 **action_log,
@@ -1089,6 +1121,7 @@ class FtrDiffusionTrainer:
                 **{f"train/{g['name']}_lr": g["lr"] for g in self.optim.param_groups},
                 "train/step_penalty": _sp_current if _sp_current is not None else 0.0,
                 "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
+                "train/tq_coef": _tq_current if _tq_current is not None else 0.0,
                 "train/epochs_run": _epochs_run,
                 # Sub-batch updates that actually landed. epochs_run alone is not enough
                 # once target_kl can break mid-epoch: a run reporting epochs_run=1 might
@@ -1117,6 +1150,9 @@ class FtrDiffusionTrainer:
                         for k in eval_log:
                             eval_log[k] /= self.config.eval_repeats
                     log.update(eval_log)
+
+                    if self.tq_coef_scheduler is not None:
+                        self.tq_coef_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
 
                     if self.optuna_trial is not None:
                         eval_step = i // self.config.eval_and_save_every

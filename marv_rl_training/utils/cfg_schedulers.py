@@ -101,3 +101,70 @@ def _make_cfg_scheduler(cfg, attr: str, init_value: float, sched_dict: dict, tot
         return _ExponentialCfgScheduler(cfg, attr, init_value, start_factor=start_f, end_factor=end_f, total_iters=total_i)
     else:
         raise ValueError(f"Unknown scheduler type: {sched_type}. Choose from: linear, exponential")
+
+
+class SRGatedCoefScheduler:
+    """Hysteresis controller that ramps a config float attribute toward a target based on
+    eval success rate, rather than a fixed iteration count.
+
+    Motivation: a pure iteration-based schedule (see the classes above) has to guess in
+    advance how long training takes to reach a given performance level, which varies wildly
+    across coefficient values -- exactly the quantity this is meant to tune. Instead this
+    reacts to the actual eval/success_rate reported at each mid-training eval:
+
+      SR >= sr_threshold  -> advance one ramp step toward target_value
+      SR <  sr_floor       -> retreat one ramp step back toward init_value
+      otherwise            -> hold
+
+    A single step size is used both ways, so a noisy bad eval costs at most one notch, not a
+    full reset -- the point is a self-correcting controller, not a one-shot trigger. Call
+    ``on_eval(success_rate)`` once per mid-training eval, not once per training iteration.
+    """
+
+    def __init__(
+        self,
+        cfg,
+        attr: str,
+        init_value: float,
+        target_value: float,
+        sr_threshold: float,
+        sr_floor: float,
+        ramp_evals: int = 10,
+    ):
+        if sr_floor >= sr_threshold:
+            raise ValueError(f"sr_floor ({sr_floor}) must be < sr_threshold ({sr_threshold}) or the controller oscillates every eval")
+        self._cfg = cfg
+        self._attr = attr
+        self._init = init_value
+        self._target = target_value
+        self._sr_threshold = sr_threshold
+        self._sr_floor = sr_floor
+        self._ramp_evals = max(1, ramp_evals)
+        self._progress = 0  # 0 = init_value, ramp_evals = target_value
+        self._apply()
+
+    def _apply(self):
+        frac = self._progress / self._ramp_evals
+        setattr(self._cfg, self._attr, self._init + (self._target - self._init) * frac)
+
+    def on_eval(self, success_rate: float) -> None:
+        if success_rate >= self._sr_threshold:
+            self._progress = min(self._progress + 1, self._ramp_evals)
+        elif success_rate < self._sr_floor:
+            self._progress = max(self._progress - 1, 0)
+        self._apply()
+
+    @property
+    def current_value(self) -> float:
+        return getattr(self._cfg, self._attr)
+
+    @property
+    def progress_frac(self) -> float:
+        return self._progress / self._ramp_evals
+
+    def state_dict(self) -> dict:
+        return {"_progress": self._progress}
+
+    def load_state_dict(self, state_dict: dict):
+        self._progress = state_dict.get("_progress", 0)
+        self._apply()
