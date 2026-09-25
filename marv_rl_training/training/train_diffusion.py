@@ -315,6 +315,10 @@ class FtrDiffusionConfig:
     # Keys: target_coef, sr_threshold, sr_floor, ramp_evals (default 10). None = disabled
     # (tq_coef stays at env_cfg_overrides.tq_coef throughout, as before).
     tq_coef_schedule: dict | None = None
+    # SR-gated ramp of env_cfg.forward_reward_scale (shaping, action_bonus and goal reward
+    # together) from 1.0 toward target_scale. Keys: target_scale, sr_threshold, sr_floor,
+    # ramp_evals (default 10). None = disabled (scale stays 1.0).
+    forward_reward_scale_schedule: dict | None = None
     # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
     sim_dt: float = 1 / 400
     decimation: int = 5                  # physics steps per policy step; control_freq = 1 / (sim_dt * decimation)
@@ -582,6 +586,22 @@ class FtrDiffusionTrainer:
         else:
             self.tq_coef_scheduler = None
 
+        # ---- forward_reward_scale SR-gated schedule ----
+        _fwd_sched = self.config.forward_reward_scale_schedule
+        if _fwd_sched is not None:
+            self.forward_scale_scheduler = SRGatedCoefScheduler(
+                self.ftr_torchrl_env.ftr_env.unwrapped.cfg,
+                "forward_reward_scale",
+                1.0,
+                target_value=_fwd_sched["target_scale"],
+                sr_threshold=_fwd_sched["sr_threshold"],
+                sr_floor=_fwd_sched["sr_floor"],
+                ramp_evals=_fwd_sched.get("ramp_evals", 10),
+            )
+            self.term_logger.info(f"forward_reward_scale SR-gated schedule: 1.0 -> {_fwd_sched['target_scale']} ({_fwd_sched})")
+        else:
+            self.forward_scale_scheduler = None
+
         # ---- resume optimizer / schedulers / counters (needs all of the above to exist) ----
         self._restore_training_state()
 
@@ -679,6 +699,8 @@ class FtrDiffusionTrainer:
             checkpoint["action_bonus_scheduler_state_dict"] = self.action_bonus_scheduler.state_dict()
         if self.tq_coef_scheduler is not None:
             checkpoint["tq_coef_scheduler_state_dict"] = self.tq_coef_scheduler.state_dict()
+        if self.forward_scale_scheduler is not None:
+            checkpoint["forward_scale_scheduler_state_dict"] = self.forward_scale_scheduler.state_dict()
         self.run_logger.save_weights(checkpoint, "training_state")
 
     def _load_training_checkpoint(self):
@@ -738,6 +760,8 @@ class FtrDiffusionTrainer:
                 self.action_bonus_scheduler.load_state_dict(checkpoint["action_bonus_scheduler_state_dict"])
             if "tq_coef_scheduler_state_dict" in checkpoint and self.tq_coef_scheduler is not None:
                 self.tq_coef_scheduler.load_state_dict(checkpoint["tq_coef_scheduler_state_dict"])
+            if "forward_scale_scheduler_state_dict" in checkpoint and self.forward_scale_scheduler is not None:
+                self.forward_scale_scheduler.load_state_dict(checkpoint["forward_scale_scheduler_state_dict"])
             self.term_logger.info(
                 f"Loaded training checkpoint: resuming from iteration {checkpoint['iteration']}, "
                 f"total_collected_frames={checkpoint['total_collected_frames']}"
@@ -1122,6 +1146,7 @@ class FtrDiffusionTrainer:
                 "train/step_penalty": _sp_current if _sp_current is not None else 0.0,
                 "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
                 "train/tq_coef": _tq_current if _tq_current is not None else 0.0,
+                "train/forward_reward_scale": self.forward_scale_scheduler.current_value if self.forward_scale_scheduler is not None else 1.0,
                 "train/epochs_run": _epochs_run,
                 # Sub-batch updates that actually landed. epochs_run alone is not enough
                 # once target_kl can break mid-epoch: a run reporting epochs_run=1 might
@@ -1153,6 +1178,8 @@ class FtrDiffusionTrainer:
 
                     if self.tq_coef_scheduler is not None:
                         self.tq_coef_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
+                    if self.forward_scale_scheduler is not None:
+                        self.forward_scale_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
 
                     if self.optuna_trial is not None:
                         eval_step = i // self.config.eval_and_save_every
