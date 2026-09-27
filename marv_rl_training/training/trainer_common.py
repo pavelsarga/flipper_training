@@ -14,6 +14,7 @@ __all__ = [
     "attach_per_env_eval_rows",
     "average_eval_repeats",
     "is_unrecoverable_gpu_error",
+    "is_wandb_transport_error",
 ]
 
 # Number of depth columns the per-spot breakdown splits each env type into for the
@@ -72,5 +73,12 @@ def is_unrecoverable_gpu_error(exc: BaseException) -> bool:
     return (
         "CUDA error" in str(exc)
         or "CUDA out of memory" in str(exc)
-        or "CommError" in type(exc).__name__
+        or is_wandb_transport_error(exc)
     )
+
+
+def is_wandb_transport_error(exc: BaseException) -> bool:
+    """True when W&B itself is gone: a CommError, or its backend process having died (raised
+    as a plain ``Exception`` from any ``wandb.log``/``wandb.save``). The GPU is still healthy,
+    so a trainer can save locally before exiting 75."""
+    return "CommError" in type(exc).__name__ or "wandb backend process has shutdown" in str(exc)

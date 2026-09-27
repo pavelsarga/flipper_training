@@ -293,8 +293,11 @@ class RunLogger:
         for f in self.logfiles.values():
             f.close()
         if self.use_wandb:
-            wandb.finish()
-            self.terminal_logger.info(f"W&B run finished (ID: {self.wandb_run_id}).")
+            try:
+                wandb.finish()
+                self.terminal_logger.info(f"W&B run finished (ID: {self.wandb_run_id}).")
+            except Exception as e:
+                self.terminal_logger.warning(f"wandb.finish() failed: {e}")
         if self.use_tensorboard and self.tensorboard_writer is not None:
             self.tensorboard_writer.close()
         self.terminal_logger.info("RunLogger closed.")

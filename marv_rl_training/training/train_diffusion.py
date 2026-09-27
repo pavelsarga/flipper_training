@@ -96,6 +96,7 @@ from marv_rl_training.policies.diffusion_dppo import DiffusionChunkActor, make_d
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_type_registry import default_num_env_types
+from marv_rl_training.training.trainer_common import is_unrecoverable_gpu_error, is_wandb_transport_error
 from marv_rl_training.training.eval_data import (
     aggregate_per_env,
     aggregate_per_spot,
@@ -782,14 +783,17 @@ class FtrDiffusionTrainer:
         except Exception as e:
             self.term_logger.error(f"Training failed: {e}")
             traceback.print_exception(e)
-            if "CUDA error" in str(e) or "CUDA out of memory" in str(e) or "CommError" in str(type(e).__name__):
+            wandb_dead = is_wandb_transport_error(e)
+            if is_unrecoverable_gpu_error(e) and not wandb_dead:
                 # CUDA context is dead — saving weights and running atexit/Isaac Sim
                 # cleanup handlers will deadlock. Exit immediately so the SLURM slot
                 # is freed and the job can be requeued rather than hanging for hours.
-                # Also exit on W&B CommError (TLS cert issues) to allow respawn.
                 self.term_logger.error(f"{type(e).__name__} detected — calling os._exit(75) to skip cleanup.")
                 import os as _os
                 _os._exit(75)
+            if wandb_dead:
+                # GPU is fine, only W&B is gone: save locally without it, then respawn.
+                self.run_logger.use_wandb = False
             try:
                 self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), "policy_crash")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_crash")
@@ -804,6 +808,13 @@ class FtrDiffusionTrainer:
                     )
             except Exception:
                 pass
+            if wandb_dead:
+                self.run_logger.close()
+                self.term_logger.error("W&B transport failure — crash checkpoint saved locally, calling os._exit(75) to respawn.")
+                sys.stdout.flush()
+                sys.stderr.flush()
+                import os as _os
+                _os._exit(75)
             raise
         finally:
             if self.run_logger is not None:
