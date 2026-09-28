@@ -78,6 +78,10 @@ parser.add_argument(
     help="Identifier for this eval run (default: auto UTC timestamp).",
 )
 parser.add_argument(
+    "--results_json", type=str, default=None, metavar="PATH",
+    help="Write the metrics averaged over all repeats to this JSON file.",
+)
+parser.add_argument(
     "--print_actions", action="store_true",
     help="Print the policy's action vector each step for env 0. Requires num_envs=1.",
 )
@@ -384,7 +388,7 @@ def run_eval(
     eval_id: "str | None" = None,
     policy_label: "str | None" = None,
     print_actions: bool = False,
-) -> None:
+) -> dict[str, float]:
     cfg = FtrDiffusionConfig(**raw_cfg)
     device = set_device(cfg.device)
     seed_all(cfg.seed)
@@ -562,12 +566,14 @@ def run_eval(
             save_eval_csvs(_output_dir, [summary], per_env_rows, per_spot_rows, episode_records)
             logger.info(f"Saved repeat {r+1} CSV → {_output_dir}")
 
+    common_keys = set.intersection(*(set(d) for d in all_results))
+    averaged = {k: sum(d[k] for d in all_results) / repeats for k in all_results[0] if k in common_keys}
     if repeats > 1:
-        averaged = {k: sum(d[k] for d in all_results) / repeats for k in all_results[0]}
         _print_results(averaged, f"AVERAGE over {repeats} repeats")
 
     if _output_dir:
         logger.info(f"Eval complete. Results saved to {_output_dir}  (eval_id={_eval_id})")
+    return averaged
 
 
 # ============================================================
@@ -676,7 +682,7 @@ if __name__ == "__main__":
         accel_path.unlink(missing_ok=True)  # remove stale/corrupted file from a previous run
         ftr_gym_env.unwrapped.cfg.log_raw_accel_path = str(accel_path)
 
-    run_eval(
+    averaged = run_eval(
         raw_cfg, ftr_gym_env,
         max_steps=max_steps,
         repeats=args.repeats,
@@ -690,6 +696,12 @@ if __name__ == "__main__":
         eval_id=args.eval_id,
         print_actions=args.print_actions,
     )
+    if args.results_json:
+        import json
+        Path(args.results_json).parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(args.results_json).with_suffix(".tmp")
+        tmp.write_text(json.dumps(averaged, indent=1))
+        tmp.replace(args.results_json)
 
     # os._exit skips atexit (needed — Isaac Sim deadlocks there) but ALSO skips flushing
     # stdout. When stdout is a redirected file it is block-buffered, so without this the

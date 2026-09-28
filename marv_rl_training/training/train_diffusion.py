@@ -64,7 +64,13 @@ if __name__ == "__main__":
 # ============================================================
 # BLOCK 2 — All other imports (Isaac Sim is now running)
 # ============================================================
+import ctypes
+import json
+import math
+import signal
+import subprocess
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -320,6 +326,12 @@ class FtrDiffusionConfig:
     # together) from 1.0 toward target_scale. Keys: target_scale, sr_threshold, sr_floor,
     # ramp_evals (default 10). None = disabled (scale stays 1.0).
     forward_reward_scale_schedule: dict | None = None
+    # Validation eval on a second terrain, to measure overfitting to the training course while
+    # training runs. IsaacLab allows one scene per process, so at every in-training eval the
+    # checkpoint just saved is evaluated by a separate eval_diffusion.py process alongside
+    # training, and its results are logged as val/* (val.csv) once it finishes. Keys: terrain,
+    # num_envs (default 256), repeats (1), timeout_s (3600). None = disabled.
+    validation_eval: dict | None = None
     # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
     sim_dt: float = 1 / 400
     decimation: int = 5                  # physics steps per policy step; control_freq = 1 / (sim_dt * decimation)
@@ -343,6 +355,17 @@ class FtrDiffusionConfig:
 # ============================================================
 # BLOCK 4 — FtrDiffusionTrainer
 # ============================================================
+
+_PR_SET_PDEATHSIG = 1
+_libc_prctl = ctypes.CDLL("libc.so.6", use_errno=True).prctl
+_VAL_KEYS = ("success_rate", "failure_rate", "explosion_rate", "tq_episode", "tq_success", "tq_scored", "mean_step_reward")
+
+
+def _die_with_parent() -> None:
+    # A trainer that os._exit(75)s must not leave its validation eval holding the GPU
+    # through the respawn.
+    _libc_prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
+
 
 class FtrDiffusionTrainer:
     """PPO trainer for a receding-horizon policy: one RL step is T_a control steps.
@@ -603,6 +626,10 @@ class FtrDiffusionTrainer:
         else:
             self.forward_scale_scheduler = None
 
+        self._val_proc: subprocess.Popen | None = None
+        self._val_meta: dict = {}
+        self._last_eval_log: dict[str, float] = {}
+
         # ---- resume optimizer / schedulers / counters (needs all of the above to exist) ----
         self._restore_training_state()
 
@@ -777,6 +804,9 @@ class FtrDiffusionTrainer:
         try:
             self._train()
             post_log = self._post_training_evaluation()
+            final_val = self._poll_validation_eval(wait=True)
+            if final_val:
+                self.run_logger.log_data(final_val, int(final_val["val/checkpoint_frames"]))
         except KeyboardInterrupt:
             self.term_logger.info("Training interrupted by user.")
             post_log = None
@@ -1191,6 +1221,8 @@ class FtrDiffusionTrainer:
                         self.tq_coef_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
                     if self.forward_scale_scheduler is not None:
                         self.forward_scale_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
+                    self._last_eval_log = eval_log
+                    self._launch_validation_eval(total_collected_frames, eval_log)
 
                     if self.optuna_trial is not None:
                         eval_step = i // self.config.eval_and_save_every
@@ -1212,6 +1244,7 @@ class FtrDiffusionTrainer:
                         _os._exit(75)
                     self.term_logger.warning(f"Eval rollout failed (physics explosion): {e}. Skipping eval metrics this checkpoint.")
 
+            log.update(self._poll_validation_eval())
             self.run_logger.log_data(log, total_collected_frames)
 
         # Name the final checkpoint by the CUMULATIVE frame count, not config.total_frames.
@@ -1231,6 +1264,79 @@ class FtrDiffusionTrainer:
         # frame 32768 but schedules from 28672, silently losing two iterations of schedule
         # progress on every resume.
         self._save_training_checkpoint(_final_iter, _final_frames)
+
+        # Validate the final policy too, alongside the post-training eval; train() collects it.
+        if self.config.validation_eval is not None:
+            pending = self._poll_validation_eval(wait=True)
+            if pending:
+                self.run_logger.log_data(pending, _final_frames)
+            self._launch_validation_eval(_final_frames, self._last_eval_log)
+
+    def _launch_validation_eval(self, frames: int, train_eval: dict[str, float]) -> None:
+        cfg = self.config.validation_eval
+        if cfg is None:
+            return
+        if self._val_proc is not None:
+            self.term_logger.warning(f"Validation eval of frame {self._val_meta['frames']} still running — skipping frame {frames}.")
+            return
+        if not (self.run_logger.weights_path / f"policy_step_{frames}.pth").exists():
+            self.term_logger.warning(f"No policy_step_{frames}.pth — skipping validation eval.")
+            return
+        out_dir = self.run_logger.logpath / "validation" / str(frames)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "results.json").unlink(missing_ok=True)
+        cmd = [
+            sys.executable, str(Path(__file__).with_name("eval_diffusion.py")),
+            "--rundir", str(self.run_logger.logpath),
+            "--policy", f"policy_step_{frames}.pth", "--vecnorm", f"vecnorm_step_{frames}.pth",
+            "--map", cfg["terrain"], "--num_envs", str(cfg.get("num_envs", 256)), "--repeats", str(cfg.get("repeats", 1)),
+            "--output_dir", str(out_dir), "--eval_id", f"val_{frames}", "--results_json", str(out_dir / "results.json"),
+            "--headless",
+        ]
+        log_f = open(out_dir / "eval.log", "w")
+        self._val_proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=_die_with_parent)
+        self._val_meta = {
+            "frames": frames, "out_dir": out_dir, "log_f": log_f, "start": time.monotonic(),
+            "train_sr": train_eval.get("eval/success_rate", math.nan), "train_tq": train_eval.get("eval/tq_episode", math.nan),
+        }
+        self.term_logger.info(f"Validation eval of frame {frames} on '{cfg['terrain']}' started (pid {self._val_proc.pid}) → {out_dir}")
+
+    def _poll_validation_eval(self, wait: bool = False) -> dict[str, float]:
+        """val/* metrics of the validation eval once it has finished, else {}. Always the same
+        key set, since RunLogger truncates a CSV whose columns change."""
+        if self._val_proc is None:
+            return {}
+        meta = self._val_meta
+        remaining = self.config.validation_eval.get("timeout_s", 3600) - (time.monotonic() - meta["start"])
+        if self._val_proc.poll() is None:
+            if remaining > 0 and not wait:
+                return {}
+            try:
+                self._val_proc.wait(timeout=max(remaining, 0))
+            except subprocess.TimeoutExpired:
+                self._val_proc.kill()
+                self._val_proc.wait()
+                self.term_logger.warning(f"Validation eval of frame {meta['frames']} timed out and was killed.")
+        proc, self._val_proc = self._val_proc, None
+        meta["log_f"].close()
+        res_path = meta["out_dir"] / "results.json"
+        if not res_path.exists():
+            self.term_logger.warning(
+                f"Validation eval of frame {meta['frames']} produced no results (exit {proc.returncode}) — see {meta['out_dir'] / 'eval.log'}"
+            )
+            return {}
+        res = json.loads(res_path.read_text())
+        out = {f"val/{k}": float(res.get(f"eval/{k}", math.nan)) for k in _VAL_KEYS}
+        out["val/checkpoint_frames"] = meta["frames"]
+        out["val/train_success_rate"] = meta["train_sr"]
+        out["val/train_tq_episode"] = meta["train_tq"]
+        out["val/success_rate_gap"] = meta["train_sr"] - out["val/success_rate"]
+        out["val/tq_episode_gap"] = meta["train_tq"] - out["val/tq_episode"]
+        self.term_logger.info(
+            f"Validation eval of frame {meta['frames']}: SR {out['val/success_rate']:.3f} (train {meta['train_sr']:.3f}), "
+            f"TQ {out['val/tq_episode']:.3f} (train {meta['train_tq']:.3f})"
+        )
+        return out
 
     def _get_eval_rollout_results(self) -> dict[str, float]:
         self.env.eval()
