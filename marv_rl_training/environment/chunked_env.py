@@ -156,7 +156,8 @@ class ActionChunkEnv(EnvBase):
         Track velocity and yaw rate are zero. The flipper command holds the current angle:
         in ``position`` mode that means inverting the env's ``[-1, 1] -> [low, high]`` map
         on the measured angle, in ``velocity``/``increment`` mode a zero command already
-        integrates to no change.
+        integrates to no change, and in ``state`` mode all-zero scores select state 0 (N),
+        which is the state a reset puts the robot in.
         """
         env = self.inner.ftr_env.unwrapped
         num_envs = self.batch_size[0]

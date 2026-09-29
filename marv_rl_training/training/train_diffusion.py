@@ -1004,11 +1004,18 @@ class FtrDiffusionTrainer:
                 "action/w_mean":  executed[..., 1].mean().item(),
                 "action/w_std":   executed[..., 1].std().item(),
             }
-            flipper_num = self.ftr_torchrl_env.ftr_env.unwrapped.flipper_num
-            flipper_names = ["fl", "fr", "rl", "rr"] if flipper_num == 4 else ["front", "rear"]
-            for fi, fname in enumerate(flipper_names):
-                action_log[f"action/flipper_{fname}_mean"] = executed[..., 2 + fi].mean().item()
-                action_log[f"action/flipper_{fname}_std"]  = executed[..., 2 + fi].std().item()
+            _env_cfg = self.ftr_torchrl_env.ftr_env.unwrapped.cfg
+            if _env_cfg.flipper_control_mode == "state":
+                # Columns 2.. are per-state scores; the env applies their argmax (before cooldown).
+                _proposed = executed[..., 2:].argmax(dim=-1)
+                for si, (sname, _, _) in enumerate(_env_cfg.flipper_states_deg):
+                    action_log[f"action/state_{sname}"] = (_proposed == si).float().mean().item()
+            else:
+                flipper_num = self.ftr_torchrl_env.ftr_env.unwrapped.flipper_num
+                flipper_names = ["fl", "fr", "rl", "rr"] if flipper_num == 4 else ["front", "rear"]
+                for fi, fname in enumerate(flipper_names):
+                    action_log[f"action/flipper_{fname}_mean"] = executed[..., 2 + fi].mean().item()
+                    action_log[f"action/flipper_{fname}_std"]  = executed[..., 2 + fi].std().item()
             # Within-chunk temporal smoothness — the quantity action chunking exists to
             # improve. Measured over the whole predicted chunk, and over the flipper block
             # separately since that is where snapping would show up first under position
