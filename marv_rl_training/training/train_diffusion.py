@@ -326,6 +326,10 @@ class FtrDiffusionConfig:
     # together) from 1.0 toward target_scale. Keys: target_scale, sr_threshold, sr_floor,
     # ramp_evals (default 10). None = disabled (scale stays 1.0).
     forward_reward_scale_schedule: dict | None = None
+    # SR-gated ramp of env_cfg.smooth_coef (motion-smoothness penalty) from
+    # env_cfg_overrides.smooth_coef toward target_coef, same rules as tq_coef_schedule.
+    # Keys: target_coef, sr_threshold, sr_floor, ramp_evals (default 10). None = disabled.
+    smooth_coef_schedule: dict | None = None
     # Validation eval on a second terrain, to measure overfitting to the training course while
     # training runs. IsaacLab allows one scene per process, so at every in-training eval the
     # checkpoint just saved is evaluated by a separate eval_diffusion.py process alongside
@@ -626,6 +630,23 @@ class FtrDiffusionTrainer:
         else:
             self.forward_scale_scheduler = None
 
+        # ---- smooth_coef SR-gated schedule ----
+        _sm_sched = self.config.smooth_coef_schedule
+        _sm_init = self.config.env_cfg_overrides.get("smooth_coef")
+        if _sm_sched is not None and _sm_init is not None:
+            self.smooth_coef_scheduler = SRGatedCoefScheduler(
+                self.ftr_torchrl_env.ftr_env.unwrapped.cfg,
+                "smooth_coef",
+                _sm_init,
+                target_value=_sm_sched["target_coef"],
+                sr_threshold=_sm_sched["sr_threshold"],
+                sr_floor=_sm_sched["sr_floor"],
+                ramp_evals=_sm_sched.get("ramp_evals", 10),
+            )
+            self.term_logger.info(f"smooth_coef SR-gated schedule: {_sm_init} -> {_sm_sched['target_coef']} ({_sm_sched})")
+        else:
+            self.smooth_coef_scheduler = None
+
         self._val_proc: subprocess.Popen | None = None
         self._val_meta: dict = {}
         self._last_eval_log: dict[str, float] = {}
@@ -729,6 +750,8 @@ class FtrDiffusionTrainer:
             checkpoint["tq_coef_scheduler_state_dict"] = self.tq_coef_scheduler.state_dict()
         if self.forward_scale_scheduler is not None:
             checkpoint["forward_scale_scheduler_state_dict"] = self.forward_scale_scheduler.state_dict()
+        if self.smooth_coef_scheduler is not None:
+            checkpoint["smooth_coef_scheduler_state_dict"] = self.smooth_coef_scheduler.state_dict()
         self.run_logger.save_weights(checkpoint, "training_state")
 
     def _load_training_checkpoint(self):
@@ -790,6 +813,8 @@ class FtrDiffusionTrainer:
                 self.tq_coef_scheduler.load_state_dict(checkpoint["tq_coef_scheduler_state_dict"])
             if "forward_scale_scheduler_state_dict" in checkpoint and self.forward_scale_scheduler is not None:
                 self.forward_scale_scheduler.load_state_dict(checkpoint["forward_scale_scheduler_state_dict"])
+            if "smooth_coef_scheduler_state_dict" in checkpoint and self.smooth_coef_scheduler is not None:
+                self.smooth_coef_scheduler.load_state_dict(checkpoint["smooth_coef_scheduler_state_dict"])
             self.term_logger.info(
                 f"Loaded training checkpoint: resuming from iteration {checkpoint['iteration']}, "
                 f"total_collected_frames={checkpoint['total_collected_frames']}"
@@ -1194,6 +1219,8 @@ class FtrDiffusionTrainer:
                 "train/step_penalty": _sp_current if _sp_current is not None else 0.0,
                 "train/action_bonus_coef": _abc_current if _abc_current is not None else 0.0,
                 "train/tq_coef": _tq_current if _tq_current is not None else 0.0,
+                "train/smooth_coef": (self.smooth_coef_scheduler.current_value if self.smooth_coef_scheduler is not None
+                                      else (self.config.env_cfg_overrides.get("smooth_coef") or 0.0)),
                 "train/forward_reward_scale": self.forward_scale_scheduler.current_value if self.forward_scale_scheduler is not None else 1.0,
                 "train/epochs_run": _epochs_run,
                 # Sub-batch updates that actually landed. epochs_run alone is not enough
@@ -1228,6 +1255,8 @@ class FtrDiffusionTrainer:
                         self.tq_coef_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
                     if self.forward_scale_scheduler is not None:
                         self.forward_scale_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
+                    if self.smooth_coef_scheduler is not None:
+                        self.smooth_coef_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
                     self._last_eval_log = eval_log
                     self._launch_validation_eval(total_collected_frames, eval_log)
 
