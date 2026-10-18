@@ -114,3 +114,18 @@ def test_reset_is_per_env_and_pop_clears():
     tr.reset(torch.tensor([0]), torch.zeros(1, 3), quat_pitch(torch.zeros(1)), torch.zeros(1, 3), torch.zeros(1, 3))
     assert tr.episode_cost[0].abs().max() == 0 and torch.equal(tr.episode_cost[1], ep1)
     assert tr.pop_step()[1].sum() > 0 and tr.step_cost.abs().max() == 0
+
+
+def test_eval_under_inference_mode_then_training_step():
+    """The eval rollout runs under inference_mode, the training rollout and resets outside it
+    (job 11807492 died at its first eval: a buffer rebound inside became an inference tensor)."""
+    _, tr = drive(smooth_bump, [0.4, 0.4], length=0.5)
+    args = (torch.tensor([[0.6, 0.0, 0.0]] * 2), quat_pitch(torch.zeros(2)), torch.zeros(2, 3), torch.tensor([[0.4, 0, 0]] * 2))
+    with torch.inference_mode():
+        tr.substep(*args)
+        tr.pop_step()
+    with torch.no_grad():
+        tr.substep(*args)
+        tr.reset(torch.tensor([0]), *(a[:1] for a in args))
+        tr.pop_step()
+    assert not any(t.is_inference() for t in vars(tr).values() if isinstance(t, torch.Tensor))
