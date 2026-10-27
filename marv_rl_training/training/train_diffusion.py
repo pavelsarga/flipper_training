@@ -110,7 +110,7 @@ from marv_rl_training.training.eval_data import (
     run_tracked_rollout,
     save_per_spot_csv,
 )
-from marv_rl_training.utils.cfg_schedulers import SRGatedCoefScheduler, _make_cfg_scheduler
+from marv_rl_training.utils.cfg_schedulers import SlowStartCoefScheduler, SRGatedCoefScheduler, _make_cfg_scheduler
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
 from marv_rl_training.utils.torch_utils import seed_all, set_device
 
@@ -633,7 +633,18 @@ class FtrDiffusionTrainer:
         # ---- smooth_coef SR-gated schedule ----
         _sm_sched = self.config.smooth_coef_schedule
         _sm_init = self.config.env_cfg_overrides.get("smooth_coef")
-        if _sm_sched is not None and _sm_init is not None:
+        if _sm_sched is not None and _sm_init is not None and _sm_sched.get("mode") == "slow_start":
+            # TCP-style: slow start / linear growth, backs off on a falling SR trend
+            _sm_opts = {k: v for k, v in _sm_sched.items() if k not in ("mode", "target_coef")}
+            self.smooth_coef_scheduler = SlowStartCoefScheduler(
+                self.ftr_torchrl_env.ftr_env.unwrapped.cfg,
+                "smooth_coef",
+                _sm_init,
+                target_value=_sm_sched["target_coef"],
+                **_sm_opts,
+            )
+            self.term_logger.info(f"smooth_coef slow-start schedule: {_sm_init} -> cap {_sm_sched['target_coef']} ({_sm_sched})")
+        elif _sm_sched is not None and _sm_init is not None:
             self.smooth_coef_scheduler = SRGatedCoefScheduler(
                 self.ftr_torchrl_env.ftr_env.unwrapped.cfg,
                 "smooth_coef",
@@ -1023,13 +1034,18 @@ class FtrDiffusionTrainer:
             action_dim = self.ftr_torchrl_env.action_dim
             chunk = flat["action"].reshape(-1, self.config.prediction_horizon, action_dim)
             executed = chunk[:, : self.T_a]
+            _unwrapped = self.ftr_torchrl_env.ftr_env.unwrapped
+            # flipper-only policy (env velocity_controller): the chunk holds the flippers alone and
+            # v/w are the env's own, logged from what it applied on the last step
+            _fo = 0 if getattr(_unwrapped, "flipper_only", False) else 2
+            _vw = _unwrapped.actions[:, :2] if _fo == 0 else executed[..., :2]
             action_log = {
-                "action/v_mean":  executed[..., 0].mean().item(),
-                "action/v_std":   executed[..., 0].std().item(),
-                "action/w_mean":  executed[..., 1].mean().item(),
-                "action/w_std":   executed[..., 1].std().item(),
+                "action/v_mean":  _vw[..., 0].mean().item(),
+                "action/v_std":   _vw[..., 0].std().item(),
+                "action/w_mean":  _vw[..., 1].mean().item(),
+                "action/w_std":   _vw[..., 1].std().item(),
             }
-            _env_cfg = self.ftr_torchrl_env.ftr_env.unwrapped.cfg
+            _env_cfg = _unwrapped.cfg
             if _env_cfg.flipper_control_mode == "state":
                 # Columns 2.. are per-state scores; the env applies their argmax (before cooldown).
                 _proposed = executed[..., 2:].argmax(dim=-1)
@@ -1039,8 +1055,8 @@ class FtrDiffusionTrainer:
                 flipper_num = self.ftr_torchrl_env.ftr_env.unwrapped.flipper_num
                 flipper_names = ["fl", "fr", "rl", "rr"] if flipper_num == 4 else ["front", "rear"]
                 for fi, fname in enumerate(flipper_names):
-                    action_log[f"action/flipper_{fname}_mean"] = executed[..., 2 + fi].mean().item()
-                    action_log[f"action/flipper_{fname}_std"]  = executed[..., 2 + fi].std().item()
+                    action_log[f"action/flipper_{fname}_mean"] = executed[..., _fo + fi].mean().item()
+                    action_log[f"action/flipper_{fname}_std"]  = executed[..., _fo + fi].std().item()
             # Within-chunk temporal smoothness — the quantity action chunking exists to
             # improve. Measured over the whole predicted chunk, and over the flipper block
             # separately since that is where snapping would show up first under position
@@ -1048,7 +1064,7 @@ class FtrDiffusionTrainer:
             if self.config.prediction_horizon > 1:
                 _delta = (chunk[:, 1:] - chunk[:, :-1]).abs()
                 action_log["action/chunk_step_delta"] = _delta.mean().item()
-                action_log["action/chunk_step_delta_flipper"] = _delta[..., 2:].mean().item()
+                action_log["action/chunk_step_delta_flipper"] = _delta[..., _fo:].mean().item()
                 action_log["action/chunk_step_delta_max"] = _delta.max().item()
             # ⚠ The three metrics above are computed on SAMPLED actions, so while the policy's
             # scale is still ~1 they measure sampling noise, not the predicted trajectory: for
@@ -1062,7 +1078,7 @@ class FtrDiffusionTrainer:
                 if self.config.prediction_horizon > 1:
                     _ld = (_loc[:, 1:] - _loc[:, :-1]).abs()
                     action_log["action/loc_step_delta"] = _ld.mean().item()
-                    action_log["action/loc_step_delta_flipper"] = _ld[..., 2:].mean().item()
+                    action_log["action/loc_step_delta_flipper"] = _ld[..., _fo:].mean().item()
                 action_log["action/loc_abs_mean"] = _loc.abs().mean().item()
             if "scale" in flat.keys():
                 action_log["action/scale_mean"] = flat["scale"].mean().item()
@@ -1221,6 +1237,8 @@ class FtrDiffusionTrainer:
                 "train/tq_coef": _tq_current if _tq_current is not None else 0.0,
                 "train/smooth_coef": (self.smooth_coef_scheduler.current_value if self.smooth_coef_scheduler is not None
                                       else (self.config.env_cfg_overrides.get("smooth_coef") or 0.0)),
+                **(self.smooth_coef_scheduler.diagnostics("train/smooth_sched")
+                   if isinstance(self.smooth_coef_scheduler, SlowStartCoefScheduler) else {}),
                 "train/forward_reward_scale": self.forward_scale_scheduler.current_value if self.forward_scale_scheduler is not None else 1.0,
                 "train/epochs_run": _epochs_run,
                 # Sub-batch updates that actually landed. epochs_run alone is not enough
@@ -1256,7 +1274,7 @@ class FtrDiffusionTrainer:
                     if self.forward_scale_scheduler is not None:
                         self.forward_scale_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
                     if self.smooth_coef_scheduler is not None:
-                        self.smooth_coef_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0))
+                        self.smooth_coef_scheduler.on_eval(eval_log.get("eval/success_rate", 0.0), frames=total_collected_frames)
                     self._last_eval_log = eval_log
                     self._launch_validation_eval(total_collected_frames, eval_log)
 

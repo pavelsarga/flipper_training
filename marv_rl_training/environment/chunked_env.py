@@ -170,8 +170,9 @@ class ActionChunkEnv(EnvBase):
         if low is None:
             return action  # flippers locked horizontal — zero is already neutral
 
-        # Same offset _pre_physics_step uses to slice the flipper block out of the action.
-        flipper_offset = 4 if env.cfg.flipper_style else 2
+        # Same offset _pre_physics_step uses to slice the flipper block out of the action; a
+        # flipper-only policy (velocity_controller set) has no v/w columns at all.
+        flipper_offset = 0 if getattr(env, "flipper_only", False) else 4 if env.cfg.flipper_style else 2
         span = (high - low).clamp_min(1e-6)
         unit = 2.0 * (env.flipper_positions.to(self.device) - low.to(self.device)) / span.to(self.device) - 1.0
         action[:, flipper_offset:] = unit.clamp(-1.0, 1.0).to(action.dtype)
