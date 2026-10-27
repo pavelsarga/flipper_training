@@ -66,6 +66,7 @@ if __name__ == "__main__":
 # ============================================================
 import ctypes
 import json
+import contextlib
 import math
 import signal
 import subprocess
@@ -336,6 +337,9 @@ class FtrDiffusionConfig:
     # training, and its results are logged as val/* (val.csv) once it finishes. Keys: terrain,
     # num_envs (default 256), repeats (1), timeout_s (3600). None = disabled.
     validation_eval: dict | None = None
+    # Co-trained speed net (training/velocity_rl.py): the velocity_controller {type: rl} speed agent's
+    # learner config -- il_dir, rates, reward weights. None = the speed controller is not trained.
+    velocity_rl: dict | None = None
     # Physics tuning (applied to env_cfg.robot / env_cfg.sim before env creation)
     sim_dt: float = 1 / 400
     decimation: int = 5                  # physics steps per policy step; control_freq = 1 / (sim_dt * decimation)
@@ -504,6 +508,23 @@ class FtrDiffusionTrainer:
         # The collector counts macro-step transitions; self.config.total_frames counts
         # control steps. They differ by T_a — see the class docstring.
         iteration_size = self.config.time_steps_per_batch * self.config.num_robots
+        # ---- co-trained speed agent (velocity_rl) ----
+        # Attached to the env's rl velocity controller before the collector's first step, so the
+        # agent drives (and records) from the first transition on.
+        self.velocity_agent = None
+        if self.config.velocity_rl is not None:
+            from marv_rl_training.training.velocity_rl import make_agent
+            _ftr = ftr_gym_env.unwrapped
+            _ctrl = getattr(_ftr, "_vel_ctrl", None)
+            if not hasattr(_ctrl, "attach"):
+                raise ValueError("velocity_rl needs env_cfg_overrides.velocity_controller {type: rl, weights: ...}")
+            vrl = OmegaConf.to_container(self.config.velocity_rl, resolve=True) \
+                if OmegaConf.is_config(self.config.velocity_rl) else dict(self.config.velocity_rl)
+            self.velocity_agent = make_agent(vrl, _ftr.num_envs, _ftr.step_dt, self.device)
+            _ctrl.attach(self.velocity_agent)
+            self.term_logger.info(f"velocity_rl: speed agent from {vrl.get('il_dir')} attached "
+                                  f"(records {self.velocity_agent.K} of {_ftr.num_envs} envs)")
+
         self.collector = SyncDataCollector(
             self.env,
             self.actor_operator,
@@ -763,7 +784,15 @@ class FtrDiffusionTrainer:
             checkpoint["forward_scale_scheduler_state_dict"] = self.forward_scale_scheduler.state_dict()
         if self.smooth_coef_scheduler is not None:
             checkpoint["smooth_coef_scheduler_state_dict"] = self.smooth_coef_scheduler.state_dict()
+        if self.velocity_agent is not None:
+            checkpoint["velocity_agent_state_dict"] = self.velocity_agent.state_dict()
         self.run_logger.save_weights(checkpoint, "training_state")
+
+    def _export_velocity_agent(self, name: str):
+        """weights/<name>.pt: the co-trained speed net as TorchScript (eval_diffusion pairs it with the
+        flipper checkpoint of the same name; the Gazebo velocity node loads it as well)."""
+        if self.velocity_agent is not None:
+            self.velocity_agent.export(str(self.run_logger.weights_path / f"{name}.pt"))
 
     def _load_training_checkpoint(self):
         """Load training state and return (iteration, total_collected_frames) to resume from.
@@ -795,6 +824,9 @@ class FtrDiffusionTrainer:
                     "Optimizer momentum will be reset; training may be noisy for first few iterations."
                 )
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if self.velocity_agent is not None and "velocity_agent_state_dict" in checkpoint:
+                self.velocity_agent.load_state_dict(checkpoint["velocity_agent_state_dict"])
+                self.term_logger.info(f"velocity_rl: restored the speed agent (update {self.velocity_agent.updates})")
             # ⚠ Re-apply the CONFIGURED learning rates after restoring.
             #
             # optim.load_state_dict() restores param_groups including "lr", and an
@@ -1253,10 +1285,16 @@ class FtrDiffusionTrainer:
                 "explosions/skipped_updates_frac": skipped_updates / (n_subbatches * self.config.epochs_per_batch),
             }
 
+            if self.velocity_agent is not None:
+                # its transitions are this batch's, recorded while the collector stepped the env
+                log.update(self.velocity_agent.update())
+                log.update(self.velocity_agent.pop_stats())
+
             save_every = self.config.save_weights_every or self.config.eval_and_save_every
             if effective_i % save_every == 0:
                 self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), f"policy_step_{total_collected_frames}")
                 self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
+                self._export_velocity_agent(f"velocity_rl_step_{total_collected_frames}")
                 self._save_training_checkpoint(effective_i, total_collected_frames)
             if effective_i % self.config.eval_and_save_every == 0 and effective_i > 0:
                 try:
@@ -1312,6 +1350,8 @@ class FtrDiffusionTrainer:
         self.run_logger.save_weights(self.vecnorm.state_dict(), "vecnorm_final")
         self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), f"policy_step_{_final_frames}")
         self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{_final_frames}")
+        self._export_velocity_agent("velocity_rl_final")
+        self._export_velocity_agent(f"velocity_rl_step_{_final_frames}")
         # Save the matching training state too. Without this the run ends with weights one
         # save-interval ahead of the optimizer/scheduler state that training_state.pth holds,
         # so a resume restores mismatched pairs — measured on the resume test: weights from
@@ -1401,12 +1441,14 @@ class FtrDiffusionTrainer:
             1, (self.ftr_torchrl_env.ftr_env.unwrapped.max_episode_length * 2) // self.T_a
         )
         self.ftr_torchrl_env.enable_per_env_tracking()
-        results, episode_records = run_tracked_rollout(
-            self.env, self.ftr_torchrl_env, self.ftr_torchrl_env.ftr_env, self.actor_operator, max_eval_steps,
-            num_env_types=self._eval_num_env_types,
-            env_type_names=self._eval_env_type_names,
-            terrain=self.config.terrain,
-        )
+        # the co-trained speed agent drives evals with its mean speed and records nothing
+        with (self.velocity_agent.evaluating() if self.velocity_agent is not None else contextlib.nullcontext()):
+            results, episode_records = run_tracked_rollout(
+                self.env, self.ftr_torchrl_env, self.ftr_torchrl_env.ftr_env, self.actor_operator, max_eval_steps,
+                num_env_types=self._eval_num_env_types,
+                env_type_names=self._eval_env_type_names,
+                terrain=self.config.terrain,
+            )
         self.ftr_torchrl_env.disable_per_env_tracking()
         _eval_reward_info = {k: results.pop(k) for k in list(results) if k.startswith("rew/") or k.startswith("shock/")}
         _shock_keys = (

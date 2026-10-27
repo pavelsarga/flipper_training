@@ -604,6 +604,16 @@ if __name__ == "__main__":
     weights_dir = run_dir / "weights"
     raw_cfg.policy_weights_path = str(weights_dir / args.policy)
     raw_cfg.vecnorm_weights_path = str(weights_dir / args.vecnorm)
+    # Co-trained speed net (velocity_rl): evaluate the flipper checkpoint with the speed net saved
+    # with it (policy_step_N.pth <-> velocity_rl_step_N.pt), not the IL net the config starts from
+    vc = (raw_cfg.get("env_cfg_overrides") or {}).get("velocity_controller")
+    if vc is not None and vc.get("type") == "rl":
+        paired = weights_dir / (Path(args.policy).stem.replace("policy_", "velocity_rl_", 1) + ".pt")
+        if paired.exists():
+            raw_cfg.env_cfg_overrides.velocity_controller.weights = str(paired)
+            logger.info(f"velocity controller: co-trained speed net {paired.name}")
+        else:
+            logger.warning(f"velocity controller: no {paired.name}; evaluating with {vc.get('weights')}")
 
     # Disable logging backends — this is eval only
     raw_cfg.use_wandb = False
