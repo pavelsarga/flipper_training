@@ -18,8 +18,12 @@ if sys.prefix == sys.base_prefix:
         if venv_site in sys.path:
             sys.path.remove(venv_site)
         sys.path.insert(0, venv_site)
+import threading
+
 import numpy as np
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
@@ -76,7 +80,39 @@ class FlipperPolicyNode(Node):
         self.declare_parameter("heightmap_layer", "elevation")  # Layer name in GridMap
         self.declare_parameter("flipper_velocity_scale", 1.0)  # Scale factor for flipper velocities
         self.declare_parameter("track_velocity_scale", 1.0)   # Scale factor for FTR track velocity commands
-        self.declare_parameter("publish_debug_cloud", True)  # Publish heightmap as point cloud for debugging
+        # Heightmap as a PointCloud2 on /policy_heightmap_debug. Off by default: it is built cell
+        # by cell in Python on every map message (~90 ms for the sim's 160x160 map) on the same
+        # single-threaded executor as the control timer, which dropped ~1 in 5 control ticks.
+        # /policy_heightmap (GridMap) and the heightmap images carry the same data cheaply.
+        self.declare_parameter("publish_debug_cloud", False)
+        # How position-mode diffusion targets reach the flippers.
+        #   "isaac" (default): emulate the training joint drive. The policy's target feeds a
+        #     second-order drive model fitted to Isaac's measured flipper response (training
+        #     config, 5 ms physics): natural frequency isaac_drive_wn, damping isaac_drive_zeta,
+        #     acceleration cap isaac_drive_max_accel, speed cap flipper_track_max_vel. A
+        #     flipper_emulation_rate timer integrates it and sends the model velocity (plus a
+        #     correction toward the model angle) on /flippers_cmd_vel/*. Measured in Isaac: a
+        #     full step moves the flipper only 3-5 deg in the first 100 ms, reaches 63% after
+        #     0.25-0.7 s, and a target flipping +-0.7 every tick (98 deg swing) moves it only
+        #     ~31 deg -- the drive low-passes the policy's tick-to-tick jumps, which is why the
+        #     motion looks calm in training.
+        #   "velocity": each tick send (target - current) / dt, clamped -- executes every jump
+        #     within one tick; far stiffer than training (erratic, robot jumps).
+        #   "position": publish the target on /flippers_cmd_pos/*. Gazebo's FlipperControlPlugin
+        #     tracks it with v = position_correction_gain * error, gain 1.0 in marv_model.sdf --
+        #     a 1 s time constant, much slower than training.
+        self.declare_parameter("diffusion_flipper_tracking", "isaac")
+        self.declare_parameter("flipper_track_max_vel", float(np.pi))  # rad/s, Isaac's 180 deg/s cap
+        self.declare_parameter("isaac_drive_wn", 4.38)        # rad/s   } fitted to Isaac step +
+        self.declare_parameter("isaac_drive_zeta", 0.43)      # -       } chatter response,
+        self.declare_parameter("isaac_drive_max_accel", 12.0)  # rad/s^2 } tq_sweep_tq2p5 config
+        self.declare_parameter("isaac_drive_correction_gain", 10.0)  # 1/s, pulls Gazebo onto the model
+        # Time-scales the whole emulated response: s=0.5 makes every flipper motion take twice
+        # as long (wn and v_max x s, a_max x s^2). 1.0 = the Isaac fit, which still looked
+        # too fast in Gazebo (it omits the ground-contact loads that slow Isaac's flippers
+        # further); 0.5 was too slow, 0.75 is the setting in use.
+        self.declare_parameter("flipper_speed_scale", 0.75)
+        self.declare_parameter("flipper_emulation_rate", 100.0)      # Hz (sim time)
         self.declare_parameter("disable_turning", False)  # Force angular velocity to 0
         # /policy_heightmap_img orientation. True (default) = drawn the way the world looks,
         # so the panel lines up with /policy_heightmap_debug and Gazebo. False = the raw
@@ -115,6 +151,23 @@ class FlipperPolicyNode(Node):
             or self.get_parameter("disable_angular_output").get_parameter_value().bool_value)
         self.auto_goal_on_release = self.get_parameter("auto_goal_on_release").get_parameter_value().bool_value
         self.auto_goal_ahead_m = self.get_parameter("auto_goal_ahead_m").get_parameter_value().double_value
+        self.diffusion_flipper_tracking = self.get_parameter("diffusion_flipper_tracking").get_parameter_value().string_value
+        if self.diffusion_flipper_tracking not in ("isaac", "velocity", "position"):
+            raise ValueError(
+                f"diffusion_flipper_tracking must be 'isaac', 'velocity' or 'position', got {self.diffusion_flipper_tracking!r}")
+        self.flipper_track_max_vel = self.get_parameter("flipper_track_max_vel").get_parameter_value().double_value
+        self._drive_wn = self.get_parameter("isaac_drive_wn").get_parameter_value().double_value
+        self._drive_zeta = self.get_parameter("isaac_drive_zeta").get_parameter_value().double_value
+        self._drive_max_accel = self.get_parameter("isaac_drive_max_accel").get_parameter_value().double_value
+        self._drive_kc = self.get_parameter("isaac_drive_correction_gain").get_parameter_value().double_value
+        _s = self.get_parameter("flipper_speed_scale").get_parameter_value().double_value
+        if _s <= 0.0:
+            raise ValueError(f"flipper_speed_scale must be > 0, got {_s}")
+        self._drive_speed_scale = _s
+        self._drive_wn *= _s
+        self._drive_max_accel *= _s * _s
+        self._drive_max_vel = self.flipper_track_max_vel * _s
+        self._emulation_rate = self.get_parameter("flipper_emulation_rate").get_parameter_value().double_value
 
         if not config_path or not policy_weights_path:
             self.get_logger().error("config_path and policy_weights_path parameters are required!")
@@ -125,7 +178,13 @@ class FlipperPolicyNode(Node):
         # ftr_obs_encoder_opts presence), which is true for ALL FTR configs regardless of
         # actual policy family and mis-routed atd3qn/icmd3qn/creps into the PPO path.
         module_name = self._detect_module_name(config_path)
-        if module_name in ("marv_rl", "hfc"):
+        if self._detect_receding_horizon(config_path):
+            # Action-chunking policy (train_diffusion.py): same 966-D observation and 6-D
+            # action per control tick as marv_rl, but T_o-frame history, T_p-step plans
+            # executed T_a steps open-loop, and (in every config so far) position-mode
+            # flipper targets. Checked first: these runs say module_name: marv_rl.
+            self._kind = "diffusion"
+        elif module_name in ("marv_rl", "hfc"):
             # hfc is a distinct module from hfcil (the separately-trained IL classifier,
             # deployed via marv_flipper_eval's dedicated hfcil_policy_node.py) — hfc is a
             # PPO-trained actor (HFCActionDecoder bakes in Eq. 7/8/9's composite action
@@ -151,7 +210,7 @@ class FlipperPolicyNode(Node):
         # [v, w, fl, fr, rl, rr], and — being flipper_control_mode: velocity with
         # flipper_dt=5 deg/step — wants exactly the incremental-position-to-velocity
         # conversion that branch already does.
-        self._is_ftr = self._kind in ("ppo_ftr", "ctrac")
+        self._is_ftr = self._kind in ("ppo_ftr", "ctrac", "diffusion")
 
         # A policy trained behind a FIXED forward speed never learned to control velocity:
         # its track command is a constant the reproduction supplies, not a network output
@@ -201,6 +260,31 @@ class FlipperPolicyNode(Node):
                 vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
                 device=device,
             )
+        elif self._kind == "diffusion":
+            from marv_rl_training.training.diffusion_policy_inference_module import DiffusionPolicyInferenceModule
+            self.policy = DiffusionPolicyInferenceModule(
+                config_path=config_path,
+                policy_weights_path=policy_weights_path,
+                vecnorm_weights_path=vecnorm_weights_path if vecnorm_weights_path else None,
+                device=device,
+            )
+            # Velocity-mode publish path clamps against this symmetric limit; position mode
+            # uses the module's per-corner ROS-frame interval (via _flipper_limits_ros).
+            self._ftr_joint_limit_rad = float(self.policy.joint_limit)
+            self._ftr_limits_ros = np.asarray(self.policy.flipper_limits_ros, dtype=np.float64)
+            # The plan is T_a consecutive control ticks at the training rate: a different
+            # timer rate replays the same chunk faster or slower than it was trained for.
+            _train_hz = 1.0 / (float(self.policy.cfg.get("sim_dt", 0.005)) * float(self.policy.cfg.get("decimation", 20)))
+            if abs(control_rate - _train_hz) > 1e-6:
+                self.get_logger().warn(
+                    f"control_rate {control_rate:g} Hz != training control rate {_train_hz:g} Hz — "
+                    f"each {self.policy.execution_horizon}-step chunk will play back at the wrong speed."
+                )
+            self.get_logger().info(
+                f"Receding horizon: T_o={self.policy.history_len} T_p={self.policy.prediction_horizon} "
+                f"T_a={self.policy.execution_horizon}, flippers={self.policy.flipper_control_mode}, "
+                f"joint limits (ROS, deg)={np.rad2deg(self._ftr_limits_ros).round(0).tolist()}"
+            )
         elif self._kind == "d3qn":
             from marv_rl_training.training.d3qn_policy_inference_module import D3QNPolicyInferenceModule
             self.policy = D3QNPolicyInferenceModule(
@@ -246,6 +330,20 @@ class FlipperPolicyNode(Node):
             )
         self.get_logger().info("Policy loaded successfully")
 
+        # Episode boundary for policies that carry state across ticks (the diffusion
+        # module's observation history and current plan). Set whenever the policy stops
+        # running — no goal, or the operator took the flippers — and consumed on the next
+        # tick that runs it, so it resumes like a fresh training episode instead of from a
+        # window of observations recorded before the pause.
+        self._policy_needs_reset = True
+
+        # Isaac drive emulation state ("isaac" tracking, ROS joint frame): the policy's latest
+        # flipper target, and the model's own angle / rate. None = not driving the flippers.
+        self._drive_goal: np.ndarray | None = None
+        self._drive_theta: np.ndarray | None = None
+        self._drive_omega: np.ndarray | None = None
+        self._drive_last_t: float | None = None
+
         # State storage
         self.current_odom: Odometry | None = None
         self.current_imu: Imu | None = None
@@ -272,7 +370,16 @@ class FlipperPolicyNode(Node):
         # Note: ground_truth_odom uses RELIABLE QoS, so we must match it
         self.odom_sub = self.create_subscription(Odometry, "/ground_truth_odom", self.odom_callback, reliable_qos)
         self.imu_sub = self.create_subscription(Imu, "/imu/data", self.imu_callback, sensor_qos)
-        self.joint_state_sub = self.create_subscription(JointState, "/joint_state", self.joint_state_callback, sensor_qos)
+        # The Isaac drive emulation needs the joint angles and its own 100 Hz tick on time. In
+        # the default (mutually exclusive) group they queue behind the elevation-map and debug
+        # callbacks: measured, the drive loop fell to ~12 Hz, each velocity was held ~80 ms,
+        # and the flippers overshot and swung. They get their own group, run by the second
+        # executor thread (see main()). Every other policy keeps the single default group.
+        self._drive_emulation = self._kind == "diffusion" and self.diffusion_flipper_tracking == "isaac"
+        self._rt_group = MutuallyExclusiveCallbackGroup() if self._drive_emulation else None
+        self._drive_lock = threading.Lock()
+        self.joint_state_sub = self.create_subscription(
+            JointState, "/joint_state", self.joint_state_callback, sensor_qos, callback_group=self._rt_group)
         # Goal uses VOLATILE to accept messages from any publisher (RViz, ros2 topic pub, etc.)
         self.goal_sub = self.create_subscription(PoseStamped, "/goal_pose", self.goal_callback, 10)
         self.goal_reset_sub = self.create_subscription(PoseStamped, "/goal_reset", self.goal_reset_callback, 10)
@@ -364,6 +471,13 @@ class FlipperPolicyNode(Node):
         # Control timer
         self.dt = 1.0 / control_rate
         self.control_timer = self.create_timer(self.dt, self.control_callback)
+        if self._drive_emulation:
+            self.drive_timer = self.create_timer(1.0 / self._emulation_rate, self._drive_emulation_callback,
+                                                 callback_group=self._rt_group)
+            self.get_logger().info(
+                f"Flipper tracking: Isaac drive emulation at {self._emulation_rate:g} Hz "
+                f"(speed scale {self._drive_speed_scale:g}: wn={self._drive_wn:.3g} rad/s, zeta={self._drive_zeta:g}, "
+                f"a_max={self._drive_max_accel:.3g} rad/s^2, v_max={np.rad2deg(self._drive_max_vel):.0f} deg/s)")
 
         self.get_logger().info(f"Flipper policy node started at {control_rate} Hz")
 
@@ -801,6 +915,8 @@ class FlipperPolicyNode(Node):
 
         # Check required inputs
         if goal_vec_local is None:
+            self._policy_needs_reset = True
+            self._drive_stop()
             # No goal set - publish zero velocities to stand in place
             twist = Twist()
             twist.linear.x = 0.0
@@ -837,6 +953,14 @@ class FlipperPolicyNode(Node):
             throttle_duration_sec=1.0,
         )
 
+        # Only the stateful diffusion module is reset here; the other families keep their
+        # existing behaviour.
+        if self._policy_needs_reset and self._kind == "diffusion":
+            self.policy.reset()
+            self._drive_stop()  # restarts from the measured flipper angles on the next target
+            self.get_logger().info("Policy reset: new episode (empty observation history, no plan).")
+        self._policy_needs_reset = False
+
         # Run policy inference
         try:
             action = self.policy.infer_action(
@@ -868,7 +992,51 @@ class FlipperPolicyNode(Node):
 
         twist = Twist()
         flipper_keys = ["front_left", "front_right", "rear_left", "rear_right"]
-        if self._is_ftr:
+        if self._kind == "diffusion" and self.policy.flipper_control_mode == "position":
+            # Position mode: the flipper outputs are ABSOLUTE targets in [-1, 1] over each
+            # corner's [low, high] (FtrEnv._pre_physics_step), not increments -- published as
+            # radian joint targets on /flippers_cmd_pos/*, like the d3qn/creps path.
+            twist.linear.x = float(action[0] * self.track_velocity_scale)
+            twist.angular.z = 0.0 if self.disable_turning else float(action[1] * self.track_velocity_scale)
+            if self.publish_cmd_vel:
+                self.cmd_vel_pub.publish(twist)
+            joint_targets = self.policy.flipper_joint_targets(action)
+            targets = np.array([self._scaled_flipper_target(key, joint_targets[i])
+                                for i, key in enumerate(flipper_keys)])
+            if self.diffusion_flipper_tracking == "isaac":
+                # Only hand the target over; _drive_emulation_callback moves the flippers.
+                with self._drive_lock:
+                    if self._drive_theta is None:
+                        self._drive_start_locked()
+                    self._drive_goal = targets.copy()
+                    model = self._drive_theta.copy()
+                cmd_txt = (f"flipper_target=[{targets[0]:.2f}, {targets[1]:.2f}, {targets[2]:.2f}, {targets[3]:.2f}] rad "
+                           f"model=[{model[0]:.2f}, {model[1]:.2f}, {model[2]:.2f}, {model[3]:.2f}] rad")
+                debug_values, debug_mode = targets, "position"
+            elif self.diffusion_flipper_tracking == "velocity":
+                current = np.array([self.flipper_positions[k] for k in flipper_keys])
+                flipper_cmd = np.clip((targets - current) / self.dt, -self.flipper_track_max_vel, self.flipper_track_max_vel)
+                for i, key in enumerate(flipper_keys):
+                    self.flipper_pubs[key].publish(Float64(data=float(flipper_cmd[i])))
+                cmd_txt = (f"flipper_target=[{targets[0]:.2f}, {targets[1]:.2f}, {targets[2]:.2f}, {targets[3]:.2f}] rad "
+                           f"-> vel=[{flipper_cmd[0]:.2f}, {flipper_cmd[1]:.2f}, {flipper_cmd[2]:.2f}, {flipper_cmd[3]:.2f}] rad/s")
+                debug_values, debug_mode = flipper_cmd, "vel"
+            else:
+                for i, key in enumerate(flipper_keys):
+                    self.flipper_pos_pubs[key].publish(Float64(data=float(targets[i])))
+                cmd_txt = f"flipper_pos=[{targets[0]:.2f}, {targets[1]:.2f}, {targets[2]:.2f}, {targets[3]:.2f}] rad"
+                debug_values, debug_mode = targets, "position"
+            self.get_logger().info(
+                f"CMD (diffusion, step {self.policy.cursor}/{self.policy.execution_horizon}"
+                f"{', re-planned' if self.policy.replanned else ''}): "
+                f"vel=({twist.linear.x:.2f}, {twist.angular.z:.2f}) {cmd_txt}"
+                + (f" (scale {self.command_scale:.2f}x)" if self.command_scale != 1.0 else ""),
+                throttle_duration_sec=0.5,
+            )
+            self.publish_policy_debug_views(
+                twist if self.publish_cmd_vel else None, debug_values, debug_mode,
+                goal_vec_local=goal_vec_local, roll_deg=roll, pitch_deg=pitch)
+        elif self._is_ftr:
             # FTR: 6-D [v, w, fl, fr, rl, rr]
             # Track: raw output is already in m/s and rad/s (clamped to 0.95 m/s, 1.0 rad/s in training)
             twist.linear.x = float(action[0] * self.track_velocity_scale)
@@ -1308,6 +1476,8 @@ class FlipperPolicyNode(Node):
             return
         self.get_logger().info(f"/flipper_override -> {self._flipper_override_active}")
         if self._flipper_override_active:
+            self._policy_needs_reset = True
+            self._drive_stop()
             # Rising edge. From here the control loop publishes nothing at all, and
             # Gazebo's velocity actuators hold the LAST command indefinitely (there
             # is no dead-man's-switch), so whatever was commanded at this instant
@@ -1331,6 +1501,59 @@ class FlipperPolicyNode(Node):
                 f"override released -> auto goal {self.auto_goal_ahead_m:.1f} m ahead "
                 f"({goal.pose.position.x:.2f}, {goal.pose.position.y:.2f})")
             self.goal_callback(goal)
+
+    # ------------------------------------------------------------------
+    # Isaac drive emulation ("isaac" flipper tracking for diffusion policies)
+    # ------------------------------------------------------------------
+    def _now_s(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _drive_start_locked(self):
+        """Start the model at the flippers' measured angles, at rest. Caller holds _drive_lock."""
+        keys = ["front_left", "front_right", "rear_left", "rear_right"]
+        self._drive_theta = np.array([self.flipper_positions[k] for k in keys], dtype=np.float64)
+        self._drive_omega = np.zeros(4)
+        self._drive_goal = None
+        self._drive_last_t = self._now_s()
+
+    def _drive_stop(self):
+        with self._drive_lock:
+            self._drive_goal = self._drive_theta = self._drive_omega = self._drive_last_t = None
+
+    def _drive_emulation_callback(self):
+        """Advance the Isaac drive model to now and command its velocity.
+
+        Model per flipper (ROS joint frame; the dynamics are sign-symmetric, so this equals
+        integrating in the FTR frame), 5 ms Euler steps like the 5 ms training physics:
+            accel = clip(wn^2 (goal - theta) - 2 zeta wn omega, +-a_max)
+            omega = clip(omega + accel dt, +-v_max);  theta += omega dt
+        Command = omega + kc (theta - measured): the model's rate, plus a pull that keeps the
+        real flipper on the model trajectory instead of drifting from it open-loop.
+        """
+        if self._flipper_override_active:
+            return
+        vmax, amax = self._drive_max_vel, self._drive_max_accel
+        with self._drive_lock:
+            if self._drive_goal is None or self._drive_theta is None or self._drive_last_t is None:
+                return
+            now = self._now_s()
+            elapsed = min(now - self._drive_last_t, 0.1)
+            if elapsed <= 0.0:
+                return
+            self._drive_last_t = now
+            steps = max(1, int(round(elapsed / 0.005)))
+            h = elapsed / steps
+            wn2, c = self._drive_wn ** 2, 2.0 * self._drive_zeta * self._drive_wn
+            for _ in range(steps):
+                acc = np.clip(wn2 * (self._drive_goal - self._drive_theta) - c * self._drive_omega, -amax, amax)
+                self._drive_omega = np.clip(self._drive_omega + acc * h, -vmax, vmax)
+                self._drive_theta = self._drive_theta + self._drive_omega * h
+            theta, omega = self._drive_theta.copy(), self._drive_omega.copy()
+        keys = ["front_left", "front_right", "rear_left", "rear_right"]
+        measured = np.array([self.flipper_positions[k] for k in keys])
+        cmd = np.clip(omega + self._drive_kc * (theta - measured), -vmax, vmax)
+        for i, key in enumerate(keys):
+            self.flipper_pubs[key].publish(Float64(data=float(cmd[i])))
 
     def stop_all(self):
         """Zero /cmd_vel and the flipper VELOCITY topics.
@@ -1491,6 +1714,19 @@ class FlipperPolicyNode(Node):
             return None
 
     @staticmethod
+    def _detect_receding_horizon(config_path: str) -> bool:
+        """True for a receding-horizon (train_diffusion.py) run: top-level prediction_horizon
+        AND execution_horizon. Same rule as scripts/lib/config_detect.sh. It has to be checked
+        before module_name, because those runs keep module_name: marv_rl and would otherwise be
+        served one control step at a time by the single-step PPO path."""
+        try:
+            from omegaconf import OmegaConf
+            cfg = OmegaConf.load(config_path)
+            return "prediction_horizon" in cfg and "execution_horizon" in cfg
+        except Exception:
+            return False
+
+    @staticmethod
     def _detect_module_name(config_path: str) -> str | None:
         """Return env_cfg_overrides.module_name, or None (native/non-FTR config)."""
         try:
@@ -1505,8 +1741,13 @@ def main(args=None):
     rclpy.init(args=args)
     node = FlipperPolicyNode()
 
+    # Two threads so the diffusion drive emulation's own callback group (joint states + the
+    # 100 Hz drive tick) runs while the default group is busy with map/debug work. Policies
+    # without it have every callback in the default group, which stays serialised as before.
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

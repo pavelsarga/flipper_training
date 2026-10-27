@@ -140,7 +140,11 @@ class FtrPolicyInferenceModule:
             self.logger.info(f"Loaded VecNorm from {vecnorm_weights_path}")
         else:
             self.logger.warning("No vecnorm_weights_path provided — running without normalisation.")
+        # freeze(), not just eval(): in torchrl 0.8.1 VecNorm keeps updating its running
+        # statistics unless `frozen` is set (eval() does not set it), so every tick would pull
+        # the training normalisation toward whatever the robot is currently seeing.
         self.vecnorm.eval()
+        self.vecnorm.freeze()
 
         # Previous action buffer initialised to zeros (as in CrossingEnv._reset_idx)
         self._prev_action = torch.zeros(num_actions, dtype=torch.float32, device=self.device)
