@@ -67,8 +67,8 @@ def test_mapless_extends_default_and_needs_no_map():
     base = R.load_rule_config(CFG_DIR / "default.yaml")
     assert c["predictive"] is False and c["v_min"] == base["v_min"]
     assert c["criteria"]["turning"] == base["criteria"]["turning"]
-    assert c["criteria"]["tilt"]["pitch_k"] == c["criteria"]["tilt"]["roll_k"]         # deep merge keeps lo / hi
-    assert c["criteria"]["tilt"]["hi"] == base["criteria"]["tilt"]["hi"]
+    assert c["criteria"]["tilt"]["weight"] > base["criteria"]["tilt"]["weight"]
+    assert c["criteria"]["tilt"]["hi"] == base["criteria"]["tilt"]["hi"]              # deep merge keeps the rest
     rs = R.RuleSpeed(c)
     assert not rs.uses_map and {k.name for k in rs.criteria} == {"tilt", "shake", "flippers", "turning"}
     assert target(rs, inputs()._replace(hm=None)) == pytest.approx(c["v_default"])
@@ -200,6 +200,18 @@ def test_compounding_floor_and_cap():
                          tilt={"weight": 0.5, "mode": "linear", "lo": 0.0, "hi": 30.0, "cap": 0.05}))
     assert target(rs, inputs(w=1.0, roll=math.radians(35))) == pytest.approx(0.05)   # special case below v_min
     assert target(rs, inputs(w=1.0, roll=math.radians(25))) == pytest.approx(0.1)    # not fully triggered
+
+
+def test_predictive_combine_strongest():
+    crit = {"step_up": STEP, "roughness": {"weight": 0.5, "mode": "linear", "lo": 0.0, "hi": 0.01, "scales": [[1, 1.0]]},
+            "turning": {"weight": 0.5, "mode": "linear", "lo": 0.0, "hi": 1.0}}
+    g = torch.Generator().manual_seed(3)
+    rough_step = step_map(0.6, 0.15) + 0.05 * torch.rand(1, R.HM_ROWS, R.HM_COLS, generator=g)
+    x = inputs(hm=rough_step, w=1.0)
+    assert target(R.RuleSpeed(cfg(**crit)), x) == pytest.approx(0.4 * 0.5 * 0.5)                     # all compound
+    assert target(R.RuleSpeed({**cfg(**crit), "predictive_combine": "strongest"}), x) == pytest.approx(0.4 * 0.5)
+    with pytest.raises(ValueError, match="predictive_combine"):
+        R.RuleSpeed({**cfg(**crit), "predictive_combine": "max"})
 
 
 def test_slew_limits():
