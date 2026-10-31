@@ -100,6 +100,9 @@ class CrashRecorder:
         self._prev_done: torch.Tensor | None = None
 
     def record(self, action: torch.Tensor) -> None:
+        if self.step == 0:
+            s = torch.cuda.current_stream()
+            print(f"[crash_recorder] env.step runs on {s} (default stream: {s == torch.cuda.default_stream()})", flush=True)
         data = self.env._robot.data
         rec = {
             "step": self.step,
