@@ -20,30 +20,40 @@ import torch
 
 
 def install_physx_sync(ftr_env) -> None:
-    """``FTR_PHYSX_SYNC=1``: device-wide synchronize around every get_*/set_* of the robot's
-    PhysX ArticulationView — a test for a torch/PhysX stream race.
+    """``FTR_PHYSX_SYNC=1|views|set|get|step``: device-wide synchronize around every get_*/set_*
+    (``1``/``views``), only set_* (``set``) or only get_* (``get``) of the robot's PhysX
+    ArticulationView, or once after every ``sim.step()`` (``step``) — tests for a stream race.
 
     omni.physics.tensors converts each index tensor with ``tensor.to(torch.int32)``, a temporary
     that returns to torch's caching allocator as soon as the setter returns; if PhysX consumes it
     asynchronously on its own stream, the block can be reused and overwritten first, handing
     PhysX garbage indices. ``torch.cuda.synchronize()`` waits for every stream, PhysX's included.
     """
-    if os.environ.get("FTR_PHYSX_SYNC", "0") != "1":
+    mode = os.environ.get("FTR_PHYSX_SYNC", "0")
+    if mode in ("0", ""):
         return
-    view = ftr_env.unwrapped._robot.root_physx_view
-    names = [n for n in dir(type(view)) if n.startswith(("get_", "set_", "apply_"))]
 
-    def wrap(fn):
+    def wrap(fn, before=True, after=True):
         def synced(*args, **kwargs):
-            torch.cuda.synchronize()
+            if before:
+                torch.cuda.synchronize()
             out = fn(*args, **kwargs)
-            torch.cuda.synchronize()
+            if after:
+                torch.cuda.synchronize()
             return out
         return synced
 
+    env = ftr_env.unwrapped
+    if mode == "step":  # one sync after every physics step: its GPU work is done before any tensor-API call
+        env.sim.step = wrap(env.sim.step, before=False)
+        print("[crash_recorder] FTR_PHYSX_SYNC=step: torch.cuda.synchronize() after every sim.step()", flush=True)
+        return
+    prefixes = {"1": ("get_", "set_", "apply_"), "views": ("get_", "set_", "apply_"), "set": ("set_", "apply_"), "get": ("get_",)}[mode]
+    view = env._robot.root_physx_view
+    names = [n for n in dir(type(view)) if n.startswith(prefixes)]
     for n in names:
         setattr(view, n, wrap(getattr(view, n)))
-    print(f"[crash_recorder] FTR_PHYSX_SYNC: {len(names)} ArticulationView methods wrapped in torch.cuda.synchronize()", flush=True)
+    print(f"[crash_recorder] FTR_PHYSX_SYNC={mode}: {len(names)} ArticulationView methods wrapped in torch.cuda.synchronize()", flush=True)
 
 
 def install_physx_keepalive() -> None:
