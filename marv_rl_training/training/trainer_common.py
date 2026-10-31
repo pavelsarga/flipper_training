@@ -13,6 +13,7 @@ from marv_rl_training.training.eval_data import aggregate_per_env, aggregate_per
 __all__ = [
     "attach_per_env_eval_rows",
     "average_eval_repeats",
+    "collector_opts",
     "is_unrecoverable_gpu_error",
     "is_wandb_transport_error",
 ]
@@ -21,6 +22,23 @@ __all__ = [
 # mid-training eval. The eval scripts read this from the terrain's layout; the trainers use a
 # fixed value because the CSV is only a within-run diagnostic.
 _TRAIN_EVAL_DEPTH_COLS = 10
+
+
+def collector_opts(opts) -> dict:
+    """``data_collector_opts`` for ``SyncDataCollector``, with ``no_cuda_sync`` defaulting to True.
+
+    With ``no_cuda_sync=False`` (torchrl's default) ``SyncDataCollector.iterator()`` creates a
+    high-priority side CUDA stream and keeps it current across every ``yield`` — so env.step,
+    and with it every IsaacLab tensor op that builds the index/target tensors handed to the
+    PhysX tensor API, runs on that stream. omni.physics.tensors orders its GPU work against
+    the default stream only, so PhysX could read those tensors before the side stream had
+    written them: the intermittent ``CUDA error: an illegal memory access`` reported at
+    GpuArticulationView.cpp:749. On a single device the collector's explicit syncs it also
+    skips are not needed. An explicit ``no_cuda_sync`` in the config still wins.
+    """
+    out = dict(opts or {})
+    out.setdefault("no_cuda_sync", True)
+    return out
 
 
 def attach_per_env_eval_rows(results: dict, episode_records, *, env_type_names, run_name: str,

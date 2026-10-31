@@ -42,6 +42,7 @@ from marv_rl_training.training.eval_data import load_env_type_names, run_tracked
 from marv_rl_training.training.trainer_common import (
     attach_per_env_eval_rows,
     average_eval_repeats,
+    collector_opts,
     is_unrecoverable_gpu_error,
 )
 from marv_rl_training.utils.cfg_schedulers import _LinearCfgScheduler
@@ -247,7 +248,7 @@ class FtrD3QNTrainer:
             self.policy_operator,
             frames_per_batch=iteration_size,
             total_frames=self.config.total_frames,
-            **self.config.data_collector_opts,
+            **collector_opts(self.config.data_collector_opts),
             device=self.device,
         )
         # Off-policy: the buffer persists and accumulates across iterations (unlike PPO's

@@ -40,6 +40,7 @@ from marv_rl_training.training.eval_data import load_env_type_names, run_tracked
 from marv_rl_training.training.trainer_common import (
     attach_per_env_eval_rows,
     average_eval_repeats,
+    collector_opts,
     is_unrecoverable_gpu_error,
 )
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
@@ -325,7 +326,7 @@ class FtrSACTrainer:
         iteration_size = self.config.time_steps_per_batch * self.config.num_robots
         self.collector = SyncDataCollector(
             self.env, self.policy_operator, frames_per_batch=iteration_size,
-            total_frames=self.config.total_frames, **self.config.data_collector_opts, device=self.device,
+            total_frames=self.config.total_frames, **collector_opts(self.config.data_collector_opts), device=self.device,
         )
         # LazyMemmapStorage (disk-backed, OS page cache) instead of LazyTensorStorage
         # (fully RAM-resident) — a CTRAC transition is unusually heavy vs. every other

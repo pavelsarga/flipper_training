@@ -103,7 +103,7 @@ from marv_rl_training.policies.diffusion_dppo import DiffusionChunkActor, make_d
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_type_registry import default_num_env_types
-from marv_rl_training.training.trainer_common import is_unrecoverable_gpu_error, is_wandb_transport_error
+from marv_rl_training.training.trainer_common import collector_opts, is_unrecoverable_gpu_error, is_wandb_transport_error
 from marv_rl_training.training.eval_data import (
     aggregate_per_env,
     aggregate_per_spot,
@@ -530,7 +530,7 @@ class FtrDiffusionTrainer:
             self.actor_operator,
             frames_per_batch=iteration_size,
             total_frames=int(self.config.total_frames / self.T_a_mean),
-            **self.config.data_collector_opts,
+            **collector_opts(self.config.data_collector_opts),
             device=self.device,
         )
         # Replay buffer lives on CPU to avoid CUDA memory pressure competing with PhysX
