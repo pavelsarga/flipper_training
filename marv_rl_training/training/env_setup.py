@@ -68,6 +68,28 @@ def resolve_env_cfg_class(task: str) -> type:
     return CrossingEnvCfg
 
 
+def _apply_physx_env_overrides(physx_cfg: Any) -> None:
+    """Apply ``FTR_PHYSX_OVERRIDES="gpu_max_rigid_patch_count=20480,gpu_max_num_partitions=1"``.
+
+    A diagnostic hook for A/B-testing PhysX buffers and solver settings on an unchanged
+    config (slurm/diag_cuda_crash.sbatch). Unknown keys raise, since a misspelt field would
+    otherwise be set and ignored.
+    """
+    import os
+
+    spec = os.environ.get("FTR_PHYSX_OVERRIDES", "").strip()
+    if not spec:
+        return
+    for item in spec.split(","):
+        key, _, raw = item.strip().partition("=")
+        if not hasattr(physx_cfg, key):
+            raise ValueError(f"FTR_PHYSX_OVERRIDES: PhysxCfg has no field {key!r}")
+        old = getattr(physx_cfg, key)
+        value = raw.lower() == "true" if isinstance(old, bool) else type(old)(float(raw)) if isinstance(old, (int, float)) else raw
+        setattr(physx_cfg, key, value)
+        print(f"[env_setup] FTR_PHYSX_OVERRIDES: physx.{key} = {value} (was {old})", flush=True)
+
+
 def build_ftr_gym_env(
     cfg: Any,
     *,
@@ -146,6 +168,7 @@ def build_ftr_gym_env(
         env_cfg.sim.physx.gpu_collision_stack_size = 2 ** 22
     elif physx_autotune == "full" and cfg.num_robots > 512:
         env_cfg.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 2 ** 27
+    _apply_physx_env_overrides(env_cfg.sim.physx)
 
     # Arbitrary direct-attribute overrides — module_name, reward params, potential-reward
     # settings and so on. A plain setattr loop, so a key that is not a real field on the env
