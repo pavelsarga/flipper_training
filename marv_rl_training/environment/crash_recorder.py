@@ -46,6 +46,32 @@ def install_physx_sync(ftr_env) -> None:
     print(f"[crash_recorder] FTR_PHYSX_SYNC: {len(names)} ArticulationView methods wrapped in torch.cuda.synchronize()", flush=True)
 
 
+def install_physx_keepalive() -> None:
+    """``FTR_PHYSX_KEEPALIVE=<n>``: hold the last n tensors omni.physics.tensors converts with
+    ``as_contiguous_*`` — the cheap counterpart of FTR_PHYSX_SYNC. If PhysX reads a converted
+    index/data temporary after the setter returns, keeping it referenced stops torch's caching
+    allocator from handing that block to the next allocation before PhysX is done with it.
+    """
+    n = int(os.environ.get("FTR_PHYSX_KEEPALIVE", "0") or 0)
+    if n <= 0:
+        return
+    from omni.physics.tensors.impl.frontend_torch import FrontendTorch
+
+    if getattr(FrontendTorch, "_keepalive", None) is not None:
+        return
+    FrontendTorch._keepalive = collections.deque(maxlen=n)
+    for name in ("as_contiguous_float32", "as_contiguous_uint32", "as_contiguous_uint8"):
+        orig = getattr(FrontendTorch, name)
+
+        def kept(self, tensor, _orig=orig):
+            out = _orig(self, tensor)
+            FrontendTorch._keepalive.append(out)
+            return out
+
+        setattr(FrontendTorch, name, kept)
+    print(f"[crash_recorder] FTR_PHYSX_KEEPALIVE: last {n} converted tensors kept alive", flush=True)
+
+
 def from_env(ftr_env) -> "CrashRecorder | None":
     n = int(os.environ.get("FTR_CRASH_RECORDER", "0") or 0)
     if n <= 0:
