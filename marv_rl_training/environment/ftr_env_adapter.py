@@ -73,6 +73,10 @@ class FtrTorchRLEnv(EnvBase):
         self._per_env_tq_sum: torch.Tensor | None = None
         self._per_env_tq_n: torch.Tensor | None = None
 
+        from marv_rl_training.environment.crash_recorder import from_env as _crash_recorder_from_env
+
+        self._crash_recorder = _crash_recorder_from_env(ftr_env)
+
         # Instantiate the observation descriptor so make_transformed_env can build VecNorm keys
         # and mlp_policy.py can build the matching encoder. Which descriptor class matches the
         # actual per-step obs vector depends on which RLModule the underlying env is configured
@@ -165,7 +169,16 @@ class FtrTorchRLEnv(EnvBase):
         # invalid (escaped terrain bounds), propagating NaN through observations → policy → action.
         action = torch.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        obs_dict, reward, terminated, truncated, _info = self.ftr_env.step(action)
+        if self._crash_recorder is None:
+            obs_dict, reward, terminated, truncated, _info = self.ftr_env.step(action)
+        else:
+            self._crash_recorder.record(action)
+            try:
+                obs_dict, reward, terminated, truncated, _info = self.ftr_env.step(action)
+            except RuntimeError as e:
+                self._crash_recorder.dump(e)
+                raise
+            self._crash_recorder.mark_done(terminated, truncated)
 
         if isinstance(_info, dict):
             if "reward_components" in _info:
