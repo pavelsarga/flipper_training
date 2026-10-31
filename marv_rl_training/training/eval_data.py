@@ -5,6 +5,7 @@ Imported by eval_ftr.py and eval_ftr_rand.py (no Isaac Sim / omni imports here).
 from __future__ import annotations
 
 import csv
+from collections import defaultdict
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,30 @@ def load_env_type_names(terrain: str | None, path: str | None, num_env_types: in
             if idx < n:
                 names[idx] = str(name)
     return names
+
+
+def tile_sweep_spawns(birth: list[dict], terrain: str | None, num_env_types: int, num_depth_cols: int) -> list[list[int]]:
+    """One birth entry per (env type, depth column) -- the forward-direction one nearest the tile's
+    centre line -- grouped by column: result[col][env_type] = birth index. Every tile of the course
+    exactly once, the same tiles for every policy, whatever its speed."""
+    groups: dict[tuple[int, int], list[tuple[float, int]]] = defaultdict(list)
+    for k, e in enumerate(birth):
+        sx, tx, ty = float(e["start_point"][0]), float(e["target_point"][0]), float(e["target_point"][1])
+        if tx > sx:                                            # "rev" entry of a bidirectional course
+            continue
+        groups[locate_env_type(terrain, tx, ty, num_env_types, num_depth_cols)].append((ty, k))
+    missing = [(t, c) for t in range(num_env_types) for c in range(num_depth_cols) if (t, c) not in groups]
+    if missing:
+        raise ValueError(f"tile sweep: no forward birth entry for (env type, column) {missing[:5]} ...")
+    sweep = []
+    for c in range(num_depth_cols):
+        col = []
+        for t in range(num_env_types):
+            ys = groups[(t, c)]
+            centre = sum(y for y, _ in ys) / len(ys)
+            col.append(min(ys, key=lambda yk: abs(yk[0] - centre))[1])
+        sweep.append(col)
+    return sweep
 
 
 def env_type_depth_col_from_target(
@@ -462,8 +487,13 @@ def run_tracked_rollout(
     eval_id: str = "",
     policy_label: str = "",
     terrain: str = "",
+    first_episode_only: bool = False,
 ) -> tuple[dict[str, float], list[EpisodeRecord]]:
     """Manual step loop that records per-robot episode data for env-type/spot aggregation.
+
+    first_episode_only: record only each robot's first episode and stop once every robot has
+    finished it (success, failure or timeout) -- no episode is cut off by max_steps, so slow and
+    fast policies are scored on the same episodes. max_steps must exceed the episode timeout.
 
     Performance notes vs a plain ``env.rollout(...)``:
     - Per-robot reward/step accumulators are GPU tensors (no Python list updates).
@@ -549,6 +579,8 @@ def run_tracked_rollout(
                 steps_cpu   = robot_steps.cpu()
 
                 for i in done_idx:
+                    if first_episode_only and robot_ep_idx[i] > 0:
+                        continue
                     counts = per_env.get(i, {})
                     if counts.get("successes", 0) > 0:
                         outcome = "success"
@@ -585,7 +617,7 @@ def run_tracked_rollout(
                     robot_steps[i]   = 0
                     robot_ep_idx[i] += 1
 
-            if dones.all():
+            if dones.all() or (first_episode_only and min(robot_ep_idx) > 0):
                 break
             td = td["next"]
 

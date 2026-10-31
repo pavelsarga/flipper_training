@@ -82,6 +82,13 @@ parser.add_argument(
     help="Write the metrics averaged over all repeats to this JSON file.",
 )
 parser.add_argument(
+    "--tile_sweep", action="store_true",
+    help="Score every tile of the course exactly once: num_envs = the env types, repeats = the depth "
+    "columns, each robot starting on its own tile of that column and scored on that one episode only "
+    "(run to success, failure or timeout). Same tiles for every policy, nothing cut off by max_steps. "
+    "Needs --output_dir.",
+)
+parser.add_argument(
     "--print_actions", action="store_true",
     help="Print the policy's action vector each step for env 0. Requires num_envs=1.",
 )
@@ -121,6 +128,7 @@ from marv_rl_training.training.eval_data import (
     make_eval_id,
     run_tracked_rollout,
     save_eval_csvs,
+    tile_sweep_spawns,
 )
 from marv_rl_training.training.train_diffusion import FtrDiffusionConfig
 from marv_rl_training.utils.logutils import get_terminal_logger
@@ -388,6 +396,7 @@ def run_eval(
     eval_id: "str | None" = None,
     policy_label: "str | None" = None,
     print_actions: bool = False,
+    tile_sweep: bool = False,
 ) -> dict[str, float]:
     cfg = FtrDiffusionConfig(**raw_cfg)
     device = set_device(cfg.device)
@@ -413,6 +422,8 @@ def run_eval(
     # so convert once here.
     if max_steps == 0:
         max_steps = ftr_gym_env.unwrapped.max_episode_length * 2
+    if tile_sweep:     # one episode per robot, run to its end: the timeout (plus the reset step) caps it
+        max_steps = ftr_gym_env.unwrapped.max_episode_length + 2 * cfg.execution_horizon
     max_steps = max(1, max_steps // cfg.execution_horizon)
     logger.info(
         f"T_p={cfg.prediction_horizon} T_a={cfg.execution_horizon} T_o={cfg.history_len} | "
@@ -476,6 +487,16 @@ def run_eval(
     _depth_cols = default_num_depth_cols(_terrain)
     _policy_lbl = policy_label or (cfg.policy_weights_path or "unknown")
 
+    sweep = None
+    if tile_sweep:
+        if not _output_dir:
+            raise ValueError("--tile_sweep needs --output_dir")
+        sweep = tile_sweep_spawns(ftr_gym_env.unwrapped.terrain_cfg.birth, _terrain, num_env_types, _depth_cols)
+        if ftr_gym_env.unwrapped.num_envs != num_env_types or repeats != _depth_cols:
+            raise ValueError(f"--tile_sweep runs {num_env_types} envs x {_depth_cols} repeats, "
+                             f"got {ftr_gym_env.unwrapped.num_envs} x {repeats}")
+        logger.info(f"Tile sweep: {num_env_types} env types x {_depth_cols} columns, one scored episode per tile")
+
     if _output_dir:
         ftr_torchrl_env.enable_per_env_tracking()
         logger.info(f"Per-env tracking enabled → CSV output: {_output_dir}  eval_id={_eval_id}")
@@ -506,6 +527,8 @@ def run_eval(
             )
             episode_records: list[EpisodeRecord] = []
         elif _output_dir:
+            if sweep is not None:
+                ftr_gym_env.unwrapped.set_spawn_sequence(sweep[r])     # robot i -> env type i, column r
             results, episode_records = run_tracked_rollout(
                 env, ftr_torchrl_env, ftr_gym_env, actor, max_steps,
                 repeat=r + 1,
@@ -514,6 +537,7 @@ def run_eval(
                 terrain=_terrain,
                 num_env_types=num_env_types,
                 env_type_names=_env_names,
+                first_episode_only=sweep is not None,
             )
         else:
             results = _run_single_rollout(env, ftr_torchrl_env, ftr_gym_env, actor, max_steps)
@@ -621,6 +645,10 @@ if __name__ == "__main__":
 
     if args.num_envs is not None:
         raw_cfg.num_robots = args.num_envs
+    if args.tile_sweep:
+        terrain = args.map or raw_cfg.terrain
+        raw_cfg.num_robots = default_num_env_types(terrain)
+        args.repeats = default_num_depth_cols(terrain)
 
     if args.map is not None:
         raw_cfg.terrain = args.map
@@ -646,8 +674,11 @@ if __name__ == "__main__":
     env_cfg.scene.num_envs = _cfg.num_robots
     env_cfg.terrain_name = _cfg.terrain
 
-    # --- Simulation timestep ---
+    # --- Simulation timestep and control rate ---
+    # The trainer sets decimation (build_ftr_gym_env, set_decimation=True); without it the env's
+    # default of 5 ran the policy at 4x its trained rate (40 vs 10 Hz for decimation 20).
     env_cfg.sim.dt = _cfg.sim_dt
+    env_cfg.decimation = _cfg.decimation
 
     # --- Rigid body properties ---
     env_cfg.robot.spawn.rigid_props.max_linear_velocity = _cfg.robot_max_linear_velocity
@@ -705,6 +736,7 @@ if __name__ == "__main__":
         env_names_yaml=args.env_names_yaml,
         eval_id=args.eval_id,
         print_actions=args.print_actions,
+        tile_sweep=args.tile_sweep,
     )
     if args.results_json:
         import json
