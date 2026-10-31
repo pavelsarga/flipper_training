@@ -33,11 +33,12 @@ def cfg(**criteria):
     return {"v_default": 1.0, "v_min": 0.1, "criteria": criteria}
 
 
-def inputs(n=1, hm=None, v=0.5, flip_vel=0.0, roll=0.0, pitch=0.0, wx=0.0, wy=0.0, w=0.0):
+def inputs(n=1, hm=None, v=0.5, flip_vel=0.0, roll=0.0, pitch=0.0, wx=0.0, wy=0.0, w=0.0, x=0.0, yaw=0.0):
     return R.Inputs(hm=torch.zeros(n, R.HM_ROWS, R.HM_COLS) if hm is None else hm,
                     v_meas=torch.full((n,), v), flip_vel=torch.full((n, 4), flip_vel),
-                    rpy=torch.tensor([[roll, pitch, 0.0]] * n), ang_vel=torch.tensor([[wx, wy, 0.0]] * n),
-                    w_cmd=torch.full((n,), w))
+                    rpy=torch.tensor([[roll, pitch, yaw]] * n), ang_vel=torch.tensor([[wx, wy, 0.0]] * n),
+                    w_cmd=torch.full((n,), w),
+                    pos=torch.tensor([[x * math.cos(yaw), x * math.sin(yaw)]] * n))
 
 
 def step_map(edge_x, height):
@@ -223,13 +224,52 @@ def test_slew_limits():
     assert float(rs(inputs(w=1.0), DT)) == pytest.approx(0.9)            # 2 m/s^2 down
 
 
-def test_stall_guard_boosts_the_floor():
-    rs = R.RuleSpeed({**cfg(turning={"weight": 0.9, "mode": "linear", "lo": 0.0, "hi": 1.0}),
-                      "stall": {"v": 0.05, "after_s": 2.0, "boost": 0.35, "boost_s": 1.0}})
-    out = [target(rs, inputs(v=0.0, w=1.0)) for _ in range(50)]
+STALL = {"window_s": 2.0, "progress_m": 0.2, "release_m": 0.3, "max_boost_s": 3.0, "boost": [0.4, 0.6]}
+SLOW = {"turning": {"weight": 0.9, "mode": "linear", "lo": 0.0, "hi": 1.0}}   # w = 1 -> target 0.1 = v_min
+
+
+def drive(rs, xs, yaw=0.0):
+    """One tick per position along the heading; the speed targets."""
+    return [target(rs, inputs(w=1.0, x=x, yaw=yaw)) for x in xs]
+
+
+def test_stall_guard_boosts_held_until_progress():
+    rs = R.RuleSpeed({**cfg(**SLOW), "stall": STALL})
+    out = drive(rs, [0.0] * 50)                                       # 2.5 s without moving
     first = next(i for i, v in enumerate(out) if v > 0.2)
-    assert 2.0 <= first * DT <= 2.15 and out[first] == pytest.approx(0.35)   # stuck > 2 s -> boost
-    assert [target(rs, inputs(v=0.3, w=1.0)) for _ in range(21)][-1] == pytest.approx(0.1, rel=1e-5)   # expires
+    assert 1.95 <= first * DT <= 2.1 and out[first] == pytest.approx(0.4)   # window full, no progress -> level 1
+    assert drive(rs, [0.1, 0.2])[-1] == pytest.approx(0.4)            # held: 0.2 m < release_m
+    assert drive(rs, [0.31])[-1] == pytest.approx(0.1, rel=1e-5)      # 0.31 m: released, rules again
+    assert rs.stall.level[0] == 0                                     # got over it: escalation reset
+
+
+def test_stall_guard_rocking_is_not_progress_and_slow_climbing_is():
+    rs = R.RuleSpeed({**cfg(**SLOW), "stall": STALL})
+    rock = [0.15 * math.sin(2 * math.pi * k * DT) for k in range(60)]      # +-0.15 m at 1 Hz, going nowhere
+    assert max(drive(rs, rock)) == pytest.approx(0.4)
+    rs = R.RuleSpeed({**cfg(**SLOW), "stall": STALL})
+    creep = [0.15 * k * DT for k in range(100)]                       # 0.15 m/s: 0.3 m per window
+    assert max(drive(rs, creep, yaw=1.0)) == pytest.approx(0.1, rel=1e-5)
+
+
+def test_stall_guard_escalates_when_a_boost_runs_out():
+    rs = R.RuleSpeed({**cfg(**SLOW), "stall": STALL})
+    out = [round(v, 3) for v in drive(rs, [0.0] * 220)]             # 11 s stuck
+    first_low, first_high = out.index(0.4), out.index(0.6)
+    assert first_low * DT == pytest.approx(2.0, abs=0.1)
+    assert (first_high - first_low) * DT == pytest.approx(3.0, abs=0.1)    # ran out: straight to the next level
+    pause = [k for k in range(first_high, len(out)) if out[k] == 0.1]       # the top level ran out: a new window
+    assert pause and (pause[0] - first_high) * DT == pytest.approx(3.0, abs=0.1)
+    assert out[pause[0] + int(2.0 / DT) + 2] == 0.6                          # stuck after it: the top level again
+
+
+def test_stall_guard_roll_limit_keeps_the_first_level():
+    rs = R.RuleSpeed({**cfg(**SLOW), "stall": {**STALL, "max_roll_deg": 15.0}})
+    level = lambda roll: target(rs, inputs(w=1.0, roll=math.radians(roll)))
+    out = [round(level(0.0), 3) for _ in range(110)]                 # 5.5 s stuck, level: escalated to 0.6
+    assert out[-1] == 0.6
+    assert round(level(20.0), 3) == 0.4                               # rolled past 15 deg: first level only
+    assert round(level(5.0), 3) == 0.6                                # level again once the roll is back
 
 
 def test_batched_envs_are_independent_and_reset_per_env():
@@ -262,8 +302,9 @@ def test_isaac_adapter_matches_the_gazebo_input_path(monkeypatch):
         flip_vel, angle, w = (torch.randn(n, 4, generator=g), torch.randn(n, 4, generator=g), torch.randn(n, generator=g))
         proprio = torch.stack([torch.from_numpy(F.proprio_frame(float(v[i]), float(v_prev[i]), flip_vel[i].numpy(),
                                                                 angle[i].numpy())) for i in range(n)])
-        v_isaac = isaac(hm[:, None], proprio[:, None], {"rpy": rpy, "ang_vel": ang_vel, "w_cmd": w, "dt": DT})
-        v_gazebo = gazebo(R.Inputs(hm=hm, v_meas=v, flip_vel=flip_vel, rpy=rpy, ang_vel=ang_vel, w_cmd=w), DT)
+        pos = torch.rand(n, 2, generator=g)
+        v_isaac = isaac(hm[:, None], proprio[:, None], {"rpy": rpy, "ang_vel": ang_vel, "w_cmd": w, "pos": pos, "dt": DT})
+        v_gazebo = gazebo(R.Inputs(hm=hm, v_meas=v, flip_vel=flip_vel, rpy=rpy, ang_vel=ang_vel, w_cmd=w, pos=pos), DT)
         assert torch.equal(v_isaac, v_gazebo)
     isaac.reset(torch.tensor([1]))
     assert isaac.rules.v_prev[1] == 0.0 and isaac.rules.v_prev[0] > 0.0
@@ -272,3 +313,18 @@ def test_isaac_adapter_matches_the_gazebo_input_path(monkeypatch):
                                            "overrides": {"predictive": False, "criteria": {"tilt": {"weight": 0.9}}}}, n, "cpu")
     assert not mapless.rules.uses_map
     assert {c.name: c.weight for c in mapless.rules.criteria}["tilt"] == 0.9
+
+
+def test_bearing_heading_distance_ramp(monkeypatch):
+    for name in ("ftr_envs", "ftr_envs.tasks", "ftr_envs.tasks.crossing"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "ftr_envs.tasks.crossing.velocity_rules", R)
+    VC = load(ROOT / "src/FTR-Benchmark/ftr_envs/tasks/crossing/velocity_control.py", "velocity_control")
+    start = torch.tensor([[0.0, 0.0, 0.2]] * 3)
+    target = torch.tensor([[-6.0, 0.0, 0.2]] * 3)                         # the course runs along -x
+    pos = torch.tensor([[-0.0, 0.3, 0.2], [-3.0, 0.3, 0.2], [-6.5, 0.3, 0.2]])   # start, half way, past the goal
+    yaw = torch.full((3,), math.pi)
+    full = VC.bearing_heading(pos, yaw, target, gain=0.5, max_w=10.0)
+    ramp = VC.bearing_heading(pos, yaw, target, gain=0.5, max_w=10.0, distance_ramp=True, starts=start)
+    assert ramp[0] == pytest.approx(0.0) and ramp[1] == pytest.approx(0.5 * full[1], rel=1e-5)
+    assert ramp[2] == pytest.approx(full[2], rel=1e-5)                    # clamped at 1 past the goal

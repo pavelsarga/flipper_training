@@ -89,6 +89,11 @@ parser.add_argument(
     "Needs --output_dir.",
 )
 parser.add_argument(
+    "--save_trajectories", action="store_true",
+    help="With --output_dir: also write <output_dir>/<eval_id>_traj_r<repeat>.npz per repeat (per-step xy, "
+    "yaw, measured / commanded v, done, episode index for every robot).",
+)
+parser.add_argument(
     "--print_actions", action="store_true",
     help="Print the policy's action vector each step for env 0. Requires num_envs=1.",
 )
@@ -397,6 +402,7 @@ def run_eval(
     policy_label: "str | None" = None,
     print_actions: bool = False,
     tile_sweep: bool = False,
+    save_trajectories: bool = False,
 ) -> dict[str, float]:
     cfg = FtrDiffusionConfig(**raw_cfg)
     device = set_device(cfg.device)
@@ -529,6 +535,7 @@ def run_eval(
         elif _output_dir:
             if sweep is not None:
                 ftr_gym_env.unwrapped.set_spawn_sequence(sweep[r])     # robot i -> env type i, column r
+            traj = {} if save_trajectories else None
             results, episode_records = run_tracked_rollout(
                 env, ftr_torchrl_env, ftr_gym_env, actor, max_steps,
                 repeat=r + 1,
@@ -538,7 +545,12 @@ def run_eval(
                 num_env_types=num_env_types,
                 env_type_names=_env_names,
                 first_episode_only=sweep is not None,
+                trajectory=traj,
             )
+            if traj:
+                import numpy as np
+                np.savez_compressed(_output_dir / f"{_eval_id}_traj_r{r + 1}.npz",
+                                    **{k: torch.stack(v).numpy() for k, v in traj.items()})
         else:
             results = _run_single_rollout(env, ftr_torchrl_env, ftr_gym_env, actor, max_steps)
             episode_records = []
@@ -737,6 +749,7 @@ if __name__ == "__main__":
         eval_id=args.eval_id,
         print_actions=args.print_actions,
         tile_sweep=args.tile_sweep,
+        save_trajectories=args.save_trajectories,
     )
     if args.results_json:
         import json

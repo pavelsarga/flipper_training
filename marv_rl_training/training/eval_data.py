@@ -53,6 +53,10 @@ def load_env_type_names(terrain: str | None, path: str | None, num_env_types: in
     return names
 
 
+# crossing_env.FAIL_REASONS, by code (kept here so this module does not import the Isaac env)
+FAIL_REASONS = ("", "rollover", "shock", "out_of_range_lateral", "out_of_range_along", "out_of_range")
+
+
 def tile_sweep_spawns(birth: list[dict], terrain: str | None, num_env_types: int, num_depth_cols: int) -> list[list[int]]:
     """One birth entry per (env type, depth column) -- the forward-direction one nearest the tile's
     centre line -- grouped by column: result[col][env_type] = birth index. Every tile of the course
@@ -121,6 +125,8 @@ class EpisodeRecord:
     # traversal quality of the episode (CrossingEnv's distance-binned three-channel metric,
     # in (0, 1]); NaN when the env did not report one
     tq: float = float("nan")
+    # failure cause (crossing_env.FAIL_REASONS): rollover / shock / out_of_range_lateral / _along / out_of_range
+    fail_reason: str = ""
 
 
 @dataclass
@@ -488,12 +494,18 @@ def run_tracked_rollout(
     policy_label: str = "",
     terrain: str = "",
     first_episode_only: bool = False,
+    trajectory: dict | None = None,
 ) -> tuple[dict[str, float], list[EpisodeRecord]]:
     """Manual step loop that records per-robot episode data for env-type/spot aggregation.
 
     first_episode_only: record only each robot's first episode and stop once every robot has
     finished it (success, failure or timeout) -- no episode is cut off by max_steps, so slow and
     fast policies are scored on the same episodes. max_steps must exceed the episode timeout.
+
+    trajectory: a dict to fill with per-step arrays [T, N] / [T, N, 2] (pre-step xy, roll, pitch, yaw,
+    measured forward speed, applied v command, done, the robot's episode index, and the V-Gov stall
+    guard's boost level when that controller drives) -- for offline analysis such as stall
+    detection. Costs one small device-to-host copy per step.
 
     Performance notes vs a plain ``env.rollout(...)``:
     - Per-robot reward/step accumulators are GPU tensors (no Python list updates).
@@ -551,6 +563,18 @@ def run_tracked_rollout(
 
             td = actor(td)
             td = env.step(td)
+            if trajectory is not None:
+                trajectory.setdefault("xy", []).append(_pos_snap[:, :2].cpu())
+                trajectory.setdefault("roll", []).append(unwrapped.orientations_3[:, 0].cpu())
+                trajectory.setdefault("pitch", []).append(unwrapped.orientations_3[:, 1].cpu())
+                trajectory.setdefault("yaw", []).append(unwrapped.orientations_3[:, 2].cpu())
+                rules = getattr(getattr(unwrapped, "_vel_ctrl", None), "rules", None)
+                if rules is not None and "stall" in rules.debug:
+                    trajectory.setdefault("stall", []).append(rules.debug["stall"].cpu())
+                trajectory.setdefault("v_meas", []).append(unwrapped.robot_lin_velocities[:, 0].cpu())
+                trajectory.setdefault("v_cmd", []).append(unwrapped.actions[:, 0].cpu())
+                trajectory.setdefault("done", []).append(td["next", "done"].squeeze(-1).cpu())
+                trajectory.setdefault("episode", []).append(torch.tensor(robot_ep_idx))
 
             rewards    = td["next", "reward"].squeeze(-1)     # [num_envs], on device
             dones      = td["next", "done"].squeeze(-1)       # [num_envs], on device
@@ -612,6 +636,7 @@ def run_tracked_rollout(
                         dist_to_goal_final=dist,
                         direction="fwd" if float(target_pos[i, 0]) <= float(start_pos[i, 0]) else "rev",
                         tq=float(counts.get("tq", float("nan"))),
+                        fail_reason=FAIL_REASONS[counts.get("fail_reason", 0)] if outcome == "failure" else "",
                     ))
                     robot_rewards[i] = 0.0
                     robot_steps[i]   = 0

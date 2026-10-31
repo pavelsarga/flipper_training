@@ -217,6 +217,9 @@ class FtrTorchRLEnv(EnvBase):
                     self._per_env_failure   += _info["failure"].long().to(self.device)
                     if "explosion" in _info:
                         self._per_env_explosion += _info["explosion"].long().to(self.device)
+                    if "fail_reason" in _info:
+                        fr = _info["fail_reason"].to(self.device)
+                        self._per_env_fail_reason = torch.where(fr > 0, fr, self._per_env_fail_reason)
                     if tq_ep is not None:
                         self._per_env_tq_sum += torch.nan_to_num(tq_ep, nan=0.0)
                         self._per_env_tq_n   += has_tq.long()
@@ -318,12 +321,14 @@ class FtrTorchRLEnv(EnvBase):
         self._per_env_explosion = torch.zeros(n, dtype=torch.long, device=self.device)
         self._per_env_tq_sum    = torch.zeros(n, dtype=torch.float32, device=self.device)
         self._per_env_tq_n      = torch.zeros(n, dtype=torch.long, device=self.device)
+        self._per_env_fail_reason = torch.zeros(n, dtype=torch.long, device=self.device)   # last one
 
     def pop_per_env_termination(self) -> dict[int, dict[str, int | float]]:
         """Return per-robot episode counts then reset all counters.
 
         Returns ``{robot_idx: {"episodes": N, "successes": N, "failures": N, "explosions": N,
-        "tq": mean traversal quality of the robot's finished episodes (NaN if none)}}``.
+        "tq": mean traversal quality of the robot's finished episodes (NaN if none),
+        "fail_reason": the env's FAIL_REASONS code of its last failure (0 = none)}}``.
         Only meaningful after ``enable_per_env_tracking()`` was called.
         """
         if not self._per_env_tracking or self._per_env_episodes is None:
@@ -337,12 +342,14 @@ class FtrTorchRLEnv(EnvBase):
                 "failures":   int(self._per_env_failure[i].item()),
                 "explosions": int(self._per_env_explosion[i].item()),
                 "tq":         tq_mean[i] if int(tq_n[i]) > 0 else float("nan"),
+                "fail_reason": int(self._per_env_fail_reason[i].item()),
             }
             for i in range(self.batch_size[0])
         }
         self._per_env_episodes.zero_()
         self._per_env_success.zero_()
         self._per_env_failure.zero_()
+        self._per_env_fail_reason.zero_()
         self._per_env_explosion.zero_()
         self._per_env_tq_sum.zero_()
         self._per_env_tq_n.zero_()
