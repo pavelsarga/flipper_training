@@ -74,8 +74,10 @@ class FtrTorchRLEnv(EnvBase):
         self._per_env_tq_n: torch.Tensor | None = None
 
         from marv_rl_training.environment.crash_recorder import from_env as _crash_recorder_from_env
+        from marv_rl_training.environment.crash_recorder import install_physx_sync
 
         self._crash_recorder = _crash_recorder_from_env(ftr_env)
+        install_physx_sync(ftr_env)
 
         # Instantiate the observation descriptor so make_transformed_env can build VecNorm keys
         # and mlp_policy.py can build the matching encoder. Which descriptor class matches the

@@ -19,6 +19,33 @@ import time
 import torch
 
 
+def install_physx_sync(ftr_env) -> None:
+    """``FTR_PHYSX_SYNC=1``: device-wide synchronize around every get_*/set_* of the robot's
+    PhysX ArticulationView — a test for a torch/PhysX stream race.
+
+    omni.physics.tensors converts each index tensor with ``tensor.to(torch.int32)``, a temporary
+    that returns to torch's caching allocator as soon as the setter returns; if PhysX consumes it
+    asynchronously on its own stream, the block can be reused and overwritten first, handing
+    PhysX garbage indices. ``torch.cuda.synchronize()`` waits for every stream, PhysX's included.
+    """
+    if os.environ.get("FTR_PHYSX_SYNC", "0") != "1":
+        return
+    view = ftr_env.unwrapped._robot.root_physx_view
+    names = [n for n in dir(type(view)) if n.startswith(("get_", "set_", "apply_"))]
+
+    def wrap(fn):
+        def synced(*args, **kwargs):
+            torch.cuda.synchronize()
+            out = fn(*args, **kwargs)
+            torch.cuda.synchronize()
+            return out
+        return synced
+
+    for n in names:
+        setattr(view, n, wrap(getattr(view, n)))
+    print(f"[crash_recorder] FTR_PHYSX_SYNC: {len(names)} ArticulationView methods wrapped in torch.cuda.synchronize()", flush=True)
+
+
 def from_env(ftr_env) -> "CrashRecorder | None":
     n = int(os.environ.get("FTR_CRASH_RECORDER", "0") or 0)
     if n <= 0:
