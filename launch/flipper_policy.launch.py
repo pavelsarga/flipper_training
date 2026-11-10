@@ -58,6 +58,7 @@ def _resolve_paths(context):
                 "flipper_velocity_scale": float(LaunchConfiguration("flipper_velocity_scale").perform(context)),
                 "track_velocity_scale": float(LaunchConfiguration("track_velocity_scale").perform(context)),
                 "disable_turning": LaunchConfiguration("disable_turning").perform(context).lower() == "true",
+                "odom_topic": LaunchConfiguration("odom_topic").perform(context),
             }
         ],
     )
@@ -68,8 +69,10 @@ def generate_launch_description():
     # --- run_dir shortcut (auto-resolves config + weights) ---
     run_dir_arg = DeclareLaunchArgument(
         "run_dir",
-        default_value="/home/robot/workspaces/robot_rodeo_gym_ws/experiments/best_long/attempt_0",
-        description="Path to a training run directory. If set, config.yaml and weights/policy_final.pth "
+        default_value="",
+        description="Path to a training run directory (REQUIRED in practice — no default: the old "
+                    "TheAshape default was pre-rl_modules and misleading; pass an rl_baselines/<run> dir). "
+                    "If set, config.yaml and weights/policy_final.pth "
                     "are loaded automatically (overrides config_path/policy_weights_path/vecnorm_weights_path).",
     )
     policy_filename_arg = DeclareLaunchArgument(
@@ -139,6 +142,13 @@ def generate_launch_description():
         default_value="true",
         description="If true, forces angular velocity to 0 on every step (straight-line only).",
     )
+    odom_topic_arg = DeclareLaunchArgument(
+        "odom_topic",
+        default_value="/ground_truth_odom",
+        description="Odometry topic the POLICY steers on. Change to test against a "
+                    "noisier/estimated odometry source (e.g. lidar ICP) without "
+                    "touching arena/scoring, which stay hardcoded to /ground_truth_odom.",
+    )
 
     return LaunchDescription(
         [
@@ -155,6 +165,7 @@ def generate_launch_description():
             flipper_velocity_scale_arg,
             track_velocity_scale_arg,
             disable_turning_arg,
+            odom_topic_arg,
             OpaqueFunction(function=_resolve_paths),
         ]
     )

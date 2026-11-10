@@ -36,6 +36,27 @@ def resolve_class(typename: str) -> Type:
 monkey_patch()
 
 
+# MARV_RL's marv_rl_training package (imported transitively whenever a rl_baselines
+# config's policy_config/env resolves a marv_rl_training.* or rl_modules.* class --
+# see experiments/ppo/rl_baseline_inference_modules.py) registers these SAME resolver
+# names with identical lambdas in its own __init__.py. Since flipper_training is
+# always imported first in this deployment's PYTHONPATH ordering,
+# OmegaConf.register_new_resolver is patched here, before flipper_training's own
+# registrations, so marv_rl_training's later (redundant) registration attempt is a
+# no-op instead of a ValueError.
+_orig_register_new_resolver = OmegaConf.register_new_resolver
+
+
+def _tolerant_register_new_resolver(name, resolver, **kwargs):
+    try:
+        return _orig_register_new_resolver(name, resolver, **kwargs)
+    except ValueError:
+        pass
+
+
+OmegaConf.register_new_resolver = _tolerant_register_new_resolver
+
+
 OmegaConf.register_new_resolver("add", lambda *args: sum(args))
 OmegaConf.register_new_resolver("mul", lambda *args: math.prod(args))
 OmegaConf.register_new_resolver("div", lambda a, b: a / b)

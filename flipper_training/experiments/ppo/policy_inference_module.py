@@ -43,6 +43,15 @@ class PPOPolicyInferenceModule:
             self.logger.info(f"Loaded VecNorm weights from {vecnorm_weights_path}")
         self.actor_operator.eval()
         self.env.eval()
+        # Heightmap-fed policies resample the incoming map onto their own
+        # percep_shape/percep_extent grid inside Heightmap.from_realistic_world.
+        # Remember which observation that is so infer_action can expose the
+        # resampled patch -- the full incoming map is NOT what the net sees, and
+        # visualising the map instead hides scale/extent mistakes.
+        self._hm_obs_name = next(
+            (o.name for o in self.world_interface_env.observations if hasattr(o, "percep_shape")), None
+        )
+        self.last_policy_heightmap = None
 
     def infer_action(self, **kwargs) -> np.ndarray:
         """
@@ -64,6 +73,10 @@ class PPOPolicyInferenceModule:
             )
             world_td.set("step_count", torch.zeros([1], dtype=torch.long, device=self.device))  # some envs need step_count
             env_td = self.env.step(world_td)
+            if self._hm_obs_name is not None:
+                hm = env_td["next"].get(self._hm_obs_name, None)
+                if hm is not None:
+                    self.last_policy_heightmap = hm.squeeze().cpu().numpy()
             true_action_td = self.actor_operator(env_td["next"])
 
         return true_action_td["action"].squeeze(0).cpu().numpy()
