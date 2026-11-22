@@ -102,16 +102,16 @@ class FlipperPolicyNode(Node):
         #     tracks it with v = position_correction_gain * error, gain 1.0 in marv_model.sdf --
         #     a 1 s time constant, much slower than training.
         self.declare_parameter("diffusion_flipper_tracking", "isaac")
-        self.declare_parameter("flipper_track_max_vel", float(np.pi))  # rad/s, Isaac's 180 deg/s cap
+        self.declare_parameter("flipper_track_max_vel", 1.0)  # rad/s, Isaac's flipper joint cap (assets/marv.py)
         self.declare_parameter("isaac_drive_wn", 4.38)        # rad/s   } fitted to Isaac step +
         self.declare_parameter("isaac_drive_zeta", 0.43)      # -       } chatter response,
         self.declare_parameter("isaac_drive_max_accel", 12.0)  # rad/s^2 } tq_sweep_tq2p5 config
         self.declare_parameter("isaac_drive_correction_gain", 10.0)  # 1/s, pulls Gazebo onto the model
-        # Time-scales the whole emulated response: s=0.5 makes every flipper motion take twice
-        # as long (wn and v_max x s, a_max x s^2). 1.0 = the Isaac fit, which still looked
-        # too fast in Gazebo (it omits the ground-contact loads that slow Isaac's flippers
-        # further); 0.5 was too slow, 0.75 is the setting in use.
-        self.declare_parameter("flipper_speed_scale", 0.75)
+        # Time-scales the emulated response: s=0.5 makes every flipper motion take twice as
+        # long (wn x s, a_max x s^2). The speed cap is flipper_track_max_vel as given, not
+        # scaled. 1.0 = the Isaac fit, which looked too fast in Gazebo (it omits the
+        # ground-contact loads that slow Isaac's flippers further); 0.25 is the setting in use.
+        self.declare_parameter("flipper_speed_scale", 0.25)
         self.declare_parameter("flipper_emulation_rate", 100.0)      # Hz (sim time)
         self.declare_parameter("disable_turning", False)  # Force angular velocity to 0
         # /policy_heightmap_img orientation. True (default) = drawn the way the world looks,
@@ -166,7 +166,7 @@ class FlipperPolicyNode(Node):
         self._drive_speed_scale = _s
         self._drive_wn *= _s
         self._drive_max_accel *= _s * _s
-        self._drive_max_vel = self.flipper_track_max_vel * _s
+        self._drive_max_vel = self.flipper_track_max_vel
         self._emulation_rate = self.get_parameter("flipper_emulation_rate").get_parameter_value().double_value
 
         if not config_path or not policy_weights_path:
