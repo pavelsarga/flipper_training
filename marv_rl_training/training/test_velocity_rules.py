@@ -68,7 +68,10 @@ def test_mapless_extends_default_and_needs_no_map():
     base = R.load_rule_config(CFG_DIR / "default.yaml")
     assert c["predictive"] is False and c["v_min"] == base["v_min"]
     assert c["criteria"]["turning"] == base["criteria"]["turning"]
-    assert c["criteria"]["tilt"]["weight"] > base["criteria"]["tilt"]["weight"]
+    for k in ("tilt", "shake", "flippers"):                                            # stronger without the map
+        assert c["criteria"][k]["weight"] >= base["criteria"][k]["weight"]
+    assert c["criteria"]["flippers"]["weight"] > base["criteria"]["flippers"]["weight"]
+    assert c["criteria"]["shake"]["weight"] > base["criteria"]["shake"]["weight"]
     assert c["criteria"]["tilt"]["hi"] == base["criteria"]["tilt"]["hi"]              # deep merge keeps the rest
     rs = R.RuleSpeed(c)
     assert not rs.uses_map and {k.name for k in rs.criteria} == {"tilt", "shake", "flippers", "turning"}
@@ -165,6 +168,16 @@ def test_tilt_roll_weighs_more_than_pitch():
     a = math.radians(20)
     assert target(rs, inputs(roll=a)) < target(rs, inputs(pitch=a))
     assert target(rs, inputs(roll=a)) == pytest.approx(1 - 0.6 * 20 / 30)
+
+
+def test_tilt_nose_down_pitch_has_its_own_weight():
+    rs = R.RuleSpeed(cfg(tilt={"weight": 0.6, "mode": "linear", "lo": 0.0, "hi": 30.0, "pitch_k": 0.5,
+                               "pitch_down_k": 1.0}))
+    a = math.radians(20)
+    assert target(rs, inputs(pitch=a)) == pytest.approx(1 - 0.6 * 20 / 30)      # + = nose down: full weight
+    assert target(rs, inputs(pitch=-a)) == pytest.approx(1 - 0.6 * 10 / 30)     # nose up: pitch_k
+    rs = R.RuleSpeed(cfg(tilt={"weight": 0.6, "mode": "linear", "lo": 0.0, "hi": 30.0, "pitch_k": 0.5}))
+    assert target(rs, inputs(pitch=a)) == target(rs, inputs(pitch=-a))         # without it: symmetric
 
 
 def test_flippers_bang_with_hold():
@@ -270,6 +283,15 @@ def test_stall_guard_roll_limit_keeps_the_first_level():
     assert out[-1] == 0.6
     assert round(level(20.0), 3) == 0.4                               # rolled past 15 deg: first level only
     assert round(level(5.0), 3) == 0.6                                # level again once the roll is back
+
+
+def test_stall_guard_nose_down_keeps_the_first_level():
+    rs = R.RuleSpeed({**cfg(**SLOW), "stall": {**STALL, "max_pitch_down_deg": 10.0}})
+    level = lambda pitch: target(rs, inputs(w=1.0, pitch=math.radians(pitch)))
+    out = [round(level(0.0), 3) for _ in range(110)]                 # 5.5 s stuck, level: escalated to 0.6
+    assert out[-1] == 0.6
+    assert round(level(20.0), 3) == 0.4                               # nose down over a lip: first level only
+    assert round(level(-20.0), 3) == 0.6                              # nose up (climbing): not limited
 
 
 def test_batched_envs_are_independent_and_reset_per_env():
