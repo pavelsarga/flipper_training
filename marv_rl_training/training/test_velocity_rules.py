@@ -350,3 +350,23 @@ def test_bearing_heading_distance_ramp(monkeypatch):
     ramp = VC.bearing_heading(pos, yaw, target, gain=0.5, max_w=10.0, distance_ramp=True, starts=start)
     assert ramp[0] == pytest.approx(0.0) and ramp[1] == pytest.approx(0.5 * full[1], rel=1e-5)
     assert ramp[2] == pytest.approx(full[2], rel=1e-5)                    # clamped at 1 past the goal
+
+
+def test_state_survives_an_inference_mode_eval():
+    """train_diffusion runs its mid-training eval under torch.inference_mode and the training rollout
+    under no_grad only: state rebound during the eval must stay writable in place afterwards (the
+    stall guard's `armed_s += dt` killed job 12073363 on the first training step after its first eval)."""
+    n = 3
+    rs = R.RuleSpeed(R.load_rule_config(CFG_DIR / "default.yaml"), n)
+    with torch.no_grad():
+        for t in range(5):
+            rs(inputs(n, x=0.02 * t), DT)
+    with torch.inference_mode():
+        for t in range(30):
+            rs(inputs(n, x=0.1 + 0.001 * t), DT)          # creeping: the stall guard rebinds its state
+        rs.reset(torch.tensor([0]))
+    with torch.no_grad():
+        for t in range(5):
+            rs(inputs(n, x=0.2 + 0.02 * t), DT)
+        rs.reset(torch.tensor([1]))
+        assert torch.isfinite(rs(inputs(n, x=0.4), DT)).all()
