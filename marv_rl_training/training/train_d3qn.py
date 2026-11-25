@@ -519,7 +519,14 @@ class FtrD3QNTrainer:
 
         resume_iteration = getattr(self, "resume_iteration", None)
         resume_frames = getattr(self, "resume_frames", None)
-        iter_offset = resume_iteration if resume_iteration is not None else 0
+        # The checkpoint holds the COMPLETED iteration k, whose frames are (k + 1) x the iteration size,
+        # so the next iteration is k + 1. Offsetting by the saved iteration (k) instead numbered the
+        # first iteration after every relaunch k again: it was logged and checkpointed under the
+        # previous attempt's frame count, so each relaunch lost one iteration from the frame counter
+        # (and every schedule driven by it) and overshot the budget by one (found on the terrain
+        # rotation E2E test). Derived from the frames, so crash checkpoints are covered too.
+        _resumed = getattr(self, "resume_frames", None)
+        iter_offset = int(_resumed // iteration_size) if _resumed else 0
         # On a respawn the counter carries on from the checkpoint while the collector only collects
         # what is left, so the bar spans resumed + remaining rather than the config's total_frames.
         _pbar_total = self.config.total_frames + (resume_frames or 0)

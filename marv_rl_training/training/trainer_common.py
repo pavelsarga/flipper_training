@@ -16,7 +16,52 @@ __all__ = [
     "collector_opts",
     "is_unrecoverable_gpu_error",
     "is_wandb_transport_error",
+    "reconcile_resumed_lrs",
 ]
+
+
+def reconcile_resumed_lrs(optim, scheduler, cfg_lr: dict, log=None) -> list[str]:
+    """After ``optim.load_state_dict`` / ``scheduler.load_state_dict`` on a resume, honour a
+    learning rate that was CHANGED in the config, without discarding the schedule's progress.
+
+    Each param group carries two rates after a restore: ``lr`` (the current, already decayed
+    value) and ``initial_lr`` (what the schedule started from). The config's value is compared
+    with ``initial_lr``, not with ``lr``:
+
+    - equal: the config was not changed, so the restored ``lr`` is kept untouched. Comparing
+      with ``lr`` instead (the previous behaviour) found a "difference" on every resume once
+      the schedule had decayed at all, and reset the rate to its initial value — with a
+      chainable scheduler such as ``LinearLR`` (each step multiplies the current rate) every
+      relaunch then threw away the decay so far, so a run reloaded every period for terrain
+      rotation would never decay.
+    - different: the schedule restarts from the new base at the SAME progress — ``lr`` is
+      rescaled by ``new / old`` and ``initial_lr`` / ``scheduler.base_lrs`` are set to the
+      config value, so a deliberate LR change takes effect immediately and keeps decaying.
+
+    ``cfg_lr`` maps param-group name -> configured lr (groups without a name use key None).
+    Returns one human-readable line per changed group (also passed to ``log`` if given).
+    """
+    msgs = []
+    for pg in optim.param_groups:
+        want = cfg_lr.get(pg.get("name"))
+        if want is None:
+            continue
+        old_base = pg.get("initial_lr", pg["lr"])
+        if old_base == want:
+            continue
+        scale = want / old_base if old_base else 1.0
+        msg = (f"Resume: config lr for {pg.get('name')} is {want:.3g}, checkpoint schedule started at "
+               f"{old_base:.3g} — rescaling the current rate {pg['lr']:.3g} -> {pg['lr'] * scale:.3g}.")
+        pg["lr"] = pg["lr"] * scale
+        pg["initial_lr"] = want
+        msgs.append(msg)
+        if log is not None:
+            log(msg)
+    if hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = [pg.get("initial_lr", pg["lr"]) for pg in optim.param_groups]
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = [pg["lr"] for pg in optim.param_groups]
+    return msgs
 
 # Number of depth columns the per-spot breakdown splits each env type into for the
 # mid-training eval. The eval scripts read this from the terrain's layout; the trainers use a

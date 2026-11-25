@@ -770,7 +770,14 @@ class FtrSACTrainer:
         # Frame/iteration bookkeeping continues a resumed run rather than restarting at 0,
         # so collected_frames stays monotonic across attempts and the respawn helper's
         # remaining-budget arithmetic matches what was actually trained.
-        iter_offset = self.resume_iteration if self.resume_iteration is not None else 0
+        # The checkpoint holds the COMPLETED iteration k, whose frames are (k + 1) x the iteration size,
+        # so the next iteration is k + 1. Offsetting by the saved iteration (k) instead numbered the
+        # first iteration after every relaunch k again: it was logged and checkpointed under the
+        # previous attempt's frame count, so each relaunch lost one iteration from the frame counter
+        # (and every schedule driven by it) and overshot the budget by one (found on the terrain
+        # rotation E2E test). Derived from the frames, so crash checkpoints are covered too.
+        _resumed = getattr(self, "resume_frames", None)
+        iter_offset = int(_resumed // iteration_size) if _resumed else 0
         resume_frames = self.resume_frames or 0
         pbar = tqdm(total=self.config.total_frames + resume_frames, desc="C-TRAC SAC Training", unit="frames", leave=False)
         if resume_frames:
