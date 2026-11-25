@@ -54,6 +54,34 @@ ASSET_DIR = WS_ROOT / "src" / "FTR-Benchmark" / "ftr_envs" / "assets" / "terrain
 _KNOWN = {"prefix", "pregen_fraction", "min_frames", "max_frames", "keep", "generator_args", "seed", "in_process"}
 
 
+def _generator_env() -> dict:
+    """Environment for the generator subprocess (plain python, no Kit app).
+
+    The generator needs USD's ``pxr``. A host conda env usually has it from pip (usd-core); the
+    cluster container does not — there USD only ships inside Isaac Sim's ``omni.usd.libs``
+    extension, which Kit puts on sys.path at runtime. When a bare interpreter cannot import pxr,
+    that extension's dir goes on PYTHONPATH and its bin/ on LD_LIBRARY_PATH.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(GEN_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    probe = subprocess.run([sys.executable, "-c", "import pxr.Usd"], env=env, capture_output=True)
+    if probe.returncode == 0:
+        return env
+    try:
+        import isaacsim
+
+        roots = [Path(p) for p in isaacsim.__path__]
+    except Exception:  # noqa: BLE001
+        roots = []
+    libs = sorted(d for r in roots for d in r.glob("extscache/omni.usd.libs-*") if (d / "pxr").is_dir())
+    if not libs:
+        raise RuntimeError("terrain generator needs USD (pxr): not importable and no isaacsim omni.usd.libs found")
+    usd = libs[-1]
+    env["PYTHONPATH"] = str(usd) + os.pathsep + env["PYTHONPATH"]
+    env["LD_LIBRARY_PATH"] = str(usd / "bin") + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    return env
+
+
 class TerrainRotation:
     def __init__(self, cfg: dict, run_root: Path, current_terrain: str, ftr_env, start_frames: int,
                  dr_spec: dict | None = None, log=print):
@@ -103,8 +131,7 @@ class TerrainRotation:
             cmd += ["--dr-spec", json.dumps(self.dr_spec)]
         for k, v in self.generator_args.items():
             cmd += [f"--{k.replace('_', '-')}", str(v)]
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(GEN_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+        env = _generator_env()
         self._gen_log = open(self.state_dir / f"generate_{self._next_name()}.log", "w")
         self.proc = subprocess.Popen(cmd, cwd=str(GEN_ROOT), env=env, stdout=self._gen_log, stderr=subprocess.STDOUT,
                                      preexec_fn=lambda: os.nice(10))
