@@ -103,7 +103,12 @@ from marv_rl_training.policies.diffusion_dppo import DiffusionChunkActor, make_d
 from marv_rl_training.environment.ftr_env_adapter import OBS_KEY, FtrTorchRLEnv
 from marv_rl_training.training.common import make_transformed_env
 from marv_rl_training.training.env_type_registry import default_num_env_types
-from marv_rl_training.training.trainer_common import collector_opts, is_unrecoverable_gpu_error, is_wandb_transport_error
+from marv_rl_training.training.trainer_common import (
+    collector_opts,
+    is_unrecoverable_gpu_error,
+    is_wandb_transport_error,
+    reconcile_resumed_lrs,
+)
 from marv_rl_training.training.eval_data import (
     aggregate_per_env,
     aggregate_per_spot,
@@ -113,6 +118,7 @@ from marv_rl_training.training.eval_data import (
 )
 from marv_rl_training.utils.cfg_schedulers import SlowStartCoefScheduler, SRGatedCoefScheduler, _make_cfg_scheduler
 from marv_rl_training.utils.logutils import RunLogger, get_terminal_logger
+from marv_rl_training.training.terrain_rotation import ROTATE_EXIT_CODE, TerrainRotation
 from marv_rl_training.utils.torch_utils import seed_all, set_device
 
 
@@ -337,6 +343,11 @@ class FtrDiffusionConfig:
     # training, and its results are logged as val/* (val.csv) once it finishes. Keys: terrain,
     # num_envs (default 256), repeats (1), timeout_s (3600). None = disabled.
     validation_eval: dict | None = None
+    # Terrain rotation: generate the next course in the background while training and swap it into the
+    # running sim once the spawn sampler reports the current one exhausted (exit 76 + relaunch only as
+    # a fallback). Needs
+    # env_cfg_overrides.spawn_sampler. Keys: training/terrain_rotation.py. None = one fixed course.
+    terrain_rotation: dict | None = None
     # Co-trained speed net (training/velocity_rl.py): the velocity_controller {type: rl} speed agent's
     # learner config -- il_dir, rates, reward weights. None = the speed controller is not trained.
     velocity_rl: dict | None = None
@@ -686,6 +697,19 @@ class FtrDiffusionTrainer:
         # ---- resume optimizer / schedulers / counters (needs all of the above to exist) ----
         self._restore_training_state()
 
+        # ---- terrain rotation (needs the restored frame counter: frames on THIS course start here) ----
+        self.terrain_rotation = None
+        if self.config.terrain_rotation:
+            _ov = self.config.env_cfg_overrides
+            _ov = OmegaConf.to_container(_ov, resolve=True) if OmegaConf.is_config(_ov) else dict(_ov or {})
+            _rot = self.config.terrain_rotation
+            _rot = OmegaConf.to_container(_rot, resolve=True) if OmegaConf.is_config(_rot) else dict(_rot)
+            self.terrain_rotation = TerrainRotation(
+                _rot, self.run_logger.run_root, self.config.terrain, self.ftr_torchrl_env.ftr_env.unwrapped,
+                start_frames=getattr(self, "resume_frames", None) or 0, dr_spec=_ov.get("domain_randomization"),
+                log=self.term_logger.info,
+            )
+
         self.term_logger.info("Initialized FtrDiffusionTrainer.")
 
     def _check_and_load_crash_checkpoint(self):
@@ -766,6 +790,55 @@ class FtrDiffusionTrainer:
             self.resume_iteration = resume_iteration
             self.resume_frames = resume_frames
 
+    def _curriculum_log(self) -> dict:
+        """Spawn-sampler, domain-randomization and rotation state for the per-iteration log."""
+        env = self.ftr_torchrl_env.ftr_env.unwrapped
+        out = dict(env.spawn_stats()) if hasattr(env, "spawn_stats") else {}
+        dr = getattr(env, "_dr", None)
+        if dr is not None:
+            out.update(dr.stats())
+        if self.terrain_rotation is not None:
+            out.update(self.terrain_rotation.stats())
+        return out
+
+    def _swap_course(self, total_collected_frames: int) -> bool:
+        """Swap the next course into the running sim and restart collection on it (no relaunch).
+        False = the swap failed before the stage was touched or the env cannot swap: the caller
+        falls back to save + exit 76. A failure after the stage changed is not recoverable here
+        (the old collider is gone) — it raises, and the crash path respawns on next_course.txt."""
+        env = self.ftr_torchrl_env.ftr_env.unwrapped
+        name = self.terrain_rotation.next_course
+        if not hasattr(env, "swap_terrain"):
+            return False
+        try:
+            from ftr_envs.assets.terrain.terrain import Terrain
+            Terrain(name)  # all course files present and readable
+        except Exception as e:  # noqa: BLE001
+            self.term_logger.warning(f"Terrain rotation: cannot load {name} in-process ({e}); falling back to exit {ROTATE_EXIT_CODE}.")
+            return False
+        t = env.swap_terrain(name)
+        self.config.terrain = name
+        self.collector.reset()  # every robot respawns on the new course; history/step counters restart
+        self.terrain_rotation.advance(total_collected_frames)
+        self.term_logger.info(f"Terrain rotation: swapped to {name} in-process at {total_collected_frames} frames "
+                              f"(stage {t['stage_s']:.1f} s, physics {t['physics_s']:.1f} s).")
+        return True
+
+    def _rotate_and_exit(self, iteration: int, total_collected_frames: int):
+        """Save the full training state and hand over to the next course (exit ROTATE_EXIT_CODE)."""
+        import os as _os
+
+        self.run_logger.save_weights(self.actor_value_wrapper.state_dict(), f"policy_step_{total_collected_frames}")
+        self.run_logger.save_weights(self.vecnorm.state_dict(), f"vecnorm_step_{total_collected_frames}")
+        self._export_velocity_agent(f"velocity_rl_step_{total_collected_frames}")
+        self._save_training_checkpoint(iteration, total_collected_frames)
+        self.term_logger.info(f"Terrain rotation: checkpoint at {total_collected_frames} frames saved; exiting "
+                              f"{ROTATE_EXIT_CODE} to relaunch on {self.terrain_rotation.next_course}.")
+        self.run_logger.close()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        _os._exit(ROTATE_EXIT_CODE)
+
     def _save_training_checkpoint(self, iteration: int, total_collected_frames: int):
         """Save training state (optimizers, schedulers, frame count) for resuming."""
         checkpoint = {
@@ -786,6 +859,9 @@ class FtrDiffusionTrainer:
             checkpoint["smooth_coef_scheduler_state_dict"] = self.smooth_coef_scheduler.state_dict()
         if self.velocity_agent is not None:
             checkpoint["velocity_agent_state_dict"] = self.velocity_agent.state_dict()
+        _dr = getattr(self.ftr_torchrl_env.ftr_env.unwrapped, "_dr", None)
+        if _dr is not None:
+            checkpoint["domain_randomization"] = _dr.state_dict()
         self.run_logger.save_weights(checkpoint, "training_state")
 
     def _export_velocity_agent(self, name: str):
@@ -827,27 +903,17 @@ class FtrDiffusionTrainer:
             if self.velocity_agent is not None and "velocity_agent_state_dict" in checkpoint:
                 self.velocity_agent.load_state_dict(checkpoint["velocity_agent_state_dict"])
                 self.term_logger.info(f"velocity_rl: restored the speed agent (update {self.velocity_agent.updates})")
-            # ⚠ Re-apply the CONFIGURED learning rates after restoring.
+            # ⚠ Honour a learning rate CHANGED in the config, keeping the schedule's progress.
             #
             # optim.load_state_dict() restores param_groups including "lr", and an
-            # LRScheduler's state_dict restores "base_lrs" — so a resume silently reverts any
-            # learning-rate change made in the config, and the run continues at the old rate
-            # while the config says otherwise. That turns "resume with a different LR", the
-            # main reason to resume at all, into a no-op with no error and no warning.
+            # LRScheduler's state_dict restores "base_lrs" — so without this a resume silently
+            # reverts an LR change made in the config. The comparison is against the
+            # checkpoint's schedule start (initial_lr), not the decayed current lr: comparing
+            # with lr reset the rate to its initial value on EVERY resume, which with the
+            # chainable LinearLR discarded the decay at each relaunch (terrain rotation
+            # relaunches every period). See trainer_common.reconcile_resumed_lrs.
             _cfg_lr = {gp.get("name"): gp.get("lr") for gp in self.optim_groups if gp.get("lr") is not None}
-            for _pg in self.optim.param_groups:
-                _want = _cfg_lr.get(_pg.get("name"))
-                if _want is not None and _pg.get("lr") != _want:
-                    self.term_logger.info(
-                        f"Resume: config lr for {_pg.get('name')} is {_want:.3g}, checkpoint had "
-                        f"{_pg.get('lr'):.3g} — using the config value."
-                    )
-                    _pg["lr"] = _want
-                    _pg["initial_lr"] = _want
-            if hasattr(self.scheduler, "base_lrs"):
-                self.scheduler.base_lrs = [
-                    _cfg_lr.get(_pg.get("name"), _pg["lr"]) for _pg in self.optim.param_groups
-                ]
+            reconcile_resumed_lrs(self.optim, self.scheduler, _cfg_lr, log=self.term_logger.info)
             if "step_penalty_scheduler_state_dict" in checkpoint and self.step_penalty_scheduler is not None:
                 self.step_penalty_scheduler.load_state_dict(checkpoint["step_penalty_scheduler_state_dict"])
             if "action_bonus_scheduler_state_dict" in checkpoint and self.action_bonus_scheduler is not None:
@@ -858,6 +924,10 @@ class FtrDiffusionTrainer:
                 self.forward_scale_scheduler.load_state_dict(checkpoint["forward_scale_scheduler_state_dict"])
             if "smooth_coef_scheduler_state_dict" in checkpoint and self.smooth_coef_scheduler is not None:
                 self.smooth_coef_scheduler.load_state_dict(checkpoint["smooth_coef_scheduler_state_dict"])
+            _dr = getattr(self.ftr_torchrl_env.ftr_env.unwrapped, "_dr", None)
+            if _dr is not None and "domain_randomization" in checkpoint:
+                _dr.load_state_dict(checkpoint["domain_randomization"])
+                self.term_logger.info(f"Resume: domain randomization ranges restored ({len(checkpoint['domain_randomization']['ranges'])} parameters)")
             self.term_logger.info(
                 f"Loaded training checkpoint: resuming from iteration {checkpoint['iteration']}, "
                 f"total_collected_frames={checkpoint['total_collected_frames']}"
@@ -943,7 +1013,14 @@ class FtrDiffusionTrainer:
         # cadence are correct without wasting GPU cycles re-running old rollouts.
         resume_iteration = getattr(self, "resume_iteration", None)
         resume_frames = getattr(self, "resume_frames", None)
-        iter_offset = resume_iteration if resume_iteration is not None else 0
+        # The checkpoint holds the COMPLETED iteration k, whose frames are (k + 1) x the iteration size,
+        # so the next iteration is k + 1. Offsetting by the saved iteration (k) instead numbered the
+        # first iteration after every relaunch k again: it was logged and checkpointed under the
+        # previous attempt's frame count, so each relaunch lost one iteration from the frame counter
+        # (and every schedule driven by it) and overshot the budget by one (found on the terrain
+        # rotation E2E test). Derived from the frames, so crash checkpoints are covered too.
+        _resumed = getattr(self, "resume_frames", None)
+        iter_offset = int(_resumed // frames_per_iter) if _resumed else 0
         # On a respawn the counter carries on from the checkpoint while the collector only collects
         # what is left, so the bar spans resumed + remaining rather than the config's total_frames.
         _pbar_total = self.config.total_frames + (resume_frames or 0)
@@ -1229,6 +1306,7 @@ class FtrDiffusionTrainer:
                 **self.ftr_torchrl_env.pop_reward_info(),
                 **self.ftr_torchrl_env.pop_termination_info(),
                 **self.ftr_torchrl_env.pop_state_stats(),
+                **self._curriculum_log(),
                 "train/mean_reward": rollout_mean_reward,
                 "train/mean_state_value": rollout_mean_state_value,
                 "train/value_minus_reward": rollout_value_minus_reward,
@@ -1338,6 +1416,11 @@ class FtrDiffusionTrainer:
 
             log.update(self._poll_validation_eval())
             self.run_logger.log_data(log, total_collected_frames)
+            # no rotation on the last iteration: nothing would train on the new course
+            if (self.terrain_rotation is not None and total_collected_frames < _pbar_total
+                    and self.terrain_rotation.step(total_collected_frames)):
+                if not (self.terrain_rotation.in_process and self._swap_course(total_collected_frames)):
+                    self._rotate_and_exit(effective_i, total_collected_frames)
 
         # Name the final checkpoint by the CUMULATIVE frame count, not config.total_frames.
         # They are the same on a fresh run, but on a cross-job resume config.total_frames is
@@ -1441,6 +1524,9 @@ class FtrDiffusionTrainer:
             1, (self.ftr_torchrl_env.ftr_env.unwrapped.max_episode_length * 2) // self.T_a
         )
         self.ftr_torchrl_env.enable_per_env_tracking()
+        _unwrapped = self.ftr_torchrl_env.ftr_env.unwrapped
+        if hasattr(_unwrapped, "spawn_sampler_pause"):
+            _unwrapped.spawn_sampler_pause(True)  # eval spawns round-robin, outside the curriculum
         # the co-trained speed agent drives evals with its mean speed and records nothing
         with (self.velocity_agent.evaluating() if self.velocity_agent is not None else contextlib.nullcontext()):
             results, episode_records = run_tracked_rollout(
@@ -1450,6 +1536,8 @@ class FtrDiffusionTrainer:
                 terrain=self.config.terrain,
             )
         self.ftr_torchrl_env.disable_per_env_tracking()
+        if hasattr(_unwrapped, "spawn_sampler_pause"):
+            _unwrapped.spawn_sampler_pause(False)
         _eval_reward_info = {k: results.pop(k) for k in list(results) if k.startswith("rew/") or k.startswith("shock/")}
         _shock_keys = (
             "shock/accel_magnitude", "shock/shock_normalised",
